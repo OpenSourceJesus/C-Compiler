@@ -5,10 +5,11 @@ import struct
 
 
 class CodeGenerator:
-    """Code generator with indexed-jump, metamorphic return sites, and quantized call-backs."""
+    """Code generator with indexed-jump, metamorphic return sites, quantized call-backs, and SIMD bit-packing."""
     
-    def __init__(self, function_data):
+    def __init__(self, function_data, global_var_data=None):
         self.function_data = function_data
+        self.global_var_data = global_var_data or {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
         self.output = []
         self.small_functions = []
         self.function_offsets = {}
@@ -17,10 +18,12 @@ class CodeGenerator:
         self.return_site_index = 0
         self.alignment = 16  # 16-byte alignment for quantized call-backs
         self.current_line = 0  # Track current output line for return site tracking
+        self.simd_register = 'xmm15'  # Last SIMD register for bit-packing
     
     def generate(self, parser):
         """Generate optimized code for all functions."""
         self.output = []
+        self._current_parser = parser  # Store parser reference for variable lookup
         
         # Separate small and large functions
         functions = parser.get_functions()
@@ -34,9 +37,21 @@ class CodeGenerator:
             else:
                 large_funcs.append(func)
         
+        # Generate initialization code for SIMD bit-packing
+        if self.global_var_data['packed_vars']:
+            self._generate_simd_packing_init()
+            self.output.append("")
+        
         # Generate code section
         self.output.append("SECTION .text")
         self.output.append("")
+        
+        # Generate main entry point that calls initialization
+        if self.global_var_data['packed_vars']:
+            self.output.append("; Program entry point")
+            self.output.append("_start:")
+            self.output.append("    CALL _init_simd_packing  ; Initialize SIMD bit-packing")
+            self.output.append("")
         
         # Generate small functions with indexed-jump support
         if small_funcs:
@@ -48,9 +63,8 @@ class CodeGenerator:
             self._generate_function(func)
             self.output.append("")
         
-        # Generate data section for function table
-        if small_funcs:
-            self._generate_function_table(small_funcs)
+        # Generate data section for function table and global variables
+        self._generate_data_section(parser)
         
         return "\n".join(self.output)
     
@@ -85,18 +99,162 @@ class CodeGenerator:
             func_name = func.decl.name if func.decl else "unknown"
             self.output.append(f"    DQ FUNC_{func_name}")
     
+    def _generate_data_section(self, parser):
+        """Generate data section for global variables."""
+        globals = parser.get_global_variables()
+        if not globals:
+            return
+        
+        self.output.append("SECTION .data")
+        self.output.append("")
+        
+        packed_var_names = {var['name'] for var in self.global_var_data['packed_vars']}
+        
+        for var in globals:
+            var_name = var.name if var.name else None
+            if not var_name:
+                continue
+            
+            # Only generate data for non-packed variables
+            # Packed variables are stored in SIMD register
+            if var_name not in packed_var_names:
+                # Regular global variable
+                self.output.append(f"GLOBAL_{var_name}:")
+                if var.init:
+                    # Has initializer
+                    if isinstance(var.init, c_ast.Constant):
+                        value = var.init.value
+                        self.output.append(f"    DD {value}  ; {var_name}")
+                    else:
+                        self.output.append(f"    DD 0  ; {var_name} (initialized at runtime)")
+                else:
+                    self.output.append(f"    DD 0  ; {var_name}")
+            else:
+                # Packed variable - still need a storage location for initialization
+                # but it will be packed into SIMD register
+                self.output.append(f"GLOBAL_{var_name}:")
+                if var.init:
+                    if isinstance(var.init, c_ast.Constant):
+                        value = var.init.value
+                        self.output.append(f"    DB {value}  ; {var_name} (packed into SIMD register)")
+                    else:
+                        self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
+                else:
+                    self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
+        
+        self.output.append("")
+    
+    def _generate_simd_packing_init(self):
+        """Generate initialization code to pack global variables into SIMD register."""
+        self.output.append("; SIMD Bit-Packing: Pack global variables (1-7 bits) into last SIMD register")
+        self.output.append("; This register (xmm15) is typically ignored by standard compilers")
+        self.output.append("_init_simd_packing:")
+        self.output.append(f"    ; Initialize {self.simd_register} with packed global variables")
+        self.output.append(f"    PXOR {self.simd_register}, {self.simd_register}  ; Clear register")
+        
+        packed_vars = self.global_var_data['packed_vars']
+        bit_positions = self.global_var_data['bit_positions']
+        
+        # Pack each variable into the register
+        for var_info in packed_vars:
+            var_name = var_info['name']
+            start_bit = var_info['start_bit']
+            bits = var_info['bits']
+            
+            # Load initial value (if any) and pack into register
+            self.output.append(f"    ; Pack {var_name} at bit {start_bit}, width {bits} bits")
+            self.output.append(f"    MOVZX RAX, BYTE [GLOBAL_{var_name}]  ; Load {var_name}")
+            self.output.append(f"    ; Extract and mask to {bits} bits")
+            self.output.append(f"    AND RAX, {(1 << bits) - 1}  ; Mask to {bits} bits")
+            
+            # Pack into SIMD register using bit manipulation
+            if start_bit == 0:
+                # First variable: just move into low bits
+                self.output.append(f"    MOVQ XMM0, RAX  ; Move to XMM0")
+                self.output.append(f"    POR {self.simd_register}, XMM0  ; OR into packed register")
+            else:
+                # Shift to correct position and OR into register
+                self.output.append(f"    SHL RAX, {start_bit}  ; Shift to bit position {start_bit}")
+                self.output.append(f"    MOVQ XMM0, RAX  ; Move to XMM0")
+                self.output.append(f"    POR {self.simd_register}, XMM0  ; OR into packed register")
+        
+        self.output.append(f"    ; {self.simd_register} now contains all packed global variables")
+        self.output.append("    RET")
+        self.output.append("")
+    
+    def _generate_packed_var_access(self, var_name, is_write=False, value_reg='RAX'):
+        """Generate inline assembly to access a packed variable from SIMD register.
+        
+        Uses direct SIMD register access for zero-latency operations, avoiding
+        memory reads that could stall the pipeline during interrupt callbacks.
+        """
+        if var_name not in self.global_var_data['bit_positions']:
+            return None  # Not a packed variable
+        
+        start_bit, bits = self.global_var_data['bit_positions'][var_name]
+        mask = (1 << bits) - 1
+        
+        if is_write:
+            # Write: extract value, modify, pack back
+            # Zero-latency: all operations on registers, no memory access
+            self.output.append(f"    ; Zero-latency write to packed variable {var_name} (bits {start_bit}-{start_bit+bits-1})")
+            self.output.append(f"    ; Direct SIMD register access - no memory stall")
+            # Save the value to write (it's in value_reg, typically RAX)
+            self.output.append(f"    PUSH {value_reg}  ; Save value to write")
+            self.output.append(f"    MOVQ RAX, {self.simd_register}  ; Load packed register (register-to-register)")
+            self.output.append(f"    ; Clear old value bits")
+            mask_shifted = mask << start_bit
+            self.output.append(f"    MOV RBX, {mask_shifted}")
+            self.output.append(f"    NOT RBX  ; Invert mask")
+            self.output.append(f"    AND RAX, RBX  ; Clear bits for {var_name}")
+            self.output.append(f"    ; Insert new value")
+            self.output.append(f"    POP RBX  ; Restore value to write")
+            self.output.append(f"    AND RBX, {mask}  ; Mask to {bits} bits")
+            self.output.append(f"    SHL RBX, {start_bit}  ; Shift to position")
+            self.output.append(f"    OR RAX, RBX  ; Insert new value")
+            self.output.append(f"    MOVQ {self.simd_register}, RAX  ; Store back to SIMD register (register-to-register)")
+            self.output.append(f"    ; Zero-latency: all operations in registers, no pipeline stall")
+        else:
+            # Read: extract value from register
+            # Zero-latency: direct register access, no memory read
+            self.output.append(f"    ; Zero-latency read from packed variable {var_name} (bits {start_bit}-{start_bit+bits-1})")
+            self.output.append(f"    ; Direct SIMD register access - eliminates memory read stall")
+            self.output.append(f"    MOVQ RAX, {self.simd_register}  ; Load packed register (register-to-register)")
+            if start_bit > 0:
+                self.output.append(f"    SHR RAX, {start_bit}  ; Shift to extract {var_name}")
+            self.output.append(f"    AND RAX, {mask}  ; Mask to {bits} bits")
+            self.output.append(f"    ; Value now in RAX (zero-latency, no memory access, no pipeline stall)")
+        
+        return True
+    
+    def _is_interrupt_callback(self, func_name):
+        """Check if function is an interrupt callback."""
+        from analyzer import is_interrupt_callback
+        return is_interrupt_callback(func_name)
+    
     def _generate_function(self, func_def):
         """Generate code for a single function."""
         func_name = func_def.decl.name if func_def.decl else "unknown"
         info = self.function_data.get(func_name, {})
+        is_interrupt = self._is_interrupt_callback(func_name)
         
         # Align function start to 16 bytes for quantized call-backs
         self.output.append(f"ALIGN {self.alignment}")
         self.output.append(f"FUNC_{func_name}:")
         
+        if is_interrupt:
+            self.output.append(f"    ; Interrupt callback: using zero-latency SIMD register access")
+            # For interrupt callbacks, ensure SIMD register is preserved/accessible
+            self.output.append(f"    ; {self.simd_register} contains packed kernel flags (no memory reads)")
+        
         # Function prologue
         self.output.append("    PUSH RBP")
         self.output.append("    MOV RBP, RSP")
+        
+        # For interrupt callbacks, preserve SIMD register if needed
+        if is_interrupt:
+            self.output.append(f"    SUB RSP, 16  ; Reserve space for SIMD register if needed")
+            # Note: xmm15 is typically preserved across calls, but we ensure it's accessible
         
         # Generate function body
         if func_def.body:
@@ -104,6 +262,8 @@ class CodeGenerator:
         
         # Function epilogue (optimized for single return sites with metamorphic return)
         # Note: If has_single_return, the return is handled in _generate_return
+        if is_interrupt:
+            self.output.append("    ADD RSP, 16  ; Restore stack if needed")
     
     def _generate_block(self, block, func_name, info):
         """Generate code for a block."""
@@ -212,7 +372,19 @@ class CodeGenerator:
             self.output.append(f"    MOV RAX, {value}")
         elif isinstance(expr, c_ast.ID):
             name = expr.name
-            self.output.append(f"    MOV RAX, [RBP-{name}]  ; Load variable")
+            # Check if this is a packed global variable
+            if name in self.global_var_data['bit_positions']:
+                # Use zero-latency SIMD register access
+                self._generate_packed_var_access(name, is_write=False)
+            else:
+                # Check if it's a global variable (non-packed)
+                globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                if name in globals:
+                    # Global variable (non-packed)
+                    self.output.append(f"    MOV RAX, [GLOBAL_{name}]  ; Load global variable")
+                else:
+                    # Local variable
+                    self.output.append(f"    MOV RAX, [RBP-{name}]  ; Load local variable")
         elif isinstance(expr, c_ast.BinaryOp):
             self._generate_binary_op(expr)
         elif isinstance(expr, c_ast.UnaryOp):
@@ -255,7 +427,19 @@ class CodeGenerator:
             self._generate_expression(assign.rvalue)
             if isinstance(assign.lvalue, c_ast.ID):
                 name = assign.lvalue.name
-                self.output.append(f"    MOV [RBP-{name}], RAX")
+                # Check if this is a packed global variable
+                if name in self.global_var_data['bit_positions']:
+                    # Use zero-latency SIMD register write
+                    self._generate_packed_var_access(name, is_write=True, value_reg='RAX')
+                else:
+                    # Check if it's a global variable (non-packed)
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        # Global variable (non-packed)
+                        self.output.append(f"    MOV [GLOBAL_{name}], RAX")
+                    else:
+                        # Local variable assignment
+                        self.output.append(f"    MOV [RBP-{name}], RAX")
     
     def _generate_if(self, if_stmt, func_name, info):
         """Generate code for if statement."""

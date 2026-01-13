@@ -52,6 +52,16 @@ class CParser:
         visitor = FunctionExtractor()
         visitor.visit(self.ast)
         return visitor.functions
+    
+    def get_global_variables(self):
+        """Extract all global variable declarations from the AST."""
+        if not self.ast:
+            return []
+        
+        globals = []
+        visitor = GlobalVariableExtractor()
+        visitor.visit(self.ast)
+        return visitor.globals
 
 
 class FunctionExtractor(c_ast.NodeVisitor):
@@ -64,4 +74,26 @@ class FunctionExtractor(c_ast.NodeVisitor):
         """Collect function definitions."""
         func_name = node.decl.name if node.decl else "unknown"
         self.functions.append(node)
+        self.generic_visit(node)
+
+
+class GlobalVariableExtractor(c_ast.NodeVisitor):
+    """Visitor to extract global variable declarations from AST."""
+    
+    def __init__(self):
+        self.globals = []
+        self.in_function = False
+    
+    def visit_FuncDef(self, node):
+        """Skip variables inside functions."""
+        self.in_function = True
+        self.generic_visit(node)
+        self.in_function = False
+    
+    def visit_Decl(self, node):
+        """Collect global variable declarations (not in functions)."""
+        if not self.in_function and node.name:
+            # Check if it's a variable (not a function)
+            if not isinstance(node.type, c_ast.FuncDecl):
+                self.globals.append(node)
         self.generic_visit(node)

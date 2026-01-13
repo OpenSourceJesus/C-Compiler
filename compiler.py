@@ -4,7 +4,7 @@
 import argparse
 import sys
 from parser import CParser
-from analyzer import analyze_all_functions
+from analyzer import analyze_all_functions, analyze_global_variables
 from codegen import CodeGenerator
 
 
@@ -41,9 +41,22 @@ def main():
         print(f"Error analyzing functions: {e}", file=sys.stderr)
         sys.exit(1)
     
+    # Analyze global variables for SIMD bit-packing
+    try:
+        global_var_data = analyze_global_variables(c_parser)
+        if args.verbose:
+            packed_count = len(global_var_data['packed_vars'])
+            if packed_count > 0:
+                print(f"SIMD Bit-Packing: {packed_count} global variables packed into {global_var_data['total_bits_used']} bits", file=sys.stderr)
+                for var_info in global_var_data['packed_vars']:
+                    print(f"  {var_info['name']}: {var_info['bits']} bits at position {var_info['start_bit']}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error analyzing global variables: {e}", file=sys.stderr)
+        global_var_data = {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
+    
     # Generate code
     try:
-        codegen = CodeGenerator(function_data)
+        codegen = CodeGenerator(function_data, global_var_data)
         output_code = codegen.generate(c_parser)
         
         # Write output
