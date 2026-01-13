@@ -19,6 +19,14 @@ class CodeGenerator:
         self.alignment = 16  # 16-byte alignment for quantized call-backs
         self.current_line = 0  # Track current output line for return site tracking
         self.simd_register = 'xmm15'  # Last SIMD register for bit-packing
+        
+        # Indexed stack pointer system (16-byte intervals)
+        self.stack_slot_size = 16  # 16-byte intervals
+        self.stack_base_register = 'R12'  # Base address register for stack
+        self.stack_index_register = 'R13'  # Index register (stores slot index, fits in 32 bits)
+        self.current_function_stack = {}  # Track local variables: {name: (slot_index, offset)}
+        self.current_stack_slots = 0  # Number of 16-byte slots allocated in current function
+        self.stack_base_address = 'STACK_BASE'  # Symbol for stack base address
     
     def generate(self, parser):
         """Generate optimized code for all functions."""
@@ -232,11 +240,100 @@ class CodeGenerator:
         from analyzer import is_interrupt_callback
         return is_interrupt_callback(func_name)
     
+    def _generate_local_var_load(self, var_name):
+        """Generate code to load a local variable using indexed stack pointer.
+        
+        Stack address = [R12 + slot_index*16 + offset]
+        Where R12 = stack base, slot_index fits in 32 bits (enables pointer compression)
+        """
+        if var_name not in self.current_function_stack:
+            # Variable not found in current function - might be a parameter or error
+            # For now, assume it's a parameter passed in register or use fallback
+            self.output.append(f"    ; Warning: {var_name} not found in stack, assuming parameter")
+            return
+        
+        slot_index, offset = self.current_function_stack[var_name]
+        
+        # Calculate address: [R12 + slot_index*16 + offset]
+        # Use indexed addressing: R12 (base) + slot_index*16 (displacement)
+        self.output.append(f"    ; Load local variable {var_name} from slot {slot_index}, offset {offset}")
+        self.output.append(f"    ; Indexed stack: address = [R12 + {slot_index}*16 + {offset}]")
+        self.output.append(f"    ; Slot index {slot_index} fits in 32 bits for pointer compression")
+        
+        # Calculate effective address: R12 + slot_index*16 + offset
+        displacement = slot_index * self.stack_slot_size + offset
+        if displacement == 0:
+            # Direct access to slot 0
+            self.output.append(f"    MOV RAX, [{self.stack_base_register}]  ; Load from slot 0")
+        else:
+            # Use displacement addressing
+            self.output.append(f"    MOV RAX, [{self.stack_base_register} + {displacement}]  ; Load from slot {slot_index}")
+    
+    def _generate_local_var_store(self, var_name):
+        """Generate code to store a local variable using indexed stack pointer.
+        
+        Stack address = [R12 + slot_index*16 + offset]
+        Where R12 = stack base, slot_index fits in 32 bits (enables pointer compression)
+        """
+        if var_name not in self.current_function_stack:
+            # Variable not found - allocate it now
+            slot_index = self.current_stack_slots
+            self.current_stack_slots += 1
+            self.current_function_stack[var_name] = (slot_index, 0)
+            self.output.append(f"    ; Allocating slot {slot_index} for {var_name}")
+            self.output.append(f"    INC {self.stack_index_register}  ; Increment slot index")
+        else:
+            slot_index, offset = self.current_function_stack[var_name]
+        
+        # Store value using indexed addressing
+        self.output.append(f"    ; Store to local variable {var_name} at slot {slot_index}, offset {offset}")
+        self.output.append(f"    ; Indexed stack: address = [R12 + {slot_index}*16 + {offset}]")
+        self.output.append(f"    ; Slot index {slot_index} fits in 32 bits for pointer compression")
+        
+        displacement = slot_index * self.stack_slot_size + offset
+        if displacement == 0:
+            self.output.append(f"    MOV [{self.stack_base_register}], RAX  ; Store to slot 0")
+        else:
+            self.output.append(f"    MOV [{self.stack_base_register} + {displacement}], RAX  ; Store to slot {slot_index}")
+    
+    def _generate_compressed_pointer(self, slot_index1, slot_index2=None):
+        """Generate code to create a compressed pointer (two 32-bit indices in one 64-bit register).
+        
+        This enables pointer compression: two stack slot indices can fit in one 64-bit register.
+        Since stack slots are 16-byte aligned, indices fit in 32 bits, allowing two indices
+        to be packed into a single 64-bit register.
+        
+        Useful for:
+        - Storing multiple stack pointers efficiently
+        - Passing stack locations between functions
+        - Enabling pointer compression optimizations
+        """
+        if slot_index2 is None:
+            # Single index - store in lower 32 bits (upper 32 bits remain 0)
+            self.output.append(f"    ; Compressed pointer: slot index {slot_index1} in lower 32 bits")
+            self.output.append(f"    MOV EAX, {slot_index1}  ; Store index in 32-bit register (fits in 32 bits)")
+            self.output.append(f"    ; Address = [R12 + EAX*16] for indexed stack access")
+        else:
+            # Two indices - pack into one 64-bit register
+            # Lower 32 bits: slot_index1, Upper 32 bits: slot_index2
+            self.output.append(f"    ; Compressed pointer: slot {slot_index1} (low) + slot {slot_index2} (high)")
+            self.output.append(f"    MOV EAX, {slot_index1}  ; Lower 32 bits: slot index {slot_index1}")
+            self.output.append(f"    MOV EDX, {slot_index2}  ; Upper 32 bits: slot index {slot_index2}")
+            self.output.append(f"    SHL RDX, 32  ; Shift upper index to high 32 bits")
+            self.output.append(f"    OR RAX, RDX  ; Combine: RAX = (slot2 << 32) | slot1")
+            self.output.append(f"    ; Single 64-bit register now contains two compressed stack pointers")
+            self.output.append(f"    ; Extract: low = RAX & 0xFFFFFFFF, high = (RAX >> 32) & 0xFFFFFFFF")
+            self.output.append(f"    ; Addresses: [R12 + low*16] and [R12 + high*16]")
+    
     def _generate_function(self, func_def):
         """Generate code for a single function."""
         func_name = func_def.decl.name if func_def.decl else "unknown"
         info = self.function_data.get(func_name, {})
         is_interrupt = self._is_interrupt_callback(func_name)
+        
+        # Reset stack tracking for this function
+        self.current_function_stack = {}
+        self.current_stack_slots = 0
         
         # Align function start to 16 bytes for quantized call-backs
         self.output.append(f"ALIGN {self.alignment}")
@@ -247,13 +344,25 @@ class CodeGenerator:
             # For interrupt callbacks, ensure SIMD register is preserved/accessible
             self.output.append(f"    ; {self.simd_register} contains packed kernel flags (no memory reads)")
         
-        # Function prologue
+        # Function prologue with indexed stack pointer
+        self.output.append("    ; Indexed stack pointer prologue (16-byte intervals)")
         self.output.append("    PUSH RBP")
-        self.output.append("    MOV RBP, RSP")
+        self.output.append("    PUSH R12  ; Preserve stack base register")
+        self.output.append("    PUSH R13  ; Preserve stack index register")
+        self.output.append("    MOV RBP, RSP  ; Save old RSP")
+        
+        # Initialize indexed stack pointer system
+        # R12 = stack base address, R13 = current slot index (0-based)
+        self.output.append(f"    MOV {self.stack_base_register}, {self.stack_base_address}  ; Load stack base")
+        self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
+        self.output.append("    ; Stack address = [R12 + R13*16] for indexed access")
+        self.output.append("    ; Pointer compression: R13 fits in 32 bits, allowing two indices in one 64-bit register")
         
         # For interrupt callbacks, preserve SIMD register if needed
         if is_interrupt:
-            self.output.append(f"    SUB RSP, 16  ; Reserve space for SIMD register if needed")
+            # Allocate one slot (16 bytes) for SIMD register preservation
+            self.current_stack_slots = 1
+            self.output.append(f"    INC {self.stack_index_register}  ; Allocate slot 0 for SIMD register")
             # Note: xmm15 is typically preserved across calls, but we ensure it's accessible
         
         # Generate function body
@@ -262,8 +371,12 @@ class CodeGenerator:
         
         # Function epilogue (optimized for single return sites with metamorphic return)
         # Note: If has_single_return, the return is handled in _generate_return
-        if is_interrupt:
-            self.output.append("    ADD RSP, 16  ; Restore stack if needed")
+        if is_interrupt and self.current_stack_slots > 0:
+            self.output.append(f"    DEC {self.stack_index_register}  ; Deallocate SIMD register slot")
+        
+        # Restore registers
+        self.output.append("    POP R13  ; Restore stack index register")
+        self.output.append("    POP R12  ; Restore stack base register")
     
     def _generate_block(self, block, func_name, info):
         """Generate code for a block."""
@@ -297,6 +410,9 @@ class CodeGenerator:
         if info.get('has_single_return', False):
             # Metamorphic return site: return address is written into instruction
             self.output.append("    ; Metamorphic return site - address injected by caller")
+            # Restore stack index to 0 (all slots deallocated)
+            if self.current_stack_slots > 0:
+                self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
             self.output.append("    MOV RSP, RBP")
             self.output.append("    POP RBP")
             # The RET address will be dynamically modified by the caller
@@ -305,7 +421,10 @@ class CodeGenerator:
             # Standard return
             if ret_stmt.expr:
                 self._generate_expression(ret_stmt.expr)
-                self.output.append("    MOV RAX, [RSP-8]  ; Return value")
+                # Return value is already in RAX from expression evaluation
+            # Restore stack index to 0 (all slots deallocated)
+            if self.current_stack_slots > 0:
+                self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
             self.output.append("    MOV RSP, RBP")
             self.output.append("    POP RBP")
             self.output.append("    RET")
@@ -383,8 +502,8 @@ class CodeGenerator:
                     # Global variable (non-packed)
                     self.output.append(f"    MOV RAX, [GLOBAL_{name}]  ; Load global variable")
                 else:
-                    # Local variable
-                    self.output.append(f"    MOV RAX, [RBP-{name}]  ; Load local variable")
+                    # Local variable - use indexed stack pointer
+                    self._generate_local_var_load(name)
         elif isinstance(expr, c_ast.BinaryOp):
             self._generate_binary_op(expr)
         elif isinstance(expr, c_ast.UnaryOp):
@@ -438,8 +557,8 @@ class CodeGenerator:
                         # Global variable (non-packed)
                         self.output.append(f"    MOV [GLOBAL_{name}], RAX")
                     else:
-                        # Local variable assignment
-                        self.output.append(f"    MOV [RBP-{name}], RAX")
+                        # Local variable assignment - use indexed stack pointer
+                        self._generate_local_var_store(name)
     
     def _generate_if(self, if_stmt, func_name, info):
         """Generate code for if statement."""
@@ -497,9 +616,26 @@ class CodeGenerator:
         self.output.append(f"{end_label}:")
     
     def _generate_decl(self, decl):
-        """Generate code for variable declaration."""
+        """Generate code for variable declaration with indexed stack pointer."""
+        name = decl.name
+        # Allocate a 16-byte slot for the variable (indexed stack)
+        slot_index = self.current_stack_slots
+        self.current_stack_slots += 1
+        
+        # Store variable location: (slot_index, offset_within_slot)
+        # For simplicity, we'll use offset 0 within each slot
+        # Multiple small variables could share a slot, but for now one per slot
+        self.current_function_stack[name] = (slot_index, 0)
+        
+        # Increment stack index register to allocate new slot
+        self.output.append(f"    ; Allocate slot {slot_index} (16 bytes) for {name}")
+        self.output.append(f"    INC {self.stack_index_register}  ; Increment slot index")
+        
         if decl.init:
             self._generate_expression(decl.init)
-            name = decl.name
-            self.output.append(f"    SUB RSP, 8  ; Allocate space for {name}")
-            self.output.append(f"    MOV [RBP-{name}], RAX")
+            # Store value using indexed addressing
+            self._generate_local_var_store(name)
+        else:
+            # Initialize to 0
+            self.output.append(f"    XOR RAX, RAX  ; Initialize {name} to 0")
+            self._generate_local_var_store(name)
