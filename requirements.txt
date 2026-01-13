@@ -1,0 +1,2 @@
+pycparser>=2.21
+pycparser-fake-libc>=1.2
