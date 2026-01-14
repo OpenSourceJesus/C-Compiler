@@ -54,12 +54,36 @@ class CodeGenerator:
         self.output.append("SECTION .text")
         self.output.append("")
         
-        # Generate main entry point that calls initialization
+        # Generate main entry point
+        self.output.append("; Program entry point")
+        self.output.append("_start:")
+        
+        # Ensure stack is 16-byte aligned (required for x86-64 ABI)
+        # RSP is already set by the kernel, but we align it to be safe
+        self.output.append("    ; Align stack to 16 bytes (x86-64 ABI requirement)")
+        self.output.append("    AND RSP, 0xFFFFFFFFFFFFFFF0  ; Align to 16-byte boundary")
+        
+        # Initialize SIMD bit-packing if needed
         if self.global_var_data['packed_vars']:
-            self.output.append("; Program entry point")
-            self.output.append("_start:")
             self.output.append("    CALL _init_simd_packing  ; Initialize SIMD bit-packing")
-            self.output.append("")
+        
+        # Call main function if it exists
+        has_main = any(
+            (f.decl.name if f.decl else "unknown") == "main"
+            for f in small_funcs + large_funcs
+        )
+        if has_main:
+            self.output.append("    CALL FUNC_main  ; Call main function")
+            self.output.append("    ; Main return value is in RAX, save it for exit")
+            self.output.append("    MOV RDI, RAX  ; Save return value to RDI (exit code)")
+        else:
+            self.output.append("    MOV RDI, 0   ; No main function, exit with code 0")
+        
+        # Exit with return code from main (in RDI)
+        self.output.append("    ; Exit system call (sys_exit)")
+        self.output.append("    MOV RAX, 60  ; sys_exit")
+        self.output.append("    SYSCALL")
+        self.output.append("")
         
         # Generate small functions with indexed-jump support
         if small_funcs:
@@ -108,13 +132,18 @@ class CodeGenerator:
             self.output.append(f"    DQ FUNC_{func_name}")
     
     def _generate_data_section(self, parser):
-        """Generate data section for global variables."""
+        """Generate data section for global variables and STACK_BASE."""
+        self.output.append("SECTION .data")
+        self.output.append("")
+        
+        # Always define STACK_BASE for indexed stack pointer system
+        self.output.append("STACK_BASE:")
+        self.output.append("    DQ 0x7FFF0000  ; Stack base address")
+        self.output.append("")
+        
         globals = parser.get_global_variables()
         if not globals:
             return
-        
-        self.output.append("SECTION .data")
-        self.output.append("")
         
         packed_var_names = {var['name'] for var in self.global_var_data['packed_vars']}
         
@@ -154,8 +183,9 @@ class CodeGenerator:
     
     def _generate_simd_packing_init(self):
         """Generate initialization code to pack global variables into SIMD register."""
-        self.output.append("; SIMD Bit-Packing: Pack global variables (1-7 bits) into last SIMD register")
+        self.output.append("; SIMD Bit-Packing: Pack global variables (1-8 bits) into last SIMD register")
         self.output.append("; This register (xmm15) is typically ignored by standard compilers")
+        self.output.append("; Variables declared as 'auto _Alignas(N) char' are packed as N-bit values")
         self.output.append("_init_simd_packing:")
         self.output.append(f"    ; Initialize {self.simd_register} with packed global variables")
         self.output.append(f"    PXOR {self.simd_register}, {self.simd_register}  ; Clear register")
@@ -282,6 +312,14 @@ class CodeGenerator:
             self.current_stack_slots += 1
             self.current_function_stack[var_name] = (slot_index, offset)
             self.output.append(f"    ; Allocating slot {slot_index} for {var_name}")
+            # Allocate stack space (16 bytes per slot) and adjust R12 to point to allocated region
+            if slot_index == 0:
+                # First slot: allocate space and set R12 to point to it
+                self.output.append(f"    SUB RSP, {self.stack_slot_size}  ; Allocate {self.stack_slot_size} bytes on stack")
+                self.output.append(f"    MOV {self.stack_base_register}, RSP  ; R12 now points to allocated region")
+            else:
+                # Subsequent slots: just allocate more space
+                self.output.append(f"    SUB RSP, {self.stack_slot_size}  ; Allocate {self.stack_slot_size} bytes on stack")
             self.output.append(f"    INC {self.stack_index_register}  ; Increment slot index")
         else:
             slot_index, offset = self.current_function_stack[var_name]
@@ -354,7 +392,11 @@ class CodeGenerator:
         
         # Initialize indexed stack pointer system
         # R12 = stack base address, R13 = current slot index (0-based)
-        self.output.append(f"    MOV {self.stack_base_register}, {self.stack_base_address}  ; Load stack base")
+        # For Linux user-space: use RSP as base (actual stack)
+        # For kernel/bare-metal with custom memory layout, could use: MOV R12, [STACK_BASE]
+        # Note: We'll set R12 to point to allocated stack space when slots are allocated
+        # For now, initialize R12 to RSP (will be adjusted when slots are allocated)
+        self.output.append(f"    MOV {self.stack_base_register}, RSP  ; Initialize to current stack pointer")
         self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
         self.output.append("    ; Stack address = [R12 + R13*16] for indexed access")
         self.output.append("    ; Pointer compression: R13 fits in 32 bits, allowing two indices in one 64-bit register")
@@ -369,15 +411,20 @@ class CodeGenerator:
         # Generate function body
         if func_def.body:
             self._generate_block(func_def.body, func_name, info)
-        
-        # Function epilogue (optimized for single return sites with metamorphic return)
-        # Note: If has_single_return, the return is handled in _generate_return
-        if is_interrupt and self.current_stack_slots > 0:
-            self.output.append(f"    DEC {self.stack_index_register}  ; Deallocate SIMD register slot")
-        
-        # Restore registers
-        self.output.append("    POP R13  ; Restore stack index register")
-        self.output.append("    POP R12  ; Restore stack base register")
+            # Check if the function body contains any return statements
+            # If not, add an implicit return at the end
+            block_items = func_def.body.block_items if isinstance(func_def.body, c_ast.Compound) else [func_def.body]
+            has_any_return = block_items and any(isinstance(item, c_ast.Return) for item in block_items)
+            if not has_any_return:
+                # Generate implicit return (fall-through case)
+                # Restore stack index to 0
+                if self.current_stack_slots > 0:
+                    self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
+                self.output.append("    MOV RSP, RBP")
+                self.output.append("    POP R13  ; Restore stack index register")
+                self.output.append("    POP R12  ; Restore stack base register")
+                self.output.append("    POP RBP")
+                self.output.append("    RET")
     
     def _generate_block(self, block, func_name, info):
         """Generate code for a block."""
@@ -418,6 +465,8 @@ class CodeGenerator:
             if self.current_stack_slots > 0:
                 self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
             self.output.append("    MOV RSP, RBP")
+            self.output.append("    POP R13  ; Restore stack index register")
+            self.output.append("    POP R12  ; Restore stack base register")
             self.output.append("    POP RBP")
             # The RET address will be dynamically modified by the caller
             self.output.append("    RET  ; Address bytes written by caller")
@@ -430,6 +479,8 @@ class CodeGenerator:
             if self.current_stack_slots > 0:
                 self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
             self.output.append("    MOV RSP, RBP")
+            self.output.append("    POP R13  ; Restore stack index register")
+            self.output.append("    POP R12  ; Restore stack base register")
             self.output.append("    POP RBP")
             self.output.append("    RET")
     

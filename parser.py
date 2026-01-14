@@ -15,6 +15,28 @@ class CParser:
     def __init__(self):
         self.parser = c_parser.CParser()
         self.ast = None
+        self._alignas_info = {}  # Store _Alignas information extracted during preprocessing
+    
+    @staticmethod
+    def _extract_alignas_info(content):
+        """Extract _Alignas(N) information from preprocessed content.
+        
+        Returns a dict mapping variable names to their alignment values.
+        Pattern: 'auto _Alignas(N) char var_name;'
+        """
+        alignas_info = {}
+        lines = content.split('\n')
+        
+        for line in lines:
+            # Match pattern: auto _Alignas(N) char var_name;
+            # or variations with signed/unsigned
+            match = re.search(r'auto\s+_Alignas\s*\(\s*(\d+)\s*\)\s+(?:signed\s+|unsigned\s+)?char\s+(\w+)\s*;', line, re.IGNORECASE)
+            if match:
+                align_value = int(match.group(1))
+                var_name = match.group(2)
+                alignas_info[var_name] = align_value
+        
+        return alignas_info
     
     @staticmethod
     def _preprocess_inline_asm(content):
@@ -88,7 +110,7 @@ class CParser:
                 cpp_args = [
                     '-E',
                     '-P',  # Don't include line markers
-                    '-std=c99',                      # Enable C99 for variadic macros
+                    '-std=c11',                      # Enable C11 for _Alignas support
                     '-D__attribute__(...)=',         # Define __attribute__ as empty variadic macro
                     '-D__extension__=',              # Define __extension__ as empty macro
                     '-D__inline__=inline',           # Map __inline__ to standard inline
@@ -131,6 +153,11 @@ class CParser:
                 
                 # Process the preprocessed output to remove inline assembly
                 preprocessed_content = result.stdout
+                
+                # Extract _Alignas information before preprocessing removes it
+                # Store it for later use in the analyzer
+                self._alignas_info = self._extract_alignas_info(preprocessed_content)
+                
                 preprocessed_content = self._preprocess_inline_asm(preprocessed_content)
                 
                 # Write to temp file and parse without cpp
@@ -150,6 +177,13 @@ class CParser:
             except (FileNotFoundError, OSError):
                 # Fall back to direct parsing (without preprocessing)
                 # This works for simple C code without stdlib includes
+                # Try to extract _Alignas info from source file directly
+                try:
+                    with open(filename, 'r') as f:
+                        source_content = f.read()
+                    self._alignas_info = self._extract_alignas_info(source_content)
+                except:
+                    self._alignas_info = {}
                 self.ast = parse_file(filename, use_cpp=False)
             return self.ast
         except ParseError as e:
@@ -186,7 +220,13 @@ class CParser:
         globals = []
         visitor = GlobalVariableExtractor()
         visitor.visit(self.ast)
+        # Don't overwrite _alignas_info - it's already set during parse_file
+        # The visitor's alignas_info is separate and not used
         return visitor.globals
+    
+    def get_alignas_info(self):
+        """Get _Alignas information extracted during parsing."""
+        return getattr(self, '_alignas_info', {})
 
 
 class FunctionExtractor(c_ast.NodeVisitor):
@@ -208,6 +248,7 @@ class GlobalVariableExtractor(c_ast.NodeVisitor):
     def __init__(self):
         self.globals = []
         self.in_function = False
+        self.alignas_info = {}  # Store _Alignas information: {var_name: align_value}
     
     def visit_FuncDef(self, node):
         """Skip variables inside functions."""
@@ -220,6 +261,8 @@ class GlobalVariableExtractor(c_ast.NodeVisitor):
         if not self.in_function and node.name:
             # Check if it's a variable (not a function)
             if not isinstance(node.type, c_ast.FuncDecl):
+                # Store _Alignas information if present in the node
+                # This will be checked later in the analyzer
                 self.globals.append(node)
         self.generic_visit(node)
 

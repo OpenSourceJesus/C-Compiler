@@ -127,31 +127,103 @@ class GlobalVariableAnalyzer:
     }
     
     def __init__(self):
-        self.packed_vars = []  # Variables that can be packed (1-7 bits)
+        self.packed_vars = []  # Variables that can be packed (1-8 bits)
         self.bit_positions = {}  # Map variable name to (start_bit, bit_width)
         self.current_bit = 0
         self.simd_register_size = 128  # xmm15 is 128-bit, can use ymm15/zmm15 for wider
+        self.alignas_info = {}  # _Alignas information from parser: {var_name: align_value}
     
     def get_type_bits(self, decl):
         """Determine the bit width of a variable type.
         
-        Detects 1-7 bit types for SIMD packing:
-        - Bit-fields (requires preprocessing support)
-        - Custom bit-width types (int1_t, uint3_t, etc.)
-        - Variables with bit-width in name (flag_1bit, counter_5bit)
-        - Small standard types that fit in 1-7 bits
+        Detects 1-8 bit types for SIMD packing using _Alignas(N) convention:
+        - 'auto _Alignas(N) char' indicates an N-bit variable (N = 1-8)
+        - Only applies to 'char', 'signed char', or 'unsigned char' types
+        - Requires 'auto' storage class
         """
         if not decl or not decl.type:
             return None
         
         type_str = self._type_to_string(decl.type)
         var_name = decl.name if decl.name else ""
+        type_lower = type_str.lower()
         
-        # Check for bit-width in variable name (e.g., flag_1bit, counter_3bit)
+        # Check for _Alignas(N) convention: 'auto _Alignas(N) char'
+        # First, verify it's a char type (char, signed char, or unsigned char)
+        is_char_type = any(char_type in type_lower for char_type in ['char', 'signed char', 'unsigned char'])
+        
+        if is_char_type:
+            # First check if we have _Alignas info from the parser (extracted from preprocessed source)
+            # If _Alignas info exists, it means the variable was declared with 'auto _Alignas(N) char'
+            # so we can trust that 'auto' was present in the original source
+            if var_name in self.alignas_info:
+                align_value = self.alignas_info[var_name]
+                if 1 <= align_value <= 8:
+                    # Since we extracted this from 'auto _Alignas(N) char' pattern,
+                    # we know 'auto' was present in the original declaration
+                    # (the extraction function only matches patterns with 'auto')
+                    return align_value
+            
+            # Fallback: Check for _Alignas(N) in multiple places:
+            # 1. In the type string (after preprocessing)
+            # 2. In type qualifiers
+            # 3. In alignment attributes
+            
+            align_value = None
+            
+            # Check type string for _Alignas(N) pattern
+            alignas_match = re.search(r'_alignas\s*\(\s*(\d+)\s*\)', type_lower, re.IGNORECASE)
+            if alignas_match:
+                align_value = int(alignas_match.group(1))
+            
+            # Check type qualifiers if not found in string
+            if align_value is None and isinstance(decl.type, c_ast.TypeDecl):
+                if hasattr(decl.type, 'quals') and decl.type.quals:
+                    quals_str = ' '.join(decl.type.quals).lower()
+                    alignas_match = re.search(r'_alignas\s*\(\s*(\d+)\s*\)', quals_str, re.IGNORECASE)
+                    if alignas_match:
+                        align_value = int(alignas_match.group(1))
+            
+            # Check for alignment attribute (if pycparser stores it separately)
+            if align_value is None and isinstance(decl.type, c_ast.TypeDecl):
+                # Check if there's an alignment attribute
+                if hasattr(decl.type, 'alignment') and decl.type.alignment:
+                    # Try to extract numeric value from alignment
+                    try:
+                        if isinstance(decl.type.alignment, c_ast.Constant):
+                            align_value = int(decl.type.alignment.value)
+                        elif hasattr(decl.type.alignment, 'value'):
+                            align_value = int(decl.type.alignment.value)
+                    except:
+                        pass
+            
+            if align_value is not None and 1 <= align_value <= 8:
+                # Verify 'auto' storage class is present
+                has_auto = 'auto' in type_lower
+                # Check declarator storage if available
+                if not has_auto and hasattr(decl, 'storage') and decl.storage:
+                    if isinstance(decl.storage, list):
+                        has_auto = 'auto' in [s.lower() for s in decl.storage]
+                    elif isinstance(decl.storage, str):
+                        has_auto = 'auto' in decl.storage.lower()
+                
+                # Also check if 'auto' appears before the type in the full declaration
+                # This handles cases where preprocessor expands macros
+                if not has_auto:
+                    # Try to get the full source representation if available
+                    full_type_str = str(decl.type) if hasattr(decl, 'type') else type_str
+                    has_auto = 'auto' in full_type_str.lower()
+                
+                if has_auto:
+                    print(f"{var_name} has bit-width {align_value} from _Alignas({align_value}) char with auto storage")
+                    return align_value
+        
+        # Legacy support: Check for bit-width in variable name (e.g., flag_1bit, counter_3bit)
+        # This is deprecated in favor of _Alignas convention
         name_bit_match = re.search(r'_(\d+)bit', var_name.lower())
         if name_bit_match:
             bits = int(name_bit_match.group(1))
-            if 1 <= bits <= 7:
+            if 1 <= bits <= 8:
                 return bits
         
         # Check for bit-field declarations (e.g., int flag : 1)
@@ -161,24 +233,22 @@ class GlobalVariableAnalyzer:
             if hasattr(decl, 'bitsize') and decl.bitsize:
                 try:
                     bits = int(decl.bitsize.value)
-                    if 1 <= bits <= 7:
+                    if 1 <= bits <= 8:
                         return bits
                 except:
                     pass
-        
-        # Check for explicit bit-width annotations in comments or attributes
-        type_lower = type_str.lower()
         
         # Check for custom bit-width types (e.g., int1_t, uint3_t, etc.)
         bit_match = re.search(r'(\d+)_t$', type_lower)
         if bit_match:
             bits = int(bit_match.group(1))
-            if 1 <= bits <= 7:
+            if 1 <= bits <= 8:
                 return bits
         
-        # Default: use standard type sizes, but only pack if <= 7 bits
+        # Default: use standard type sizes, but only pack if <= 8 bits
+        # Note: Standard types are typically >= 8 bits, so this rarely applies
         base_bits = self.TYPE_BITS.get(type_lower, 32)
-        if base_bits <= 7:
+        if base_bits <= 8:
             return base_bits
         
         return None
@@ -196,7 +266,9 @@ class GlobalVariableAnalyzer:
                 if names:
                     type_name = ' '.join(names)
             
-            return ' '.join(quals + [type_name])
+            # Combine qualifiers and type name
+            result = ' '.join(quals + [type_name])
+            return result
         elif isinstance(type_node, c_ast.IdentifierType):
             return ' '.join(type_node.names) if type_node.names else 'int'
         else:
@@ -214,8 +286,8 @@ class GlobalVariableAnalyzer:
                 continue
             
             bits = self.get_type_bits(var)
-            if bits and 1 <= bits <= 7:
-                # Check if it fits in the SIMD register
+            if bits and 1 <= bits <= 8:
+                # Check if it fits in the SIMD register (up to 128 bits total)
                 if self.current_bit + bits <= self.simd_register_size:
                     self.packed_vars.append({
                         'name': var_name,
@@ -240,6 +312,14 @@ def analyze_global_variables(parser):
     """Analyze global variables for SIMD bit-packing."""
     globals = parser.get_global_variables()
     analyzer = GlobalVariableAnalyzer()
+    # Get _Alignas information from parser
+    if hasattr(parser, 'get_alignas_info'):
+        alignas_info = parser.get_alignas_info()
+    elif hasattr(parser, '_alignas_info'):
+        alignas_info = parser._alignas_info
+    else:
+        alignas_info = {}
+    analyzer.alignas_info = alignas_info
     return analyzer.analyze_globals(globals)
 
 
