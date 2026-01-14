@@ -278,8 +278,9 @@ class CodeGenerator:
         if var_name not in self.current_function_stack:
             # Variable not found - allocate it now
             slot_index = self.current_stack_slots
+            offset = 0
             self.current_stack_slots += 1
-            self.current_function_stack[var_name] = (slot_index, 0)
+            self.current_function_stack[var_name] = (slot_index, offset)
             self.output.append(f"    ; Allocating slot {slot_index} for {var_name}")
             self.output.append(f"    INC {self.stack_index_register}  ; Increment slot index")
         else:
@@ -381,8 +382,11 @@ class CodeGenerator:
     def _generate_block(self, block, func_name, info):
         """Generate code for a block."""
         if isinstance(block, c_ast.Compound):
-            for item in block.block_items:
-                self._generate_statement(item, func_name, info)
+            # block_items can be None for empty blocks
+            if block.block_items:
+                for item in block.block_items:
+                    self._generate_statement(item, func_name, info)
+            # If block_items is None, it's an empty block - do nothing
         else:
             self._generate_statement(block, func_name, info)
     
