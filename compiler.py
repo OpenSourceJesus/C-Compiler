@@ -3,7 +3,9 @@
 
 import argparse
 import sys
-from parser import CParser
+import os
+from pathlib import Path
+from parser import CParser, MultiFileParser, find_c_files
 from analyzer import analyze_all_functions, analyze_global_variables
 from codegen import CodeGenerator
 
@@ -11,20 +13,53 @@ from codegen import CodeGenerator
 def main():
     """Main compiler entry point."""
     parser = argparse.ArgumentParser(description='Custom C Compiler with Function Call Optimizations')
-    parser.add_argument('input_file', help='Input C source file')
+    parser.add_argument('input_path', help='Input C source file or directory containing C files')
     parser.add_argument('-o', '--output', help='Output assembly file', default=None)
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     args = parser.parse_args()
     
-    # Parse input file
-    c_parser = CParser()
-    try:
-        ast = c_parser.parse_file(args.input_file)
-        if args.verbose:
-            print(f"Parsed {args.input_file} successfully", file=sys.stderr)
-    except Exception as e:
-        print(f"Error parsing {args.input_file}: {e}", file=sys.stderr)
+    input_path = Path(args.input_path)
+    
+    # Determine if input is a file or directory
+    if input_path.is_file():
+        # Single file mode
+        c_files = [str(input_path)]
+        c_parser = CParser()
+        try:
+            ast = c_parser.parse_file(args.input_path)
+            if args.verbose:
+                print(f"Parsed {args.input_path} successfully", file=sys.stderr)
+        except Exception as e:
+            print(f"Error parsing {args.input_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif input_path.is_dir():
+        # Directory mode - find all .c files recursively
+        try:
+            c_files = find_c_files(args.input_path)
+            if not c_files:
+                print(f"Error: No .c files found in directory {args.input_path}", file=sys.stderr)
+                sys.exit(1)
+            
+            if args.verbose:
+                print(f"Found {len(c_files)} C file(s) in {args.input_path}:", file=sys.stderr)
+                for c_file in c_files:
+                    print(f"  {c_file}", file=sys.stderr)
+            
+            # Parse all files
+            c_parser = MultiFileParser()
+            try:
+                c_parser.parse_files(c_files)
+                if args.verbose:
+                    print(f"Parsed {len(c_files)} file(s) successfully", file=sys.stderr)
+            except Exception as e:
+                print(f"Error parsing files: {e}", file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Error: {args.input_path} is not a valid file or directory", file=sys.stderr)
         sys.exit(1)
     
     # Analyze functions
@@ -60,7 +95,14 @@ def main():
         output_code = codegen.generate(c_parser)
         
         # Write output
-        output_file = args.output or args.input_file.replace('.c', '.asm')
+        if args.output:
+            output_file = args.output
+        elif input_path.is_file():
+            output_file = str(input_path).replace('.c', '.asm')
+        else:
+            # For directories, use directory name with .asm extension
+            output_file = os.path.join(args.input_path, Path(args.input_path).name + '.asm')
+        
         with open(output_file, 'w') as f:
             f.write(output_code)
         

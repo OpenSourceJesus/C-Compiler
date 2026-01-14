@@ -4,6 +4,7 @@ from pycparser import c_parser, c_ast, parse_file
 from pycparser.plyparser import ParseError
 import sys
 import os
+from pathlib import Path
 
 
 class CParser:
@@ -97,3 +98,64 @@ class GlobalVariableExtractor(c_ast.NodeVisitor):
             if not isinstance(node.type, c_ast.FuncDecl):
                 self.globals.append(node)
         self.generic_visit(node)
+
+
+class MultiFileParser:
+    """Parser that aggregates functions and globals from multiple C files."""
+    
+    def __init__(self):
+        self.parsers = []  # List of CParser instances, one per file
+        self.file_paths = []  # List of file paths
+    
+    def parse_files(self, file_paths):
+        """Parse multiple C files and aggregate their ASTs."""
+        self.file_paths = file_paths
+        self.parsers = []
+        
+        for file_path in file_paths:
+            parser = CParser()
+            try:
+                parser.parse_file(file_path)
+                self.parsers.append(parser)
+            except Exception as e:
+                print(f"Warning: Failed to parse {file_path}: {e}", file=sys.stderr)
+                raise
+        
+        return self.parsers
+    
+    def get_functions(self):
+        """Extract all function definitions from all parsed files."""
+        all_functions = []
+        for parser in self.parsers:
+            functions = parser.get_functions()
+            all_functions.extend(functions)
+        return all_functions
+    
+    def get_global_variables(self):
+        """Extract all global variable declarations from all parsed files."""
+        all_globals = []
+        for parser in self.parsers:
+            globals = parser.get_global_variables()
+            all_globals.extend(globals)
+        return all_globals
+
+
+def find_c_files(directory):
+    """Recursively find all .c files in a directory and its subdirectories."""
+    c_files = []
+    path = Path(directory)
+    
+    if not path.exists():
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    
+    if not path.is_dir():
+        raise ValueError(f"Not a directory: {directory}")
+    
+    # Recursively find all .c files
+    for c_file in path.rglob("*.c"):
+        c_files.append(str(c_file))
+    
+    # Sort for deterministic order
+    c_files.sort()
+    
+    return c_files
