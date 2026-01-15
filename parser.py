@@ -97,13 +97,15 @@ class CParser:
     
     def parse_file(self, filename):
         """Parse a C file into an AST."""
+        # Convert filename to absolute path early to avoid issues with path resolution
+        abs_filename = os.path.abspath(filename)
         try:
             # Try to use cpp, but fall back to direct parsing if not available
             try:
                 # Get the directory where this script is located to find the wrapper header
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 wrapper_header = os.path.join(script_dir, 'pycparser_wrapper.h')
-                source_dir = os.path.dirname(os.path.abspath(filename))
+                source_dir = os.path.dirname(abs_filename)
                 
                 # Define GCC-specific attributes and extensions as empty macros so pycparser can handle them
                 # Use variadic macro for __attribute__ to handle __attribute__((...)) syntax
@@ -140,9 +142,10 @@ class CParser:
                     pass  # fake libc not available, use system headers
                 
                 # Call cpp manually to get preprocessed output
+                # Use absolute filename to avoid path resolution issues with cwd
                 import subprocess
                 result = subprocess.run(
-                    ['cpp'] + cpp_args + [filename],
+                    ['cpp'] + cpp_args + [abs_filename],
                     capture_output=True,
                     text=True,
                     cwd=source_dir
@@ -179,12 +182,12 @@ class CParser:
                 # This works for simple C code without stdlib includes
                 # Try to extract _Alignas info from source file directly
                 try:
-                    with open(filename, 'r') as f:
+                    with open(abs_filename, 'r') as f:
                         source_content = f.read()
                     self._alignas_info = self._extract_alignas_info(source_content)
                 except:
                     self._alignas_info = {}
-                self.ast = parse_file(filename, use_cpp=False)
+                self.ast = parse_file(abs_filename, use_cpp=False)
             return self.ast
         except ParseError as e:
             print(f"Parse error: {e}", file=sys.stderr)

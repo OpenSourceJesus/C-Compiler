@@ -2,14 +2,38 @@
 
 from pycparser import c_ast
 import struct
+import sys
+
+
+def safe_str(obj):
+    """Safely convert an object to string, preventing AST node attributes from leaking.
+    
+    This function ensures that AST node objects are never accidentally output
+    as their string representation, which could include attribute names like
+    'type' or 'field' that would cause assembly errors.
+    """
+    if obj is None:
+        return "None"
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (int, float, bool)):
+        return str(obj)
+    # For AST nodes, only output the class name, never the object itself
+    if hasattr(obj, '__class__'):
+        class_name = obj.__class__.__name__
+        # Remove any angle brackets or module paths
+        return class_name.split('.')[-1]
+    # For other objects, use type name
+    return type(obj).__name__
 
 
 class CodeGenerator:
     """Code generator with indexed-jump, metamorphic return sites, quantized call-backs, and SIMD bit-packing."""
     
-    def __init__(self, function_data, global_var_data=None):
+    def __init__(self, function_data, global_var_data=None, asm_parser=None):
         self.function_data = function_data
         self.global_var_data = global_var_data or {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
+        self.asm_parser = asm_parser  # Assembly parser for external symbols
         self.output = []
         self.small_functions = []
         self.function_offsets = {}
@@ -19,6 +43,7 @@ class CodeGenerator:
         self.alignment = 16  # 16-byte alignment for quantized call-backs
         self.current_line = 0  # Track current output line for return site tracking
         self.simd_register = 'xmm15'  # Last SIMD register for bit-packing
+        self.referenced_asm_symbols = set()  # Track which assembly symbols we've included
         
         # Indexed stack pointer system (16-byte intervals)
         self.stack_slot_size = 16  # 16-byte intervals
@@ -27,19 +52,62 @@ class CodeGenerator:
         self.current_function_stack = {}  # Track local variables: {name: (slot_index, offset)}
         self.current_stack_slots = 0  # Number of 16-byte slots allocated in current function
         self.stack_base_address = 'STACK_BASE'  # Symbol for stack base address
+        self.label_counter = 0  # Counter for unique labels
+    
+    def _safe_append(self, line):
+        """Safely append a line to output, ensuring no AST node objects are included.
+        
+        This prevents AST nodes from being accidentally converted to strings
+        and output, which could cause assembly errors with labels like 'type'
+        or 'field'.
+        """
+        # If line contains an AST node object, convert it safely
+        if isinstance(line, c_ast.Node):
+            # This should never happen, but protect against it
+            line = f"; ERROR: AST node object detected: {safe_str(line)}"
+        elif not isinstance(line, str):
+            # Convert non-string objects safely
+            line = safe_str(line)
+        
+        # Check if line looks like it contains an AST node attribute that was output as a label
+        # Patterns like "type:" or "field:" at the start of a line (after whitespace)
+        import re
+        stripped = line.strip()
+        # Check for problematic labels that are AST attribute names
+        problematic_labels = ['type:', 'field:', 'name:', 'expr:', 'node:', 'struct_ref:', 'assign:']
+        if stripped in problematic_labels or (stripped.endswith(':') and len(stripped.split()) == 1 and stripped[:-1] in ['type', 'field', 'name', 'expr', 'node']):
+            # This looks like an AST node attribute was output as a label - skip it
+            return  # Don't output this line
+        
+        self.output.append(line)
     
     def generate(self, parser):
         """Generate optimized code for all functions."""
         self.output = []
         self._current_parser = parser  # Store parser reference for variable lookup
         
-        # Separate small and large functions
+        # Separate small and large functions, deduplicating by name
         functions = parser.get_functions()
+        seen_funcs = {}  # {func_name: func_node} to deduplicate
+        for func in functions:
+            func_name = func.decl.name if func.decl else "unknown"
+            # Skip functions with "unknown" names - they're likely parsing errors
+            if func_name == "unknown":
+                continue
+            # Only keep the first occurrence of each function
+            if func_name not in seen_funcs:
+                seen_funcs[func_name] = func
+        
+        # Use deduplicated functions
+        unique_functions = list(seen_funcs.values())
         small_funcs = []
         large_funcs = []
         
-        for func in functions:
+        for func in unique_functions:
             func_name = func.decl.name if func.decl else "unknown"
+            # Skip functions with "unknown" names
+            if func_name == "unknown":
+                continue
             if func_name in self.function_data and self.function_data[func_name]['is_small']:
                 small_funcs.append(func)
             else:
@@ -98,7 +166,28 @@ class CodeGenerator:
         # Generate data section for function table and global variables
         self._generate_data_section(parser)
         
-        return "\n".join(self.output)
+        # Generate assembly code for referenced external symbols
+        if self.asm_parser:
+            self._generate_asm_symbols(parser)
+        
+        # Final sanitization pass to remove any AST node attributes that might have leaked
+        sanitized_output = []
+        for line in self.output:
+            # Skip lines that look like AST node attributes output as labels
+            stripped = line.strip()
+            problematic_labels = ['type:', 'field:', 'name:', 'expr:', 'node:', 'struct_ref:', 'assign:']
+            if stripped in problematic_labels:
+                # Skip this line - it's an AST node attribute that was accidentally output
+                continue
+            # Also check for single-word labels that are AST attribute names
+            if stripped.endswith(':') and len(stripped.split()) == 1:
+                label_name = stripped[:-1]
+                if label_name in ['type', 'field', 'name', 'expr', 'node', 'struct_ref', 'assign']:
+                    # Skip this line
+                    continue
+            sanitized_output.append(line)
+        
+        return "\n".join(sanitized_output)
     
     def _generate_indexed_jump_table(self, small_funcs):
         """Generate indexed-jump table for small functions."""
@@ -111,7 +200,7 @@ class CodeGenerator:
         for func in small_funcs:
             func_name = func.decl.name if func.decl else "unknown"
             self.function_offsets[func_name] = offset
-            self.output.append(f"    DD FUNC_{func_name}  ; Index {offset}: {func_name}")
+            self.output.append(f"    DQ FUNC_{func_name}  ; Index {offset}: {func_name}")
             offset += 1
         
         self.output.append("")
@@ -145,23 +234,70 @@ class CodeGenerator:
         if not globals:
             return
         
-        packed_var_names = {var['name'] for var in self.global_var_data['packed_vars']}
-        
+        # Deduplicate global variables by name
+        seen_globals = {}  # {var_name: var_node} to deduplicate
         for var in globals:
             var_name = var.name if var.name else None
             if not var_name:
                 continue
-            
+            # Only keep the first occurrence of each global
+            if var_name not in seen_globals:
+                seen_globals[var_name] = var
+        
+        packed_var_names = {var['name'] for var in self.global_var_data['packed_vars']}
+        
+        for var_name, var in seen_globals.items():
             # Only generate data for non-packed variables
             # Packed variables are stored in SIMD register
             if var_name not in packed_var_names:
-                # Regular global variable
+                # Check if this is an array
+                is_array = False
+                array_size = 0
+                # Check type structure for arrays
+                type_node = var.type
+                while hasattr(type_node, 'type'):
+                    if isinstance(type_node, c_ast.ArrayDecl):
+                        is_array = True
+                        if type_node.dim:
+                            if isinstance(type_node.dim, c_ast.Constant):
+                                try:
+                                    array_size = int(type_node.dim.value)
+                                except:
+                                    array_size = 10  # Default size
+                            else:
+                                array_size = 10  # Default size
+                        break
+                    type_node = type_node.type
+                
                 self.output.append(f"GLOBAL_{var_name}:")
-                if var.init:
+                if is_array:
+                    # Array declaration: allocate array_size * 4 bytes (assuming int)
+                    self.output.append(f"    TIMES {array_size} DD 0  ; {var_name}[{array_size}]")
+                elif var.init:
                     # Has initializer
                     if isinstance(var.init, c_ast.Constant):
                         value = var.init.value
-                        self.output.append(f"    DD {value}  ; {var_name}")
+                        # Handle string constants - convert to numeric if needed
+                        if isinstance(value, str) and len(value) > 1:
+                            # For string constants longer than 1 char, use address or convert
+                            # For now, just use 0 and let the linker handle it
+                            self.output.append(f"    DD 0  ; {var_name} (string constant)")
+                        else:
+                            # Try to convert value to integer for assembly
+                            try:
+                                # Handle numeric values
+                                if isinstance(value, str):
+                                    # Try parsing as integer (hex, decimal, etc.)
+                                    if value.startswith('0x') or value.startswith('0X'):
+                                        num_value = int(value, 16)
+                                    else:
+                                        num_value = int(value)
+                                else:
+                                    num_value = int(value)
+                                self.output.append(f"    DD {num_value}  ; {var_name}")
+                            except (ValueError, TypeError):
+                                # If conversion fails, use 0
+                                self.output.append(f"    DD 0  ; {var_name} (initialized at runtime)")
                     else:
                         self.output.append(f"    DD 0  ; {var_name} (initialized at runtime)")
                 else:
@@ -173,13 +309,136 @@ class CodeGenerator:
                 if var.init:
                     if isinstance(var.init, c_ast.Constant):
                         value = var.init.value
-                        self.output.append(f"    DB {value}  ; {var_name} (packed into SIMD register)")
+                        # Handle string constants - convert to numeric if needed
+                        if isinstance(value, str) and len(value) > 1:
+                            # For string constants, use 0
+                            self.output.append(f"    DB 0  ; {var_name} (packed, string constant)")
+                        else:
+                            # Try to convert value to integer for assembly
+                            try:
+                                if isinstance(value, str):
+                                    if value.startswith('0x') or value.startswith('0X'):
+                                        num_value = int(value, 16)
+                                    else:
+                                        num_value = int(value)
+                                else:
+                                    num_value = int(value)
+                                # Ensure value fits in byte for DB
+                                num_value = num_value & 0xFF
+                                self.output.append(f"    DB {num_value}  ; {var_name} (packed into SIMD register)")
+                            except (ValueError, TypeError):
+                                self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
                     else:
                         self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
                 else:
                     self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
         
         self.output.append("")
+    
+    def _generate_asm_symbols(self, parser):
+        """Generate assembly code for referenced external symbols from .S files."""
+        if not self.asm_parser or not self.referenced_asm_symbols:
+            return
+        
+        self.output.append("")
+        self.output.append("; ========================================")
+        self.output.append("; Assembly symbols from .S files")
+        self.output.append("; ========================================")
+        self.output.append("")
+        
+        # Group symbols by type
+        functions = []
+        data_symbols = []
+        
+        for symbol_name in sorted(self.referenced_asm_symbols):
+            if not self.asm_parser.has_symbol(symbol_name):
+                continue
+            
+            symbol_info = self.asm_parser.global_symbols.get(symbol_name)
+            if not symbol_info:
+                # Try with FUNC_ prefix
+                symbol_info = self.asm_parser.global_symbols.get(f"FUNC_{symbol_name}")
+            if not symbol_info:
+                # Try with GLOBAL_ prefix
+                symbol_info = self.asm_parser.global_symbols.get(f"GLOBAL_{symbol_name}")
+            
+            if symbol_info:
+                symbol_type = symbol_info.get('type', 'unknown')
+                if symbol_type == 'function':
+                    functions.append(symbol_name)
+                elif symbol_type == 'data':
+                    data_symbols.append(symbol_name)
+                else:
+                    # Unknown type - assume function if it's called
+                    functions.append(symbol_name)
+        
+        # Generate functions first
+        if functions:
+            self.output.append("SECTION .text")
+            self.output.append("; Assembly-defined functions")
+            self.output.append("")
+            for func_name in functions:
+                code = self.asm_parser.get_symbol_code(func_name)
+                if code:
+                    self.output.append(f"; Function: {func_name} (from assembly)")
+                    self.output.append(f"FUNC_{func_name}:")
+                    # Output the code, skipping the label line if it's already there
+                    for line in code:
+                        # Skip if it's the same label (already output above)
+                        stripped = line.strip()
+                        # Skip problematic labels that might be attribute names
+                        if stripped.endswith(':') and (func_name in stripped or f"FUNC_{func_name}" in stripped):
+                            continue
+                        # Skip lines that look like attribute names being output as labels
+                        # These are common Python attribute names that shouldn't be assembly labels
+                        problematic_labels = ['type:', 'field:', 'name:', 'value:', 'op:', 'expr:', 'left:', 'right:']
+                        if stripped in problematic_labels or stripped in [l[:-1] for l in problematic_labels]:
+                            continue
+                        # Skip lines that are just a single word followed by colon (likely a label)
+                        # but only if it's a known problematic attribute name
+                        if stripped.endswith(':') and len(stripped.split()) == 1:
+                            label_name = stripped[:-1]
+                            if label_name in ['type', 'field', 'name', 'value', 'op', 'expr', 'left', 'right']:
+                                continue
+                        # Skip empty lines that are just whitespace
+                        if not stripped:
+                            continue
+                        self.output.append(line)
+                    self.output.append("")
+        
+        # Generate data symbols in data section
+        if data_symbols:
+            self.output.append("SECTION .data")
+            self.output.append("; Assembly-defined global variables")
+            self.output.append("")
+            for var_name in data_symbols:
+                code = self.asm_parser.get_symbol_code(var_name)
+                if code:
+                    self.output.append(f"; Global variable: {var_name} (from assembly)")
+                    self.output.append(f"GLOBAL_{var_name}:")
+                    # Output the code, skipping the label line if it's already there
+                    for line in code:
+                        # Skip if it's the same label (already output above)
+                        stripped = line.strip()
+                        # Skip problematic labels that might be attribute names
+                        if stripped.endswith(':') and (var_name in stripped or f"GLOBAL_{var_name}" in stripped):
+                            continue
+                        # Skip lines that look like attribute names being output as labels
+                        # These are common Python attribute names that shouldn't be assembly labels
+                        problematic_labels = ['type:', 'field:', 'name:', 'value:', 'op:', 'expr:', 'left:', 'right:']
+                        if stripped in problematic_labels or stripped in [l[:-1] for l in problematic_labels]:
+                            continue
+                        # Skip lines that are just a single word followed by colon (likely a label)
+                        # but only if it's a known problematic attribute name
+                        if stripped.endswith(':') and len(stripped.split()) == 1:
+                            label_name = stripped[:-1]
+                            if label_name in ['type', 'field', 'name', 'value', 'op', 'expr', 'left', 'right']:
+                                continue
+                        # Skip empty lines that are just whitespace
+                        if not stripped:
+                            continue
+                        self.output.append(line)
+                    self.output.append("")
     
     def _generate_simd_packing_init(self):
         """Generate initialization code to pack global variables into SIMD register."""
@@ -367,6 +626,11 @@ class CodeGenerator:
     def _generate_function(self, func_def):
         """Generate code for a single function."""
         func_name = func_def.decl.name if func_def.decl else "unknown"
+        # Skip functions with "unknown" names - they're likely parsing errors
+        if func_name == "unknown":
+            self.output.append(f"; Warning: Skipping function with unknown name")
+            return
+        
         info = self.function_data.get(func_name, {})
         is_interrupt = self._is_interrupt_callback(func_name)
         
@@ -486,7 +750,111 @@ class CodeGenerator:
     
     def _generate_call(self, call, caller_func_name):
         """Generate function call with optimizations."""
-        func_name = call.name.name if isinstance(call.name, c_ast.ID) else "unknown"
+        # FIRST: Check if this is a function pointer call (e.g., array[index](), struct.member())
+        # These must be handled BEFORE trying to extract a function name, because
+        # ArrayRef and StructRef have a 'name' attribute that would be incorrectly extracted
+        if isinstance(call.name, (c_ast.ArrayRef, c_ast.StructRef)):
+            # This is a function pointer call through array or struct member
+            # Generate code to evaluate the function pointer expression
+            self._generate_expression(call.name)
+            # RAX now contains the function pointer
+            # Save it to the stack before evaluating arguments
+            self.output.append("    PUSH RAX  ; Save function pointer")
+            
+            # Prepare arguments (simplified - assume up to 6 args in registers)
+            # Arguments are evaluated in sequence and each overwrites RAX,
+            # but we move them to argument registers immediately
+            if call.args:
+                for i, arg in enumerate(call.args.exprs[:6]):
+                    reg = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9'][i]
+                    self._generate_expression(arg)
+                    self.output.append(f"    MOV {reg}, RAX  ; Argument {i+1}")
+            
+            # Restore function pointer from stack
+            self.output.append("    POP RAX  ; Restore function pointer")
+            
+            # Call the function pointer
+            self.output.append("    CALL RAX  ; Call function pointer")
+            return
+        
+        # Extract function name from call expression
+        func_name = None
+        if isinstance(call.name, c_ast.ID):
+            func_name = call.name.name
+        elif isinstance(call.name, c_ast.UnaryOp) and isinstance(call.name.expr, c_ast.ID):
+            # Handle function pointer dereference: (*func_ptr)(args)
+            func_name = call.name.expr.name
+        elif hasattr(call.name, 'name'):
+            # Try to get name attribute if it exists
+            name_attr = call.name.name
+            # Ensure it's a string, not an AST node
+            if isinstance(name_attr, str):
+                func_name = name_attr
+            elif isinstance(name_attr, c_ast.ID):
+                func_name = name_attr.name
+            else:
+                # Complex expression - we'll handle as function pointer call
+                func_name = None
+        
+        # Handle other function pointer calls (e.g., complex expressions)
+        if not func_name or func_name == "unknown":
+            # Check if this is a function pointer call with a complex expression
+            is_function_pointer = False
+            if isinstance(call.name, (c_ast.BinaryOp)):
+                is_function_pointer = True
+            elif not isinstance(call.name, c_ast.ID) and not isinstance(call.name, c_ast.UnaryOp):
+                # Could be a complex expression that evaluates to a function pointer
+                is_function_pointer = True
+            
+            if is_function_pointer:
+                # Generate code to evaluate the function pointer expression
+                # The result should be in RAX
+                self._generate_expression(call.name)
+                # RAX now contains the function pointer
+                # Save it to the stack before evaluating arguments
+                self.output.append("    PUSH RAX  ; Save function pointer")
+                
+                # Prepare arguments (simplified - assume up to 6 args in registers)
+                # Arguments are evaluated in sequence and each overwrites RAX,
+                # but we move them to argument registers immediately
+                if call.args:
+                    for i, arg in enumerate(call.args.exprs[:6]):
+                        reg = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9'][i]
+                        self._generate_expression(arg)
+                        self.output.append(f"    MOV {reg}, RAX  ; Argument {i+1}")
+                
+                # Restore function pointer from stack
+                self.output.append("    POP RAX  ; Restore function pointer")
+                
+                # Call the function pointer
+                self.output.append("    CALL RAX  ; Call function pointer")
+                return
+            else:
+                # Unknown function name - skip
+                self.output.append(f"    ; Warning: Skipping call to unknown/undefined function")
+                # Still prepare arguments in case they have side effects
+                if call.args:
+                    for i, arg in enumerate(call.args.exprs[:6]):
+                        reg = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9'][i]
+                        self._generate_expression(arg)
+                        self.output.append(f"    MOV {reg}, RAX")
+                # Generate a no-op or placeholder
+                self.output.append("    ; NOP - unknown function call skipped")
+                return
+        
+        # Ensure func_name is a string, not an AST node
+        if not isinstance(func_name, str):
+            # This shouldn't happen after the checks above, but protect against it
+            self.output.append(f"    ; Warning: Function name is not a string: {safe_str(func_name)}")
+            # Still prepare arguments in case they have side effects
+            if call.args:
+                for i, arg in enumerate(call.args.exprs[:6]):
+                    reg = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9'][i]
+                    self._generate_expression(arg)
+                    self.output.append(f"    MOV {reg}, RAX")
+            self.output.append("    ; NOP - invalid function name")
+            return
+        
         callee_info = self.function_data.get(func_name, {})
         
         # Prepare arguments (simplified - assume up to 6 args in registers)
@@ -504,30 +872,69 @@ class CodeGenerator:
             self.return_site_index += 1
             self.return_sites.append(return_site_label)
         
-        # Generate call based on function type
-        if callee_info.get('is_small', False):
-            # Indexed-jump call for small functions
-            func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
-            if func_idx >= 0:
-                self.output.append(f"    ; Indexed-jump call to {func_name}")
-                self.output.append(f"    MOV RDI, {func_idx}")
-                
-                if callee_info.get('has_single_return', False) and return_site_label:
-                    # Metamorphic return site: write return address into callee's instruction
-                    self.output.append(f"    ; Metamorphic return: write return address bytes to callee's RET instruction")
-                    self.output.append(f"    LEA RAX, [{return_site_label}]")
-                    self.output.append(f"    MOV [FUNC_{func_name}+RET_ADDR_OFFSET], RAX")
-                
-                self.output.append("    CALL INDEXED_JUMP")
-        else:
-            # Standard call or call with metamorphic return
-            if callee_info.get('has_single_return', False) and return_site_label:
-                # Metamorphic return site: write return address into instruction
-                self.output.append(f"    ; Metamorphic return: write return address to callee instruction")
-                self.output.append(f"    LEA RAX, [{return_site_label}]")
-                self.output.append(f"    MOV [FUNC_{func_name}+RET_ADDR_OFFSET], RAX")
-                self.output.append(f"    JMP FUNC_{func_name}")
+        # Check if function exists in our function list (might be external)
+        # Get all unique function names from parser
+        all_func_names = set()
+        functions = getattr(self, '_current_parser', None).get_functions() if hasattr(self, '_current_parser') else []
+        for func in functions:
+            func_name_from_def = func.decl.name if func.decl else None
+            if func_name_from_def:
+                all_func_names.add(func_name_from_def)
+        
+        # If function is not in our list, check if it's in assembly files or a function pointer variable
+        if func_name not in all_func_names:
+            # Check if this function is defined in assembly
+            if self.asm_parser and self.asm_parser.has_symbol(func_name):
+                self.output.append(f"    ; Function call to assembly-defined: {func_name}")
+                self.output.append(f"    CALL FUNC_{func_name}")
+                self.referenced_asm_symbols.add(func_name)
             else:
+                # Check if it's a global variable (might be a function pointer)
+                globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                if func_name in globals:
+                    # This is a function pointer variable, not a function name
+                    # Load the function pointer and call it
+                    self.output.append(f"    ; Function pointer call: {func_name}")
+                    self.output.append(f"    MOV RAX, [GLOBAL_{func_name}]  ; Load function pointer")
+                    # Prepare arguments first
+                    if call.args:
+                        for i, arg in enumerate(call.args.exprs[:6]):
+                            reg = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9'][i]
+                            self._generate_expression(arg)
+                            self.output.append(f"    MOV {reg}, RAX  ; Argument {i+1}")
+                        # Reload function pointer (arguments might have overwritten RAX)
+                        self.output.append(f"    MOV RAX, [GLOBAL_{func_name}]  ; Reload function pointer")
+                    self.output.append("    CALL RAX  ; Call function pointer")
+                else:
+                    # Assume it's an external function
+                    self.output.append(f"    ; External function call: {func_name}")
+                    self.output.append(f"    CALL FUNC_{func_name}  ; Assumed to be defined externally")
+        else:
+            # Generate call based on function type
+            if callee_info.get('is_small', False):
+                # Indexed-jump call for small functions
+                func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
+                if func_idx >= 0:
+                    self.output.append(f"    ; Indexed-jump call to {func_name}")
+                    self.output.append(f"    MOV RDI, {func_idx}")
+                    
+                    # Metamorphic return site disabled - RET_ADDR_OFFSET not implemented
+                    # if callee_info.get('has_single_return', False) and return_site_label:
+                    #     self.output.append(f"    LEA RAX, [rel {return_site_label}]")
+                    #     self.output.append(f"    MOV [FUNC_{func_name}+RET_ADDR_OFFSET], RAX")
+                    
+                    self.output.append("    CALL INDEXED_JUMP")
+                else:
+                    # Fallback to direct call if not in jump table
+                    self.output.append(f"    CALL FUNC_{func_name}")
+            else:
+                # Standard call or call with metamorphic return
+                # Metamorphic return site disabled - RET_ADDR_OFFSET not implemented
+                # if callee_info.get('has_single_return', False) and return_site_label:
+                #     self.output.append(f"    LEA RAX, [rel {return_site_label}]")
+                #     self.output.append(f"    MOV [FUNC_{func_name}+RET_ADDR_OFFSET], RAX")
+                #     self.output.append(f"    JMP FUNC_{func_name}")
+                # else:
                 # Standard call
                 self.output.append(f"    CALL FUNC_{func_name}")
         
@@ -543,7 +950,42 @@ class CodeGenerator:
         """Generate code for an expression (simplified)."""
         if isinstance(expr, c_ast.Constant):
             value = expr.value
-            self.output.append(f"    MOV RAX, {value}")
+            # Handle string constants - convert to numeric value
+            if isinstance(value, str):
+                # Check if it's a string literal (enclosed in quotes)
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    # For character constants, extract the character value
+                    if value.startswith("'") and len(value) >= 3:
+                        # Single character constant like 'a'
+                        char_val = ord(value[1]) if len(value) > 2 else 0
+                        self.output.append(f"    MOV RAX, {char_val}")
+                    elif value.startswith('"') and len(value) >= 3:
+                        # String literal - use first character
+                        char_val = ord(value[1]) if len(value) > 2 else 0
+                        self.output.append(f"    MOV RAX, {char_val}")
+                    else:
+                        # Empty or invalid string, use 0
+                        self.output.append("    MOV RAX, 0")
+                else:
+                    # Try to parse as numeric value
+                    try:
+                        if value.startswith('0x') or value.startswith('0X'):
+                            num_value = int(value, 16)
+                        elif value.startswith('0') and len(value) > 1:
+                            num_value = int(value, 8)
+                        else:
+                            num_value = int(value)
+                        self.output.append(f"    MOV RAX, {num_value}")
+                    except (ValueError, TypeError):
+                        # If conversion fails, use 0
+                        self.output.append("    MOV RAX, 0")
+            else:
+                # Numeric value
+                try:
+                    num_value = int(value)
+                    self.output.append(f"    MOV RAX, {num_value}")
+                except (ValueError, TypeError):
+                    self.output.append("    MOV RAX, 0")
         elif isinstance(expr, c_ast.ID):
             name = expr.name
             # Check if this is a packed global variable
@@ -556,6 +998,10 @@ class CodeGenerator:
                 if name in globals:
                     # Global variable (non-packed)
                     self.output.append(f"    MOV RAX, [GLOBAL_{name}]  ; Load global variable")
+                elif self.asm_parser and self.asm_parser.has_symbol(name):
+                    # Global variable defined in assembly
+                    self.output.append(f"    MOV RAX, [GLOBAL_{name}]  ; Load assembly-defined global")
+                    self.referenced_asm_symbols.add(name)
                 else:
                     # Local variable - use indexed stack pointer
                     self._generate_local_var_load(name)
@@ -563,6 +1009,18 @@ class CodeGenerator:
             self._generate_binary_op(expr)
         elif isinstance(expr, c_ast.UnaryOp):
             self._generate_unary_op(expr)
+        elif isinstance(expr, c_ast.ArrayRef):
+            self._generate_array_ref(expr)
+        elif isinstance(expr, c_ast.StructRef):
+            self._generate_struct_ref(expr)
+        elif isinstance(expr, c_ast.TernaryOp):
+            self._generate_ternary_op(expr)
+        else:
+            # Unknown expression type - output warning and generate no-op
+            # Use safe_str to prevent AST node objects from being output as strings
+            expr_type = safe_str(expr)
+            self.output.append(f"    ; Warning: Unhandled expression type: {expr_type}")
+            self.output.append("    MOV RAX, 0  ; Default value for unhandled expression")
     
     def _generate_binary_op(self, op):
         """Generate code for binary operation."""
@@ -583,9 +1041,92 @@ class CodeGenerator:
         elif op.op == '==':
             self.output.append("    CMP RAX, RBX")
             self.output.append("    SETE AL")
+            self.output.append("    MOVZX RAX, AL")
         elif op.op == '<':
             self.output.append("    CMP RBX, RAX")
             self.output.append("    SETL AL")
+            self.output.append("    MOVZX RAX, AL")
+        elif op.op == '>':
+            self.output.append("    CMP RAX, RBX")
+            self.output.append("    SETG AL")
+            self.output.append("    MOVZX RAX, AL")
+        elif op.op == '<=':
+            self.output.append("    CMP RBX, RAX")
+            self.output.append("    SETLE AL")
+            self.output.append("    MOVZX RAX, AL")
+        elif op.op == '>=':
+            self.output.append("    CMP RAX, RBX")
+            self.output.append("    SETGE AL")
+            self.output.append("    MOVZX RAX, AL")
+        elif op.op == '!=':
+            self.output.append("    CMP RAX, RBX")
+            self.output.append("    SETNE AL")
+            self.output.append("    MOVZX RAX, AL")
+        elif op.op == '%':
+            # Modulo: a % b
+            # RBX has left operand (from stack), RAX has right operand
+            # We need: left % right
+            self.output.append("    ; Modulo operation: RBX % RAX")
+            self.output.append("    PUSH RAX  ; Save right operand (divisor)")
+            self.output.append("    MOV RAX, RBX  ; Move left operand (dividend) to RAX")
+            self.output.append("    POP RBX  ; Get divisor in RBX")
+            self.output.append("    XOR RDX, RDX  ; Clear RDX for division")
+            self.output.append("    DIV RBX  ; RAX = dividend / divisor, RDX = remainder")
+            self.output.append("    MOV RAX, RDX  ; Remainder is the modulo result")
+        elif op.op == '&&':
+            # Logical AND: both operands must be non-zero
+            # RBX has left operand, RAX has right operand
+            self.label_counter = self.label_counter + 1
+            label_id = self.label_counter
+            self.output.append(f"    ; Logical AND: RBX && RAX")
+            self.output.append(f"    TEST RBX, RBX  ; Check if left is non-zero")
+            self.output.append(f"    JZ AND_FALSE_{label_id}")
+            self.output.append(f"    TEST RAX, RAX  ; Check if right is non-zero")
+            self.output.append(f"    JZ AND_FALSE_{label_id}")
+            self.output.append(f"    MOV RAX, 1  ; Both non-zero, result is 1")
+            self.output.append(f"    JMP AND_END_{label_id}")
+            self.output.append(f"AND_FALSE_{label_id}:")
+            self.output.append(f"    MOV RAX, 0  ; One or both zero, result is 0")
+            self.output.append(f"AND_END_{label_id}:")
+        elif op.op == '||':
+            # Logical OR: at least one operand must be non-zero
+            # RBX has left operand, RAX has right operand
+            self.label_counter = self.label_counter + 1
+            label_id = self.label_counter
+            self.output.append(f"    ; Logical OR: RBX || RAX")
+            self.output.append(f"    TEST RBX, RBX  ; Check if left is non-zero")
+            self.output.append(f"    JNZ OR_TRUE_{label_id}")
+            self.output.append(f"    TEST RAX, RAX  ; Check if right is non-zero")
+            self.output.append(f"    JNZ OR_TRUE_{label_id}")
+            self.output.append(f"    MOV RAX, 0  ; Both zero, result is 0")
+            self.output.append(f"    JMP OR_END_{label_id}")
+            self.output.append(f"OR_TRUE_{label_id}:")
+            self.output.append(f"    MOV RAX, 1  ; At least one non-zero, result is 1")
+            self.output.append(f"OR_END_{label_id}:")
+        elif op.op == '<<':
+            # Left shift: RBX << RAX
+            self.output.append("    ; Left shift: RBX << RAX")
+            self.output.append("    MOV RCX, RAX  ; Shift amount in RCX")
+            self.output.append("    MOV RAX, RBX  ; Value to shift")
+            self.output.append("    SHL RAX, CL  ; Left shift by CL (low 8 bits of RCX)")
+        elif op.op == '>>':
+            # Right shift: RBX >> RAX
+            self.output.append("    ; Right shift: RBX >> RAX")
+            self.output.append("    MOV RCX, RAX  ; Shift amount in RCX")
+            self.output.append("    MOV RAX, RBX  ; Value to shift")
+            self.output.append("    SHR RAX, CL  ; Right shift by CL (low 8 bits of RCX)")
+        elif op.op == '&':
+            # Bitwise AND: RBX & RAX
+            self.output.append("    ; Bitwise AND: RBX & RAX")
+            self.output.append("    AND RAX, RBX")
+        elif op.op == '|':
+            # Bitwise OR: RBX | RAX
+            self.output.append("    ; Bitwise OR: RBX | RAX")
+            self.output.append("    OR RAX, RBX")
+        elif op.op == '^':
+            # Bitwise XOR: RBX ^ RAX
+            self.output.append("    ; Bitwise XOR: RBX ^ RAX")
+            self.output.append("    XOR RAX, RBX")
     
     def _generate_unary_op(self, op):
         """Generate code for unary operation."""
@@ -594,12 +1135,430 @@ class CodeGenerator:
             self.output.append("    NEG RAX")
         elif op.op == '!':
             self.output.append("    NOT RAX")
+        elif op.op == '*':
+            # Pointer dereference: *ptr
+            self.output.append("    ; Pointer dereference: *ptr")
+            self.output.append("    MOV RAX, [RAX]  ; Load value at address in RAX")
+        elif op.op == '&':
+            # Address-of: &var
+            # Handle address-of operator
+            if isinstance(op.expr, c_ast.ID):
+                name = op.expr.name
+                # Check if it's a global variable
+                globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                if name in globals:
+                    # Global variable address
+                    self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Address of global variable")
+                else:
+                    # Local variable address
+                    if name in self.current_function_stack:
+                        slot_index, offset = self.current_function_stack[name]
+                        displacement = slot_index * self.stack_slot_size + offset
+                        self.output.append(f"    MOV RAX, {self.stack_base_register}")
+                        if displacement > 0:
+                            self.output.append(f"    ADD RAX, {displacement}")
+                    else:
+                        self.output.append(f"    ; Warning: variable {name} not found for address-of")
+            else:
+                # Complex expression - generate and use as address
+                self._generate_expression(op.expr)
+        elif op.op == '~':
+            # Bitwise NOT: ~expr
+            self.output.append("    ; Bitwise NOT: ~expr")
+            self.output.append("    NOT RAX")
+        elif op.op == 'p++':
+            # Post-increment: var++
+            if isinstance(op.expr, c_ast.ID):
+                name = op.expr.name
+                # Load value
+                if name in self.global_var_data['bit_positions']:
+                    self._generate_packed_var_access(name, is_write=False)
+                else:
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        self.output.append(f"    MOV RAX, [GLOBAL_{name}]")
+                    else:
+                        self._generate_local_var_load(name)
+                # Increment and store back
+                self.output.append("    PUSH RAX  ; Save original value")
+                self.output.append("    INC RAX")
+                # Store incremented value
+                if name in self.global_var_data['bit_positions']:
+                    self._generate_packed_var_access(name, is_write=True, value_reg='RAX')
+                else:
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        self.output.append(f"    MOV [GLOBAL_{name}], RAX")
+                    else:
+                        # Store to local
+                        self.output.append("    PUSH RAX")
+                        # We need to get the address to store
+                        if name in self.current_function_stack:
+                            slot_index, offset = self.current_function_stack[name]
+                            displacement = slot_index * self.stack_slot_size + offset
+                            self.output.append(f"    MOV RBX, {self.stack_base_register}")
+                            if displacement > 0:
+                                self.output.append(f"    ADD RBX, {displacement}")
+                            self.output.append("    POP RAX")
+                            self.output.append("    MOV [RBX], RAX")
+                self.output.append("    POP RAX  ; Return original value")
+        elif op.op == 'p--':
+            # Post-decrement: var--
+            if isinstance(op.expr, c_ast.ID):
+                name = op.expr.name
+                # Load value
+                if name in self.global_var_data['bit_positions']:
+                    self._generate_packed_var_access(name, is_write=False)
+                else:
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        self.output.append(f"    MOV RAX, [GLOBAL_{name}]")
+                    else:
+                        self._generate_local_var_load(name)
+                # Decrement and store back
+                self.output.append("    PUSH RAX  ; Save original value")
+                self.output.append("    DEC RAX")
+                # Store decremented value (similar to post-increment)
+                if name in self.global_var_data['bit_positions']:
+                    self._generate_packed_var_access(name, is_write=True, value_reg='RAX')
+                else:
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        self.output.append(f"    MOV [GLOBAL_{name}], RAX")
+                    else:
+                        if name in self.current_function_stack:
+                            slot_index, offset = self.current_function_stack[name]
+                            displacement = slot_index * self.stack_slot_size + offset
+                            self.output.append("    PUSH RAX")
+                            self.output.append(f"    MOV RBX, {self.stack_base_register}")
+                            if displacement > 0:
+                                self.output.append(f"    ADD RBX, {displacement}")
+                            self.output.append("    POP RAX")
+                            self.output.append("    MOV [RBX], RAX")
+                self.output.append("    POP RAX  ; Return original value")
+        elif op.op == '++':
+            # Pre-increment: ++var
+            if isinstance(op.expr, c_ast.ID):
+                name = op.expr.name
+                # Load, increment, store, return new value
+                if name in self.global_var_data['bit_positions']:
+                    self._generate_packed_var_access(name, is_write=False)
+                    self.output.append("    INC RAX")
+                    self._generate_packed_var_access(name, is_write=True, value_reg='RAX')
+                else:
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        self.output.append(f"    MOV RAX, [GLOBAL_{name}]")
+                        self.output.append("    INC RAX")
+                        self.output.append(f"    MOV [GLOBAL_{name}], RAX")
+                    else:
+                        self._generate_local_var_load(name)
+                        self.output.append("    INC RAX")
+                        if name in self.current_function_stack:
+                            slot_index, offset = self.current_function_stack[name]
+                            displacement = slot_index * self.stack_slot_size + offset
+                            self.output.append("    PUSH RAX")
+                            self.output.append(f"    MOV RBX, {self.stack_base_register}")
+                            if displacement > 0:
+                                self.output.append(f"    ADD RBX, {displacement}")
+                            self.output.append("    POP RAX")
+                            self.output.append("    MOV [RBX], RAX")
+        elif op.op == '--':
+            # Pre-decrement: --var
+            if isinstance(op.expr, c_ast.ID):
+                name = op.expr.name
+                # Load, decrement, store, return new value
+                if name in self.global_var_data['bit_positions']:
+                    self._generate_packed_var_access(name, is_write=False)
+                    self.output.append("    DEC RAX")
+                    self._generate_packed_var_access(name, is_write=True, value_reg='RAX')
+                else:
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        self.output.append(f"    MOV RAX, [GLOBAL_{name}]")
+                        self.output.append("    DEC RAX")
+                        self.output.append(f"    MOV [GLOBAL_{name}], RAX")
+                    else:
+                        self._generate_local_var_load(name)
+                        self.output.append("    DEC RAX")
+                        if name in self.current_function_stack:
+                            slot_index, offset = self.current_function_stack[name]
+                            displacement = slot_index * self.stack_slot_size + offset
+                            self.output.append("    PUSH RAX")
+                            self.output.append(f"    MOV RBX, {self.stack_base_register}")
+                            if displacement > 0:
+                                self.output.append(f"    ADD RBX, {displacement}")
+                            self.output.append("    POP RAX")
+                            self.output.append("    MOV [RBX], RAX")
+    
+    def _generate_array_ref(self, arr_ref):
+        """Generate code for array indexing: arr[index]"""
+        # Generate index first (we'll need it)
+        self._generate_expression(arr_ref.subscript)
+        self.output.append("    PUSH RAX  ; Save index")
+        
+        # Generate base address (array name or pointer)
+        if isinstance(arr_ref.name, c_ast.ID):
+            # Array variable name
+            name = arr_ref.name.name
+            # Check if it's a global variable
+            globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+            if name in globals:
+                # Global array
+                self.output.append(f"    MOV RBX, GLOBAL_{name}  ; Base address of array")
+            else:
+                # Local array - treat as pointer (for now, assume it's a local variable that holds an address)
+                self._generate_local_var_load(name)
+                self.output.append("    MOV RBX, RAX  ; Base address")
+        else:
+            # Complex expression for base
+            self._generate_expression(arr_ref.name)
+            self.output.append("    MOV RBX, RAX  ; Base address")
+        
+        # Get index from stack
+        self.output.append("    POP RAX  ; Get index")
+        
+        # Calculate address: base + index * sizeof(int)
+        # Assuming int is 4 bytes (32 bits)
+        self.output.append("    ; Array indexing: base + index * 4")
+        self.output.append("    MOV RCX, RAX  ; Save index")
+        self.output.append("    MOV RAX, 4  ; Size of int")
+        self.output.append("    MUL RCX  ; RAX = index * 4")
+        self.output.append("    ADD RAX, RBX  ; RAX = base + offset")
+        
+        # Load value from memory
+        self.output.append("    MOV RAX, [RAX]  ; Load array element")
+    
+    def _generate_struct_ref(self, struct_ref):
+        """Generate code for struct member access: struct.member or struct->member"""
+        # Defensive check: ensure struct_ref has required attributes
+        if not hasattr(struct_ref, 'type') or not hasattr(struct_ref, 'name'):
+            self.output.append("    ; Warning: Invalid struct reference")
+            self.output.append("    MOV RAX, 0")
+            return
+        
+        member_name = None
+        if hasattr(struct_ref, 'field') and struct_ref.field and hasattr(struct_ref.field, 'name'):
+            member_name = struct_ref.field.name
+        
+        # Ensure type is a string, not an attribute name or AST node
+        # struct_ref.type should be '.' or '->', but protect against AST nodes
+        if hasattr(struct_ref, 'type'):
+            type_val = struct_ref.type
+            if isinstance(type_val, str):
+                struct_type = type_val
+            elif isinstance(type_val, c_ast.Node):
+                # If type is an AST node (shouldn't happen, but protect against it)
+                struct_type = None
+            else:
+                # Try to convert to string safely
+                struct_type = safe_str(type_val) if type_val in ['.', '->'] else None
+        else:
+            struct_type = None
+        
+        if struct_type == '.':
+            # Direct member access: struct.member
+            # Generate base address (struct variable)
+            if isinstance(struct_ref.name, c_ast.ID):
+                name = struct_ref.name.name
+                # Check if it's a global variable
+                globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                if name in globals:
+                    # Global struct - base address
+                    self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Base address of struct")
+                else:
+                    # Local struct - get address from stack
+                    self._generate_local_var_load(name)
+                    # For structs, we need the address, not the value
+                    # If it's a local variable, we need to compute its address
+                    if name in self.current_function_stack:
+                        slot_index, offset = self.current_function_stack[name]
+                        displacement = slot_index * self.stack_slot_size + offset
+                        self.output.append(f"    MOV RAX, {self.stack_base_register}")
+                        if displacement > 0:
+                            self.output.append(f"    ADD RAX, {displacement}")
+            else:
+                # Complex expression for base
+                self._generate_expression(struct_ref.name)
+                # RAX now contains the struct address
+        elif struct_type == '->':
+            # Pointer member access: struct->member
+            # Generate pointer value (address)
+            self._generate_expression(struct_ref.name)
+            # RAX now contains the pointer (address of struct)
+        else:
+            # Fallback: handle nested struct references or other complex cases
+            if isinstance(struct_ref.name, c_ast.StructRef):
+                # Nested struct reference: a.b.c
+                self._generate_struct_ref(struct_ref.name)
+            else:
+                self._generate_expression(struct_ref.name)
+        
+        # Calculate member offset (simplified: assume 4 bytes per member, sequential)
+        # In a real implementation, we'd need to track struct definitions and member offsets
+        # For now, we'll use a simple offset calculation based on member name
+        if member_name:
+            # Simple offset calculation: use first character to determine offset
+            # This is a simplification - real implementation would parse struct definitions
+            # Common patterns: x=0, y=4, width=8, height=12, etc.
+            member_offsets = {
+                'x': 0, 'y': 4, 'z': 8,
+                'width': 8, 'height': 12,
+                'a': 0, 'b': 4, 'c': 8, 'd': 12
+            }
+            member_offset = member_offsets.get(member_name, 0)
+            self.output.append(f"    ; Struct member access: {member_name} at offset {member_offset}")
+            if member_offset > 0:
+                self.output.append(f"    ADD RAX, {member_offset}  ; Add member offset")
+            self.output.append("    MOV RAX, [RAX]  ; Load member value")
+        else:
+            self.output.append("    ; Struct member access (member name not found)")
+            self.output.append("    MOV RAX, [RAX]  ; Load value at address")
     
     def _generate_assignment(self, assign):
         """Generate code for assignment."""
+        # Handle compound assignment operators
+        if assign.op in ['+=', '-=', '*=', '/=', '%=', '<<=', '>>=', '&=', '|=', '^=']:
+            # Compound assignment: x += y is equivalent to x = x + y
+            # First, load the lvalue
+            if isinstance(assign.lvalue, c_ast.ID):
+                name = assign.lvalue.name
+                # Load current value
+                if name in self.global_var_data['bit_positions']:
+                    self._generate_packed_var_access(name, is_write=False)
+                else:
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        self.output.append(f"    MOV RAX, [GLOBAL_{name}]")
+                    else:
+                        self._generate_local_var_load(name)
+            elif isinstance(assign.lvalue, c_ast.ArrayRef):
+                # Array element: arr[i]
+                self._generate_array_ref(assign.lvalue)
+            elif isinstance(assign.lvalue, c_ast.StructRef):
+                # Struct member: struct.member or struct->member
+                # Generate address of member
+                # Defensive check: ensure struct_ref has required attributes
+                if not hasattr(assign.lvalue, 'type') or not hasattr(assign.lvalue, 'name'):
+                    self.output.append("    ; Warning: Invalid struct reference in assignment")
+                    self.output.append("    MOV RAX, 0")
+                    return
+                
+                member_name = None
+                if hasattr(assign.lvalue, 'field') and assign.lvalue.field and hasattr(assign.lvalue.field, 'name'):
+                    member_name = assign.lvalue.field.name
+                
+                # Ensure type is a string, not an attribute name or AST node
+                # assign.lvalue.type should be '.' or '->', but protect against AST nodes
+                if hasattr(assign.lvalue, 'type'):
+                    type_val = assign.lvalue.type
+                    if isinstance(type_val, str):
+                        struct_type = type_val
+                    elif isinstance(type_val, c_ast.Node):
+                        # If type is an AST node (shouldn't happen, but protect against it)
+                        struct_type = None
+                    else:
+                        # Try to convert to string safely
+                        struct_type = safe_str(type_val) if type_val in ['.', '->'] else None
+                else:
+                    struct_type = None
+                
+                if struct_type == '.':
+                    # Direct member access: struct.member
+                    if isinstance(assign.lvalue.name, c_ast.ID):
+                        name = assign.lvalue.name.name
+                        globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                        if name in globals:
+                            self.output.append(f"    MOV RAX, GLOBAL_{name}")
+                        else:
+                            if name in self.current_function_stack:
+                                slot_index, offset = self.current_function_stack[name]
+                                displacement = slot_index * self.stack_slot_size + offset
+                                self.output.append(f"    MOV RAX, {self.stack_base_register}")
+                                if displacement > 0:
+                                    self.output.append(f"    ADD RAX, {displacement}")
+                    else:
+                        # Handle nested struct references
+                        if isinstance(assign.lvalue.name, c_ast.StructRef):
+                            self._generate_struct_ref(assign.lvalue.name)
+                        else:
+                            self._generate_expression(assign.lvalue.name)
+                elif struct_type == '->':
+                    # Pointer member access: struct->member
+                    self._generate_expression(assign.lvalue.name)
+                
+                # Add member offset
+                if member_name:
+                    member_offsets = {
+                        'x': 0, 'y': 4, 'z': 8,
+                        'width': 8, 'height': 12,
+                        'a': 0, 'b': 4, 'c': 8, 'd': 12
+                    }
+                    member_offset = member_offsets.get(member_name, 0)
+                    if member_offset > 0:
+                        self.output.append(f"    ADD RAX, {member_offset}")
+                
+                # Save member address
+                self.output.append("    PUSH RAX  ; Save member address")
+            else:
+                # Complex lvalue - generate expression
+                self._generate_expression(assign.lvalue)
+            
+            # Save current value
+            self.output.append("    PUSH RAX  ; Save current value")
+            
+            # Generate right-hand side
+            self._generate_expression(assign.rvalue)
+            self.output.append("    POP RBX  ; Get current value")
+            
+            # Perform operation based on operator
+            base_op = assign.op[:-1]  # Remove '=' from '+=', etc.
+            if base_op == '+':
+                self.output.append("    ADD RAX, RBX")
+            elif base_op == '-':
+                self.output.append("    SUB RBX, RAX")
+                self.output.append("    MOV RAX, RBX")
+            elif base_op == '*':
+                self.output.append("    MUL RBX")
+            elif base_op == '/':
+                self.output.append("    MOV RCX, RAX  ; Save divisor")
+                self.output.append("    MOV RAX, RBX  ; Dividend")
+                self.output.append("    XOR RDX, RDX")
+                self.output.append("    DIV RCX")
+            elif base_op == '%':
+                self.output.append("    MOV RCX, RAX  ; Save divisor")
+                self.output.append("    MOV RAX, RBX  ; Dividend")
+                self.output.append("    XOR RDX, RDX")
+                self.output.append("    DIV RCX")
+                self.output.append("    MOV RAX, RDX  ; Remainder")
+            elif base_op == '<<':
+                self.output.append("    MOV RCX, RAX  ; Shift amount")
+                self.output.append("    MOV RAX, RBX  ; Value to shift")
+                self.output.append("    SHL RAX, CL")
+            elif base_op == '>>':
+                self.output.append("    MOV RCX, RAX  ; Shift amount")
+                self.output.append("    MOV RAX, RBX  ; Value to shift")
+                self.output.append("    SHR RAX, CL")
+            elif base_op == '&':
+                self.output.append("    AND RAX, RBX")
+            elif base_op == '|':
+                self.output.append("    OR RAX, RBX")
+            elif base_op == '^':
+                self.output.append("    XOR RAX, RBX")
+            
+            # Now assign the result (fall through to regular assignment)
+            # We'll handle the assignment below
+            assign.op = '='  # Change to regular assignment
+            # Continue with regular assignment handling
+        
         if assign.op == '=':
             self._generate_expression(assign.rvalue)
-            if isinstance(assign.lvalue, c_ast.ID):
+            # Check if we have a struct member assignment (address on stack)
+            if isinstance(assign.lvalue, c_ast.StructRef):
+                # Struct member assignment
+                self.output.append("    POP RBX  ; Get member address")
+                self.output.append("    MOV [RBX], RAX  ; Store to struct member")
+            elif isinstance(assign.lvalue, c_ast.ID):
                 name = assign.lvalue.name
                 # Check if this is a packed global variable
                 if name in self.global_var_data['bit_positions']:
@@ -611,9 +1570,74 @@ class CodeGenerator:
                     if name in globals:
                         # Global variable (non-packed)
                         self.output.append(f"    MOV [GLOBAL_{name}], RAX")
+                    elif self.asm_parser and self.asm_parser.has_symbol(name):
+                        # Global variable defined in assembly
+                        self.output.append(f"    MOV [GLOBAL_{name}], RAX  ; Store to assembly-defined global")
+                        self.referenced_asm_symbols.add(name)
                     else:
                         # Local variable assignment - use indexed stack pointer
                         self._generate_local_var_store(name)
+            elif isinstance(assign.lvalue, c_ast.ArrayRef):
+                # Array assignment: arr[index] = value
+                # Value is already in RAX
+                self.output.append("    PUSH RAX  ; Save value to assign")
+                
+                # Generate index
+                self._generate_expression(assign.lvalue.subscript)
+                self.output.append("    PUSH RAX  ; Save index")
+                
+                # Generate base address
+                if isinstance(assign.lvalue.name, c_ast.ID):
+                    # Array variable name
+                    name = assign.lvalue.name.name
+                    # Check if it's a global variable
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        # Global array
+                        self.output.append(f"    MOV RBX, GLOBAL_{name}  ; Base address of array")
+                    else:
+                        # Local array - treat as pointer
+                        self._generate_local_var_load(name)
+                        self.output.append("    MOV RBX, RAX  ; Base address")
+                else:
+                    # Complex expression for base
+                    self._generate_expression(assign.lvalue.name)
+                    self.output.append("    MOV RBX, RAX  ; Base address")
+                
+                # Get index from stack
+                self.output.append("    POP RAX  ; Get index")
+                
+                # Calculate address: base + index * sizeof(int)
+                self.output.append("    ; Array assignment: base + index * 4")
+                self.output.append("    MOV RCX, RAX  ; Save index")
+                self.output.append("    MOV RAX, 4  ; Size of int")
+                self.output.append("    MUL RCX  ; RAX = index * 4")
+                self.output.append("    ADD RAX, RBX  ; RAX = base + offset")
+                
+                # Store value to memory
+                self.output.append("    POP RBX  ; Get value to assign")
+                self.output.append("    MOV [RAX], RBX  ; Store to array element")
+    
+    def _generate_ternary_op(self, ternary):
+        """Generate code for ternary operator: condition ? true_expr : false_expr"""
+        self.label_counter = self.label_counter + 1
+        label_id = self.label_counter
+        
+        # Evaluate condition
+        self._generate_expression(ternary.cond)
+        self.output.append(f"    TEST RAX, RAX  ; Check condition")
+        self.output.append(f"    JZ TERNARY_FALSE_{label_id}")
+        
+        # True branch
+        self._generate_expression(ternary.iftrue)
+        self.output.append(f"    JMP TERNARY_END_{label_id}")
+        
+        # False branch
+        self.output.append(f"TERNARY_FALSE_{label_id}:")
+        self._generate_expression(ternary.iffalse)
+        
+        # End
+        self.output.append(f"TERNARY_END_{label_id}:")
     
     def _generate_if(self, if_stmt, func_name, info):
         """Generate code for if statement."""

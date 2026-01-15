@@ -10,6 +10,8 @@ from pathlib import Path
 from parser import CParser, MultiFileParser, find_c_files
 from analyzer import analyze_all_functions, analyze_global_variables
 from codegen import CodeGenerator
+from asm_parser import parse_asm_files, find_asm_files
+from symbol_collector import collect_symbols
 
 
 def find_assembler():
@@ -22,7 +24,98 @@ def find_assembler():
 		return None
 
 
-def assemble_and_link(asm_file, output_executable=None, verbose=False):
+def find_linker_script(input_path):
+	"""Find linker script (linker.ld) in common locations."""
+	# Convert to Path object if it's a string
+	if isinstance(input_path, str):
+		input_path = Path(input_path)
+	
+	# Resolve to absolute path
+	try:
+		input_path = input_path.resolve()
+	except:
+		pass
+	
+	# Check in the input directory
+	if input_path.is_dir():
+		linker_script = input_path / 'linker.ld'
+		if linker_script.exists():
+			return str(linker_script)
+		
+		# Check in common subdirectories
+		for subdir in ['src', 'kernel', 'src/kernel', 'build']:
+			linker_script = input_path / subdir / 'linker.ld'
+			if linker_script.exists():
+				return str(linker_script)
+		
+		# Check parent directories up to 3 levels
+		current = input_path
+		for _ in range(3):
+			current = current.parent
+			linker_script = current / 'linker.ld'
+			if linker_script.exists():
+				return str(linker_script)
+			# Also check subdirectories
+			for subdir in ['src', 'kernel', 'src/kernel', 'build']:
+				linker_script = current / subdir / 'linker.ld'
+				if linker_script.exists():
+					return str(linker_script)
+	
+	# Check parent directory if input is a file
+	if input_path.is_file():
+		parent = input_path.parent
+		linker_script = parent / 'linker.ld'
+		if linker_script.exists():
+			return str(linker_script)
+		
+		# Check in common subdirectories of parent
+		for subdir in ['src', 'kernel', 'src/kernel', 'build']:
+			linker_script = parent / subdir / 'linker.ld'
+			if linker_script.exists():
+				return str(linker_script)
+		
+		# Check parent directories up to 3 levels
+		current = parent
+		for _ in range(3):
+			current = current.parent
+			linker_script = current / 'linker.ld'
+			if linker_script.exists():
+				return str(linker_script)
+			# Also check subdirectories
+			for subdir in ['src', 'kernel', 'src/kernel', 'build']:
+				linker_script = current / subdir / 'linker.ld'
+				if linker_script.exists():
+					return str(linker_script)
+	
+	# Check for minikraft directory structure in common locations
+	minikraft_paths = [
+		Path('/home/gileadcosman/pythonlinux/minikraft/src/kernel/linker.ld'),
+		Path.home() / 'minikraft' / 'src' / 'kernel' / 'linker.ld',
+		Path.home() / 'minikraft' / 'linker.ld',
+		Path('/home/gileadcosman/minikraft/src/kernel/linker.ld'),
+		Path('/home/gileadcosman/minikraft/linker.ld'),
+	]
+	
+	for path in minikraft_paths:
+		if path.exists():
+			return str(path)
+	
+	# Check current working directory
+	cwd = Path.cwd()
+	linker_script = cwd / 'linker.ld'
+	if linker_script.exists():
+		return str(linker_script)
+	
+	# Check in common subdirectories of current directory
+	for subdir in ['src', 'kernel', 'src/kernel', 'build']:
+		linker_script = cwd / subdir / 'linker.ld'
+		if linker_script.exists():
+			return str(linker_script)
+	
+	return None
+
+
+def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_script=None):
 	"""Assemble and link the generated assembly file."""
 	# Find assembler
 	assembler_info = find_assembler()
@@ -61,10 +154,19 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False):
 	# Link
 	if verbose:
 		print(f"Linking {obj_file}...", file=sys.stderr)
+		if linker_script:
+			print(f"Using linker script: {linker_script}", file=sys.stderr)
 	
 	try:
+		# Build linker command
+		link_cmd = ['ld', obj_file, '-o', output_executable]
+		
+		# Add linker script if provided
+		if linker_script:
+			link_cmd.extend(['-T', linker_script])
+		
 		result = subprocess.run(
-			['ld', obj_file, '-o', output_executable],
+			link_cmd,
 			check=True,
 			capture_output=True,
 			text=True
@@ -241,9 +343,51 @@ def main():
 		print(f"Error analyzing global variables: {e}", file=sys.stderr)
 		global_var_data = {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
 	
+	# Parse assembly files if they exist
+	asm_parser = None
+	if input_path.is_dir():
+		# Look for assembly files in the same directory
+		asm_files = find_asm_files(input_path)
+		if asm_files:
+			if args.verbose:
+				print(f"Found {len(asm_files)} assembly file(s):", file=sys.stderr)
+				for asm_file in asm_files:
+					print(f"  {asm_file}", file=sys.stderr)
+			try:
+				asm_parser = parse_asm_files(asm_files)
+				if args.verbose:
+					symbols = asm_parser.get_all_symbols()
+					if symbols:
+						print(f"Extracted {len(symbols)} symbol(s) from assembly files:", file=sys.stderr)
+						for symbol in sorted(symbols):
+							symbol_info = asm_parser.global_symbols.get(symbol, {})
+							symbol_type = symbol_info.get('type', 'unknown')
+							print(f"  {symbol} ({symbol_type})", file=sys.stderr)
+			except Exception as e:
+				print(f"Warning: Failed to parse assembly files: {e}", file=sys.stderr)
+				asm_parser = None
+	elif input_path.is_file():
+		# Look for assembly files in the same directory as the C file
+		asm_dir = input_path.parent
+		asm_files = find_asm_files(asm_dir)
+		if asm_files:
+			if args.verbose:
+				print(f"Found {len(asm_files)} assembly file(s) in directory:", file=sys.stderr)
+				for asm_file in asm_files:
+					print(f"  {asm_file}", file=sys.stderr)
+			try:
+				asm_parser = parse_asm_files(asm_files)
+				if args.verbose:
+					symbols = asm_parser.get_all_symbols()
+					if symbols:
+						print(f"Extracted {len(symbols)} symbol(s) from assembly files", file=sys.stderr)
+			except Exception as e:
+				print(f"Warning: Failed to parse assembly files: {e}", file=sys.stderr)
+				asm_parser = None
+	
 	# Generate code
 	try:
-		codegen = CodeGenerator(function_data, global_var_data)
+		codegen = CodeGenerator(function_data, global_var_data, asm_parser)
 		output_code = codegen.generate(c_parser)
 		
 		# Write output
@@ -274,7 +418,12 @@ def main():
 				else:
 					executable_name = os.path.join(args.input_path, Path(args.input_path).name)
 			
-			success = assemble_and_link(output_file, executable_name, args.verbose)
+			# Find linker script
+			linker_script = find_linker_script(input_path)
+			if linker_script and args.verbose:
+				print(f"Found linker script: {linker_script}", file=sys.stderr)
+			
+			success = assemble_and_link(output_file, executable_name, args.verbose, linker_script)
 			if not success:
 				sys.exit(1)
 			
