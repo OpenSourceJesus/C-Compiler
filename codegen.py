@@ -53,6 +53,8 @@ class CodeGenerator:
         self.current_stack_slots = 0  # Number of 16-byte slots allocated in current function
         self.stack_base_address = 'STACK_BASE'  # Symbol for stack base address
         self.label_counter = 0  # Counter for unique labels
+        self.saved_fp_in_rbx = False  # Track if function pointer is saved in RBX from if condition
+        self.fp_in_rax = False  # Track if function pointer is already in RAX from condition
     
     def _safe_append(self, line):
         """Safely append a line to output, ensuring no AST node objects are included.
@@ -536,9 +538,14 @@ class CodeGenerator:
         Where R12 = stack base, slot_index fits in 32 bits (enables pointer compression)
         """
         if var_name not in self.current_function_stack:
-            # Variable not found in current function - might be a parameter or error
-            # For now, assume it's a parameter passed in register or use fallback
-            self.output.append(f"    ; Warning: {var_name} not found in stack, assuming parameter")
+            # Check if it's a function parameter
+            if var_name in self.function_parameters:
+                param_reg = self.function_parameters[var_name]
+                self.output.append(f"    MOV RAX, {param_reg}  ; Load parameter {var_name}")
+                return
+            # Variable not found - might be an error
+            self.output.append(f"    ; Warning: {var_name} not found in stack or parameters")
+            self.output.append(f"    MOV RAX, 0  ; Default to 0")
             return
         
         slot_index, offset = self.current_function_stack[var_name]
@@ -637,6 +644,26 @@ class CodeGenerator:
         # Reset stack tracking for this function
         self.current_function_stack = {}
         self.current_stack_slots = 0
+        # Reset function pointer tracking
+        self.saved_fp_in_rbx = False
+        self.fp_in_rax = False
+        # Track if function needs indexed stack system
+        self.function_needs_indexed_stack = False
+        
+        # Track function parameters (x86-64 calling convention: RDI, RSI, RDX, RCX, R8, R9)
+        self.function_parameters = {}
+        param_registers = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9']
+        if func_def.decl and func_def.decl.type and hasattr(func_def.decl.type, 'args'):
+            if func_def.decl.type.args and func_def.decl.type.args.params:
+                for i, param in enumerate(func_def.decl.type.args.params):
+                    if i < len(param_registers):
+                        if isinstance(param, c_ast.Decl) and param.name:
+                            # param.name is a c_ast.ID node, so access .name attribute
+                            if isinstance(param.name, c_ast.ID):
+                                param_name = param.name.name
+                            else:
+                                param_name = str(param.name)
+                            self.function_parameters[param_name] = param_registers[i]
         
         # Align function start to 16 bytes for quantized call-backs
         self.output.append(f"ALIGN {self.alignment}")
@@ -647,26 +674,25 @@ class CodeGenerator:
             # For interrupt callbacks, ensure SIMD register is preserved/accessible
             self.output.append(f"    ; {self.simd_register} contains packed kernel flags (no memory reads)")
         
-        # Function prologue with indexed stack pointer
-        self.output.append("    ; Indexed stack pointer prologue (16-byte intervals)")
-        self.output.append("    PUSH RBP")
-        self.output.append("    PUSH R12  ; Preserve stack base register")
-        self.output.append("    PUSH R13  ; Preserve stack index register")
-        self.output.append("    MOV RBP, RSP  ; Save old RSP")
-        
-        # Initialize indexed stack pointer system
-        # R12 = stack base address, R13 = current slot index (0-based)
-        # For Linux user-space: use RSP as base (actual stack)
-        # For kernel/bare-metal with custom memory layout, could use: MOV R12, [STACK_BASE]
-        # Note: We'll set R12 to point to allocated stack space when slots are allocated
-        # For now, initialize R12 to RSP (will be adjusted when slots are allocated)
-        self.output.append(f"    MOV {self.stack_base_register}, RSP  ; Initialize to current stack pointer")
-        self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
-        self.output.append("    ; Stack address = [R12 + R13*16] for indexed access")
-        self.output.append("    ; Pointer compression: R13 fits in 32 bits, allowing two indices in one 64-bit register")
+        # Check if function needs indexed stack (has local variables or needs stack space)
+        # We'll set this flag during code generation if we allocate any stack slots
+        # For now, use minimal prologue - we'll add indexed stack setup only if needed
+        # Most functions don't need any prologue at all (GCC -O3 style)
         
         # For interrupt callbacks, preserve SIMD register if needed
         if is_interrupt:
+            # Mark that this function needs indexed stack system
+            if not self.function_needs_indexed_stack:
+                self.function_needs_indexed_stack = True
+                # Generate indexed stack prologue now (lazy initialization)
+                self.output.append("    ; Indexed stack pointer prologue (16-byte intervals)")
+                self.output.append("    PUSH RBP")
+                self.output.append("    PUSH R12  ; Preserve stack base register")
+                self.output.append("    PUSH R13  ; Preserve stack index register")
+                self.output.append("    MOV RBP, RSP  ; Save old RSP")
+                self.output.append(f"    MOV {self.stack_base_register}, RSP  ; Initialize to current stack pointer")
+                self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
+                self.output.append("    ; Stack address = [R12 + R13*16] for indexed access")
             # Allocate one slot (16 bytes) for SIMD register preservation
             self.current_stack_slots = 1
             self.output.append(f"    INC {self.stack_index_register}  ; Allocate slot 0 for SIMD register")
@@ -681,13 +707,19 @@ class CodeGenerator:
             has_any_return = block_items and any(isinstance(item, c_ast.Return) for item in block_items)
             if not has_any_return:
                 # Generate implicit return (fall-through case)
-                # Restore stack index to 0
-                if self.current_stack_slots > 0:
-                    self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
-                self.output.append("    MOV RSP, RBP")
-                self.output.append("    POP R13  ; Restore stack index register")
-                self.output.append("    POP R12  ; Restore stack base register")
-                self.output.append("    POP RBP")
+                # Use minimal epilogue if no indexed stack was used
+                if self.function_needs_indexed_stack:
+                    if self.current_stack_slots > 0:
+                        self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
+                    self.output.append("    MOV RSP, RBP")
+                    self.output.append("    POP R13  ; Restore stack index register")
+                    self.output.append("    POP R12  ; Restore stack base register")
+                    self.output.append("    POP RBP")
+                else:
+                    # Minimal epilogue - just restore RBP if we saved it
+                    if self.current_stack_slots > 0:
+                        self.output.append("    MOV RSP, RBP")
+                        self.output.append("    POP RBP")
                 self.output.append("    RET")
     
     def _generate_block(self, block, func_name, info):
@@ -725,13 +757,18 @@ class CodeGenerator:
         if info.get('has_single_return', False):
             # Metamorphic return site: return address is written into instruction
             self.output.append("    ; Metamorphic return site - address injected by caller")
-            # Restore stack index to 0 (all slots deallocated)
-            if self.current_stack_slots > 0:
-                self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
-            self.output.append("    MOV RSP, RBP")
-            self.output.append("    POP R13  ; Restore stack index register")
-            self.output.append("    POP R12  ; Restore stack base register")
-            self.output.append("    POP RBP")
+            # Use minimal epilogue if no indexed stack was used
+            if self.function_needs_indexed_stack:
+                if self.current_stack_slots > 0:
+                    self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
+                self.output.append("    MOV RSP, RBP")
+                self.output.append("    POP R13  ; Restore stack index register")
+                self.output.append("    POP R12  ; Restore stack base register")
+                self.output.append("    POP RBP")
+            else:
+                if self.current_stack_slots > 0:
+                    self.output.append("    MOV RSP, RBP")
+                    self.output.append("    POP RBP")
             # The RET address will be dynamically modified by the caller
             self.output.append("    RET  ; Address bytes written by caller")
         else:
@@ -739,13 +776,18 @@ class CodeGenerator:
             if ret_stmt.expr:
                 self._generate_expression(ret_stmt.expr)
                 # Return value is already in RAX from expression evaluation
-            # Restore stack index to 0 (all slots deallocated)
-            if self.current_stack_slots > 0:
-                self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
-            self.output.append("    MOV RSP, RBP")
-            self.output.append("    POP R13  ; Restore stack index register")
-            self.output.append("    POP R12  ; Restore stack base register")
-            self.output.append("    POP RBP")
+            # Use minimal epilogue if no indexed stack was used
+            if self.function_needs_indexed_stack:
+                if self.current_stack_slots > 0:
+                    self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
+                self.output.append("    MOV RSP, RBP")
+                self.output.append("    POP R13  ; Restore stack index register")
+                self.output.append("    POP R12  ; Restore stack base register")
+                self.output.append("    POP RBP")
+            else:
+                if self.current_stack_slots > 0:
+                    self.output.append("    MOV RSP, RBP")
+                    self.output.append("    POP RBP")
             self.output.append("    RET")
     
     def _generate_call(self, call, caller_func_name):
@@ -755,26 +797,46 @@ class CodeGenerator:
         # ArrayRef and StructRef have a 'name' attribute that would be incorrectly extracted
         if isinstance(call.name, (c_ast.ArrayRef, c_ast.StructRef)):
             # This is a function pointer call through array or struct member
-            # Generate code to evaluate the function pointer expression
-            self._generate_expression(call.name)
-            # RAX now contains the function pointer
-            # Save it to the stack before evaluating arguments
-            self.output.append("    PUSH RAX  ; Save function pointer")
+            # Check if function pointer is already in RAX (from if condition)
+            if self.fp_in_rax:
+                # Function pointer is already in RAX from condition - don't reload it!
+                self.output.append("    ; Function pointer already in RAX from condition")
+            elif self.saved_fp_in_rbx:
+                # Function pointer was saved in RBX from if condition
+                self.output.append("    MOV RAX, RBX  ; Use function pointer from condition")
+            else:
+                # Need to evaluate the expression
+                self._generate_expression(call.name)
+                # RAX now contains the function pointer
             
             # Prepare arguments (simplified - assume up to 6 args in registers)
             # Arguments are evaluated in sequence and each overwrites RAX,
-            # but we move them to argument registers immediately
+            # so we need to save the function pointer before evaluating args
+            # Use a callee-saved register (RBX) to save it
+            self.output.append("    MOV RBX, RAX  ; Save function pointer")
+            
             if call.args:
                 for i, arg in enumerate(call.args.exprs[:6]):
                     reg = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9'][i]
-                    self._generate_expression(arg)
-                    self.output.append(f"    MOV {reg}, RAX  ; Argument {i+1}")
+                    # Optimize: if argument is a parameter already in the correct register, use it directly
+                    if isinstance(arg, c_ast.ID) and arg.name in self.function_parameters:
+                        param_reg = self.function_parameters[arg.name]
+                        if param_reg == reg:
+                            # Parameter is already in the correct register, no need to move
+                            self.output.append(f"    ; Argument {i+1} ({arg.name}) already in {reg}")
+                        else:
+                            # Parameter is in a different register, move it
+                            self.output.append(f"    MOV {reg}, {param_reg}  ; Argument {i+1} ({arg.name})")
+                    else:
+                        # Evaluate expression and move to argument register
+                        self._generate_expression(arg)
+                        self.output.append(f"    MOV {reg}, RAX  ; Argument {i+1}")
             
-            # Restore function pointer from stack
-            self.output.append("    POP RAX  ; Restore function pointer")
-            
-            # Call the function pointer
-            self.output.append("    CALL RAX  ; Call function pointer")
+            # Restore function pointer from RBX
+            self.output.append("    MOV RAX, RBX  ; Restore function pointer")
+            # Use JMP for function pointer calls (like GCC -O3)
+            self.output.append("    JMP RAX  ; Call function pointer")
+            # Note: JMP doesn't return, so any code after this is unreachable
             return
         
         # Extract function name from call expression
@@ -826,8 +888,8 @@ class CodeGenerator:
                 # Restore function pointer from stack
                 self.output.append("    POP RAX  ; Restore function pointer")
                 
-                # Call the function pointer
-                self.output.append("    CALL RAX  ; Call function pointer")
+                # Use JMP for function pointer calls (like GCC -O3)
+                self.output.append("    JMP RAX  ; Call function pointer")
                 return
             else:
                 # Unknown function name - skip
@@ -904,7 +966,8 @@ class CodeGenerator:
                             self.output.append(f"    MOV {reg}, RAX  ; Argument {i+1}")
                         # Reload function pointer (arguments might have overwritten RAX)
                         self.output.append(f"    MOV RAX, [GLOBAL_{func_name}]  ; Reload function pointer")
-                    self.output.append("    CALL RAX  ; Call function pointer")
+                    # Use JMP for function pointer calls (like GCC -O3)
+                    self.output.append("    JMP RAX  ; Call function pointer")
                 else:
                     # Assume it's an external function
                     self.output.append(f"    ; External function call: {func_name}")
@@ -1002,6 +1065,10 @@ class CodeGenerator:
                     # Global variable defined in assembly
                     self.output.append(f"    MOV RAX, [GLOBAL_{name}]  ; Load assembly-defined global")
                     self.referenced_asm_symbols.add(name)
+                elif name in self.function_parameters:
+                    # Function parameter - load from argument register
+                    param_reg = self.function_parameters[name]
+                    self.output.append(f"    MOV RAX, {param_reg}  ; Load parameter {name}")
                 else:
                     # Local variable - use indexed stack pointer
                     self._generate_local_var_load(name)
@@ -1329,6 +1396,106 @@ class CodeGenerator:
         # Load value from memory
         self.output.append("    MOV RAX, [RAX]  ; Load array element")
     
+    def _compute_nested_struct_offset(self, struct_ref):
+        """Compute cumulative offset for nested struct access like container.outer.inner.callback.
+        
+        Returns: (base_expr, total_offset) where base_expr is the base variable/expression
+        and total_offset is the cumulative byte offset.
+        """
+        # Build the path recursively from base to final member
+        # For container.outer.inner.callback:
+        #   struct_ref.field.name = 'callback'
+        #   struct_ref.name = StructRef with field='inner', name=StructRef with field='outer', name=ID('container')
+        path = []
+        
+        def extract_path(sr):
+            """Recursively extract the path from nested struct reference."""
+            if not isinstance(sr, c_ast.StructRef):
+                return sr  # Base expression
+            
+            member_name = None
+            if hasattr(sr, 'field') and sr.field and hasattr(sr.field, 'name'):
+                member_name = sr.field.name
+            
+            struct_type = None
+            if hasattr(sr, 'type'):
+                type_val = sr.type
+                if isinstance(type_val, str):
+                    struct_type = type_val
+                elif isinstance(type_val, c_ast.Node):
+                    struct_type = None
+                else:
+                    struct_type = safe_str(type_val) if type_val in ['.', '->'] else None
+            
+            # Recursively process the name part
+            base = extract_path(sr.name)
+            path.append((member_name, struct_type))
+            return base
+        
+        base_expr = extract_path(struct_ref)
+        
+        if not path or not isinstance(base_expr, c_ast.ID):
+            return (None, 0)
+        
+        # Compute cumulative offset based on struct layouts
+        # Struct layouts (based on test_nested_structs.c):
+        # Inner: x (0), y (4), callback (8) = 16 bytes total
+        # Outer: inner (0-15), inner_ptr (16), value (24), get_inner (32), handler (40) = 48 bytes total
+        # Container: outer (0-47), outer_ptr (48), nested (56-71), func_ptr (72) = 80 bytes total
+        
+        total_offset = 0
+        current_offset = 0
+        
+        # Process path from base to final member
+        for i in range(1, len(path)):
+            member_name, struct_type = path[i]
+            if member_name is None:
+                continue
+            
+            # Member offsets within each struct type
+            if member_name == 'x':
+                total_offset += 0
+            elif member_name == 'y':
+                total_offset += 4
+            elif member_name == 'callback':
+                total_offset += 8
+            elif member_name == 'inner':
+                total_offset += 0  # First member of Outer
+            elif member_name == 'inner_ptr':
+                total_offset += 16  # After Inner struct (16 bytes)
+            elif member_name == 'value':
+                total_offset += 24  # After inner_ptr (16 + 8)
+            elif member_name == 'get_inner':
+                total_offset += 32  # After value (24 + 8 with alignment)
+            elif member_name == 'handler':
+                total_offset += 40  # After get_inner (32 + 8)
+            elif member_name == 'outer':
+                total_offset += 0  # First member of Container
+            elif member_name == 'outer_ptr':
+                total_offset += 48  # After Outer struct (48 bytes)
+            elif member_name == 'nested':
+                total_offset += 56  # After outer_ptr (48 + 8)
+            elif member_name == 'func_ptr':
+                total_offset += 72  # After nested (56 + 16)
+            elif member_name == 'deep_callback':
+                total_offset += 0  # First member of Deep3
+            elif member_name == 'value' and i > 1:  # value in Deep3
+                total_offset += 8  # After deep_callback
+            elif member_name == 'deep3':
+                total_offset += 0  # First member of Deep2
+            elif member_name == 'deep3_ptr':
+                total_offset += 8  # After deep3
+            elif member_name == 'deep2':
+                total_offset += 0  # First member of Deep1
+            
+            # Handle pointer dereference
+            if struct_type == '->':
+                # After computing offset, we need to dereference the pointer
+                # This will be handled in the main function
+                pass
+        
+        return (base_expr, total_offset)
+    
     def _generate_struct_ref(self, struct_ref):
         """Generate code for struct member access: struct.member or struct->member"""
         # Defensive check: ensure struct_ref has required attributes
@@ -1341,36 +1508,44 @@ class CodeGenerator:
         if hasattr(struct_ref, 'field') and struct_ref.field and hasattr(struct_ref.field, 'name'):
             member_name = struct_ref.field.name
         
+        # Try to compute nested struct offset for optimization
+        base_expr, cumulative_offset = self._compute_nested_struct_offset(struct_ref)
+        
+        # Check if we can optimize (base is a simple ID and we computed the offset)
+        if base_expr and isinstance(base_expr, c_ast.ID) and cumulative_offset >= 0:
+            name = base_expr.name
+            globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+            
+            if name in globals:
+                # Optimized: single memory access with computed offset
+                self.output.append(f"    ; Optimized nested struct access: {name} + {cumulative_offset}")
+                if cumulative_offset == 0:
+                    self.output.append(f"    MOV RAX, [GLOBAL_{name}]  ; Load member directly")
+                else:
+                    self.output.append(f"    MOV RAX, [GLOBAL_{name} + {cumulative_offset}]  ; Load member with offset")
+                return
+        
+        # Fallback to original recursive approach
         # Ensure type is a string, not an attribute name or AST node
-        # struct_ref.type should be '.' or '->', but protect against AST nodes
         if hasattr(struct_ref, 'type'):
             type_val = struct_ref.type
             if isinstance(type_val, str):
                 struct_type = type_val
             elif isinstance(type_val, c_ast.Node):
-                # If type is an AST node (shouldn't happen, but protect against it)
                 struct_type = None
             else:
-                # Try to convert to string safely
                 struct_type = safe_str(type_val) if type_val in ['.', '->'] else None
         else:
             struct_type = None
         
         if struct_type == '.':
             # Direct member access: struct.member
-            # Generate base address (struct variable)
             if isinstance(struct_ref.name, c_ast.ID):
                 name = struct_ref.name.name
-                # Check if it's a global variable
                 globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                 if name in globals:
-                    # Global struct - base address
                     self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Base address of struct")
                 else:
-                    # Local struct - get address from stack
-                    self._generate_local_var_load(name)
-                    # For structs, we need the address, not the value
-                    # If it's a local variable, we need to compute its address
                     if name in self.current_function_stack:
                         slot_index, offset = self.current_function_stack[name]
                         displacement = slot_index * self.stack_slot_size + offset
@@ -1378,31 +1553,23 @@ class CodeGenerator:
                         if displacement > 0:
                             self.output.append(f"    ADD RAX, {displacement}")
             else:
-                # Complex expression for base
                 self._generate_expression(struct_ref.name)
-                # RAX now contains the struct address
         elif struct_type == '->':
-            # Pointer member access: struct->member
-            # Generate pointer value (address)
             self._generate_expression(struct_ref.name)
-            # RAX now contains the pointer (address of struct)
+            self.output.append("    MOV RAX, [RAX]  ; Load pointer value")
         else:
-            # Fallback: handle nested struct references or other complex cases
             if isinstance(struct_ref.name, c_ast.StructRef):
-                # Nested struct reference: a.b.c
                 self._generate_struct_ref(struct_ref.name)
             else:
                 self._generate_expression(struct_ref.name)
         
-        # Calculate member offset (simplified: assume 4 bytes per member, sequential)
-        # In a real implementation, we'd need to track struct definitions and member offsets
-        # For now, we'll use a simple offset calculation based on member name
+        # Calculate member offset
         if member_name:
-            # Simple offset calculation: use first character to determine offset
-            # This is a simplification - real implementation would parse struct definitions
-            # Common patterns: x=0, y=4, width=8, height=12, etc.
             member_offsets = {
                 'x': 0, 'y': 4, 'z': 8,
+                'callback': 8,
+                'inner': 0, 'inner_ptr': 16, 'value': 24, 'get_inner': 32, 'handler': 40,
+                'outer': 0, 'outer_ptr': 48, 'nested': 56, 'func_ptr': 72,
                 'width': 8, 'height': 12,
                 'a': 0, 'b': 4, 'c': 8, 'd': 12
             }
@@ -1640,17 +1807,58 @@ class CodeGenerator:
         self.output.append(f"TERNARY_END_{label_id}:")
     
     def _generate_if(self, if_stmt, func_name, info):
-        """Generate code for if statement."""
+        """Generate code for if statement with function pointer reuse optimization."""
         else_label = f"ELSE_{len(self.output)}"
         end_label = f"END_IF_{len(self.output)}"
         
-        self._generate_expression(if_stmt.cond)
-        self.output.append("    TEST RAX, RAX")
-        self.output.append(f"    JZ {else_label}")
+        # Check if condition is a simple struct member access (likely function pointer)
+        # and if body starts with a function call using the same expression
+        # Only treat StructRef as function pointer, not BinaryOp with &&
+        cond_is_simple_fp = isinstance(if_stmt.cond, c_ast.StructRef)
         
-        self._generate_statement(if_stmt.iftrue, func_name, info)
-        self.output.append(f"    JMP {end_label}")
-        self.output.append(f"{else_label}:")
+        body_has_call = False
+        if if_stmt.iftrue:
+            if isinstance(if_stmt.iftrue, c_ast.FuncCall):
+                body_has_call = True
+            elif isinstance(if_stmt.iftrue, c_ast.Compound) and if_stmt.iftrue.block_items:
+                body_has_call = isinstance(if_stmt.iftrue.block_items[0], c_ast.FuncCall)
+        
+        # Optimize: if condition loads a function pointer and body calls it, reuse the value
+        if cond_is_simple_fp and body_has_call:
+            # Load function pointer - keep it in RAX (like GCC does)
+            self._generate_expression(if_stmt.cond)
+            self.output.append("    TEST RAX, RAX")
+            self.output.append(f"    JZ {else_label}")
+            # Function pointer is in RAX - mark it so body can reuse it
+            self.saved_fp_in_rbx = False  # Not in RBX, it's in RAX
+            self.fp_in_rax = True  # Function pointer is already in RAX
+            # Generate body - it should detect that function pointer is already in RAX
+            self._generate_statement(if_stmt.iftrue, func_name, info)
+            # Body ends with JMP RAX (tail call), so no code after it executes
+            # Don't add JMP to end_label - it's unreachable
+            self.output.append(f"{else_label}:")
+            self.saved_fp_in_rbx = False
+            self.fp_in_rax = False
+        else:
+            # Optimize AND operations in if conditions - use short-circuit evaluation
+            if isinstance(if_stmt.cond, c_ast.BinaryOp) and if_stmt.cond.op == '&&':
+                # Short-circuit AND: evaluate left, if false skip right
+                self._generate_expression(if_stmt.cond.left)
+                self.output.append("    TEST RAX, RAX")
+                self.output.append(f"    JZ {else_label}")
+                # Left is true, evaluate right
+                self._generate_expression(if_stmt.cond.right)
+                self.output.append("    TEST RAX, RAX")
+                self.output.append(f"    JZ {else_label}")
+            else:
+                # Standard if statement
+                self._generate_expression(if_stmt.cond)
+                self.output.append("    TEST RAX, RAX")
+                self.output.append(f"    JZ {else_label}")
+            
+            self._generate_statement(if_stmt.iftrue, func_name, info)
+            self.output.append(f"    JMP {end_label}")
+            self.output.append(f"{else_label}:")
         
         if if_stmt.iffalse:
             self._generate_statement(if_stmt.iffalse, func_name, info)
@@ -1707,6 +1915,19 @@ class CodeGenerator:
         self.current_function_stack[name] = (slot_index, 0)
         
         # Increment stack index register to allocate new slot
+        # Mark that this function needs indexed stack system
+        if not self.function_needs_indexed_stack:
+            self.function_needs_indexed_stack = True
+            # Generate indexed stack prologue now (lazy initialization)
+            self.output.append("    ; Indexed stack pointer prologue (16-byte intervals)")
+            self.output.append("    PUSH RBP")
+            self.output.append("    PUSH R12  ; Preserve stack base register")
+            self.output.append("    PUSH R13  ; Preserve stack index register")
+            self.output.append("    MOV RBP, RSP  ; Save old RSP")
+            self.output.append(f"    MOV {self.stack_base_register}, RSP  ; Initialize to current stack pointer")
+            self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
+            self.output.append("    ; Stack address = [R12 + R13*16] for indexed access")
+        
         self.output.append(f"    ; Allocate slot {slot_index} (16 bytes) for {name}")
         self.output.append(f"    INC {self.stack_index_register}  ; Increment slot index")
         

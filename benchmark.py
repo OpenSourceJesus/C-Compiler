@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark script comparing GCC -O3 with this compiler."""
+"""Benchmark script comparing GCC with this compiler."""
 
 import os
 import sys
@@ -13,7 +13,7 @@ from parser import find_c_files
 from asm_parser import find_asm_files
 
 # Configuration
-ITERATIONS = 5
+DEFAULT_ITERATIONS = 5
 
 def find_assembler():
     """Find available assembler (nasm or yasm)."""
@@ -30,11 +30,17 @@ def get_file_size(filepath):
     except OSError:
         return 0
 
-def run_benchmark(executable_path, name):
-    """Run benchmark and return statistics."""
+def run_benchmark(executable_path, name, iterations):
+    """Run benchmark and return statistics.
+    
+    Args:
+        executable_path: Path to the executable to benchmark
+        name: Name of the compiler/executable being benchmarked
+        iterations: Number of iterations to run
+    """
     times = []
     
-    print(f"   Running {name} ({ITERATIONS} iterations)...")
+    print(f"   Running {name} ({iterations} iterations)...")
     print()
     
     # Ensure executable path is absolute
@@ -51,7 +57,7 @@ def run_benchmark(executable_path, name):
         print(f"   Error: File is not executable: {executable_path}")
         return None
     
-    for i in range(1, ITERATIONS + 1):
+    for i in range(1, iterations + 1):
         # Use time.perf_counter() for highest precision
         start = time.perf_counter()
         
@@ -115,7 +121,7 @@ def find_linker_scripts(directory):
     
     return linker_scripts
 
-def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False):
+def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O3', iterations=DEFAULT_ITERATIONS):
     """Compile a single file or folder and run benchmarks.
     
     Args:
@@ -123,12 +129,22 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         output_base_name: Base name for output files
         exclude_patterns: List of patterns to exclude from compilation (e.g., ['idt_asm.S'])
         use_32bit: If True, compile in 32-bit mode with -m32 flag
+        opt_level: GCC optimization level (e.g., '-O2', '-O3', '-Os')
+        iterations: Number of benchmark iterations to run
     """
     test_path = Path(test_path).resolve()
     script_dir = Path(__file__).parent.absolute()
     
     if exclude_patterns is None:
         exclude_patterns = []
+    
+    # Create separate output directories
+    gcc_output_dir = script_dir / 'gcc_output'
+    custom_output_dir = script_dir / 'custom_output'
+    
+    # Create output directories if they don't exist
+    gcc_output_dir.mkdir(exist_ok=True)
+    custom_output_dir.mkdir(exist_ok=True)
     
     # Determine test files to compile
     c_files = []
@@ -197,16 +213,20 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     # Generate base names for output files
     if len(c_files) == 1 and test_path.is_file():
-        gcc_output = f"{output_base_name}_gcc"
-        custom_output = f"{output_base_name}_custom"
+        gcc_output_name = output_base_name
+        custom_output_name = output_base_name
     else:
         # For multiple files or directories, use directory name or base name
         if test_path.is_dir():
-            gcc_output = f"{test_path.name}_gcc"
-            custom_output = f"{test_path.name}_custom"
+            gcc_output_name = test_path.name
+            custom_output_name = test_path.name
         else:
-            gcc_output = f"{output_base_name}_gcc"
-            custom_output = f"{output_base_name}_custom"
+            gcc_output_name = output_base_name
+            custom_output_name = output_base_name
+    
+    # Full paths for outputs
+    gcc_output = gcc_output_dir / gcc_output_name
+    custom_output = custom_output_dir / custom_output_name
     
     # Clean up previous builds
     for ext in ['', '.o', '.asm']:
@@ -216,22 +236,23 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 path.unlink()
     
     # Compile with GCC
-    print("1. Compiling with GCC -O3...")
+    print(f"1. Compiling with GCC {opt_level}...")
     if use_32bit:
         print("   Using 32-bit compilation mode (-m32)")
     
     try:
         # Build GCC command with all C files and assembly files
-        gcc_cmd = ['gcc', '-O3']
+        gcc_cmd = ['gcc', opt_level]
         if use_32bit:
             gcc_cmd.append('-m32')
         gcc_cmd.extend(c_files)
         gcc_cmd.extend(asm_files)
-        gcc_cmd.extend(['-o', gcc_output])
+        gcc_cmd.extend(['-o', str(gcc_output)])
         
         if len(gcc_cmd) > 10:  # If command is very long, show summary
             mode_str = " (32-bit)" if use_32bit else ""
-            print(f"   Running: gcc -O3{mode_str} [{len(c_files)} C files, {len(asm_files)} ASM files] -o {gcc_output}")
+            print(f"   Running: gcc {opt_level}{mode_str} [{len(c_files)} C files, {len(asm_files)} ASM files] -o {gcc_output}")
+            print(f"   Output directory: {gcc_output_dir}")
         else:
             print(f"   Running: {' '.join(gcc_cmd)}")
         result = subprocess.run(
@@ -280,7 +301,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         print("Error: gcc not found")
         return False
     
-    gcc_executable = (script_dir / gcc_output).resolve()
+    gcc_executable = gcc_output.resolve()
     if not gcc_executable.exists():
         print(f"Error: GCC executable was not created at {gcc_executable}")
         return False
@@ -294,6 +315,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     # Compile with custom compiler
     print("2. Compiling with custom compiler...")
+    print(f"   Output directory: {custom_output_dir}")
     python_cmd = '/usr/bin/python3'
     
     # Pass the directory or file path to the compiler
@@ -303,9 +325,11 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     else:
         input_path = str(test_path.resolve())
     
+    custom_asm_file = custom_output_dir / f'{custom_output_name}.asm'
+    
     try:
         result = subprocess.run(
-            [python_cmd, 'compiler.py', input_path, '-o', f'{custom_output}.asm', '--no-assemble'],
+            [python_cmd, 'compiler.py', input_path, '-o', str(custom_asm_file), '--no-assemble'],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -322,7 +346,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         return False
     
     # Check if assembly file was created
-    asm_file = script_dir / f'{custom_output}.asm'
+    asm_file = custom_asm_file
     if not asm_file.exists():
         print(f"Error: Assembly file was not created: {asm_file}")
         return False
@@ -335,9 +359,11 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     assembler, format_type = assembler_info
     
+    custom_obj_file = custom_output_dir / f'{custom_output_name}.o'
+    
     try:
         result = subprocess.run(
-            [assembler, '-f', format_type, str(asm_file), '-o', f'{custom_output}.o'],
+            [assembler, '-f', format_type, str(asm_file), '-o', str(custom_obj_file)],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -351,7 +377,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         return False
     
     # Check if object file was created
-    obj_file = script_dir / f'{custom_output}.o'
+    obj_file = custom_obj_file
     if not obj_file.exists():
         print(f"Error: Object file was not created: {obj_file}")
         return False
@@ -360,8 +386,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     asm_obj_files = []
     for asm_file in asm_files:
         if asm_file.endswith('.S') or asm_file.endswith('.s'):
-            # Create object file name
-            asm_obj = script_dir / Path(asm_file).name.replace('.S', '.o').replace('.s', '.o')
+            # Create object file name in custom output directory
+            asm_obj = custom_output_dir / Path(asm_file).name.replace('.S', '.o').replace('.s', '.o')
             try:
                 # Use gcc to assemble .S files (it handles both .S and .s)
                 gcc_asm_cmd = ['gcc', '-c', asm_file, '-o', str(asm_obj)]
@@ -382,7 +408,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 print(f"Warning: gcc not found, skipping assembly file {asm_file}")
     
     # Build linker command with all object files
-    link_cmd = ['ld', str(obj_file)] + asm_obj_files + ['-o', custom_output]
+    link_cmd = ['ld', str(obj_file)] + asm_obj_files + ['-o', str(custom_output)]
     
     # Add linker script if found (use the first one if multiple)
     if linker_scripts:
@@ -407,7 +433,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         print("Error: ld linker not found")
         return False
     
-    custom_executable = (script_dir / custom_output).resolve()
+    custom_executable = custom_output.resolve()
     if not custom_executable.exists():
         print(f"Error: Custom compiler executable was not created at {custom_executable}")
         return False
@@ -420,19 +446,19 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     print()
     
     # Run benchmarks
-    print(f"3. Running benchmarks ({ITERATIONS} iterations each)...")
+    print(f"3. Running benchmarks ({iterations} iterations each)...")
     print()
     
-    gcc_avg = run_benchmark(str(gcc_executable), "GCC -O3")
+    gcc_avg = run_benchmark(str(gcc_executable), f"GCC {opt_level}", iterations)
     print()
-    custom_avg = run_benchmark(str(custom_executable), "Custom Compiler")
+    custom_avg = run_benchmark(str(custom_executable), "Custom Compiler", iterations)
     print()
     
     # Results summary
     print("=" * 50)
     print("Results Summary")
     print("=" * 50)
-    print("GCC -O3:")
+    print(f"GCC {opt_level}:")
     if gcc_avg is not None:
         print(f"  Average time: {gcc_avg:18.15f} seconds")
     else:
@@ -489,6 +515,8 @@ def main():
     # Parse command-line arguments
     exclude_patterns = []
     use_32bit = False
+    opt_level = '-O3'  # Default optimization level
+    iterations = DEFAULT_ITERATIONS
     
     args = sys.argv[1:]
     if not args:
@@ -498,7 +526,7 @@ def main():
             test_path = default_test
             output_base = "benchmark"
         else:
-            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit]")
+            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N]")
             print()
             print("Examples:")
             print("  benchmark.py test.c")
@@ -506,6 +534,10 @@ def main():
             print("  benchmark.py test.c my_test")
             print("  benchmark.py test_folder --exclude idt_asm.S")
             print("  benchmark.py test_folder --32bit")
+            print("  benchmark.py test.c --opt-level O2")
+            print("  benchmark.py test.c --opt-level O3")
+            print("  benchmark.py test.c --opt-level Os")
+            print("  benchmark.py test.c --runs 10")
             sys.exit(1)
         args = []
     else:
@@ -532,16 +564,36 @@ def main():
             elif args[i] == '--32bit':
                 use_32bit = True
                 i += 1
+            elif args[i] == '--opt-level' and i + 1 < len(args):
+                opt_level_arg = args[i + 1]
+                # Ensure it starts with -O
+                if opt_level_arg.startswith('-O'):
+                    opt_level = opt_level_arg
+                elif opt_level_arg.startswith('O'):
+                    opt_level = f'-{opt_level_arg}'
+                else:
+                    opt_level = f'-O{opt_level_arg}'
+                i += 2
+            elif args[i] == '--runs' and i + 1 < len(args):
+                try:
+                    iterations = int(args[i + 1])
+                    if iterations < 1:
+                        print("Error: Number of runs must be at least 1")
+                        sys.exit(1)
+                except ValueError:
+                    print(f"Error: Invalid number of runs: {args[i + 1]}")
+                    sys.exit(1)
+                i += 2
             else:
                 i += 1
         
         if test_path is None:
             print("Error: No test path specified")
-            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit]")
+            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N]")
             sys.exit(1)
     
     print("=" * 50)
-    print("Benchmark: GCC -O3 vs Custom Compiler")
+    print(f"Benchmark: GCC {opt_level} vs Custom Compiler")
     print("=" * 50)
     print()
     print(f"Test path: {test_path}")
@@ -549,9 +601,11 @@ def main():
         print(f"Excluding files matching: {', '.join(exclude_patterns)}")
     if use_32bit:
         print("Compilation mode: 32-bit")
+    print(f"GCC optimization level: {opt_level}")
+    print(f"Number of benchmark runs: {iterations}")
     print()
     
-    success = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit)
+    success = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations)
     
     if not success:
         sys.exit(1)
