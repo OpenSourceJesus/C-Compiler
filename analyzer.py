@@ -27,11 +27,18 @@ class FunctionAnalyzer(c_ast.NodeVisitor):
         # This is a simplification; real analysis would require actual code generation
         estimated_size = self.instruction_count * 8
         
+        # A function has a single return if:
+        # - It has exactly 1 explicit return statement, OR
+        # - It has 0 explicit return statements (implicit return at the end)
+        # Functions with 2+ explicit returns do NOT have a single return
+        num_returns = len(self.return_sites)
+        has_single_return = (num_returns == 0) or (num_returns == 1)
+        
         self.function_info[func_name] = {
             'size': estimated_size,
-            'return_sites': len(self.return_sites),
+            'return_sites': num_returns,
             'is_small': estimated_size < 1024,
-            'has_single_return': len(self.return_sites) == 1,
+            'has_single_return': has_single_return,
             'node': func_def
         }
         

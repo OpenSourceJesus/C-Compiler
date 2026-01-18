@@ -869,7 +869,27 @@ class CodeGenerator:
                         self.output.append(f"    MOV {self.reg_rax}, 1  ; print (64-bit)")
                         self.output.append("    SYSCALL")
                     # No epilogue needed - syscall doesn't modify stack
-                    self.output.append("    RET")
+                    
+                    # Use metamorphic return site if function has single return
+                    if info.get('has_single_return', False):
+                        # Metamorphic return site for syscall function
+                        # Generate a label for the metamorphic return site (if not already generated)
+                        if func_name not in self.metamorphic_labels:
+                            self.metamorphic_labels[func_name] = f"FUNC_{func_name}_METAMORPHIC"
+                        
+                        label_name = self.metamorphic_labels[func_name]
+                        
+                        # Metamorphic return: load return address from instruction bytes and jump
+                        # The caller will overwrite 0xdeadbeef with the actual return address
+                        self.output.append(f"{label_name}:")
+                        if self.use_32bit:
+                            self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+                        else:
+                            self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+                        self.output.append(f"    JMP RDX  ; Jump to return address")
+                    else:
+                        # Standard return for functions with multiple returns
+                        self.output.append("    RET")
                     return
         
         # Generate function body
@@ -881,12 +901,45 @@ class CodeGenerator:
             has_any_return = block_items and any(isinstance(item, c_ast.Return) for item in block_items)
             if not has_any_return:
                 # Generate implicit return (fall-through case)
-                # Standard epilogue - restore RBP only if prologue was generated
-                if self.function_needs_indexed_stack or self.current_stack_slots > 0:
-                    if self.current_stack_slots > 0:
-                        self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}  ; Restore stack pointer")
-                    self.output.append(f"    POP {self.reg_rbp}  ; Restore frame pointer")
-                self.output.append("    RET")
+                # Use metamorphic return site if function has single return (implicit)
+                if info.get('has_single_return', False):
+                    # Metamorphic return site for implicit return
+                    # Generate a label for the metamorphic return site (if not already generated)
+                    if func_name not in self.metamorphic_labels:
+                        self.metamorphic_labels[func_name] = f"FUNC_{func_name}_METAMORPHIC"
+                    
+                    label_name = self.metamorphic_labels[func_name]
+                    
+                    # Use minimal epilogue if no indexed stack was used
+                    if self.function_needs_indexed_stack:
+                        if self.current_stack_slots > 0:
+                            self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
+                        self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
+                        if not self.use_32bit:
+                            self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
+                            self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
+                        self.output.append(f"    POP {self.reg_rbp}")
+                    else:
+                        if self.current_stack_slots > 0:
+                            self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
+                            self.output.append(f"    POP {self.reg_rbp}")
+                    
+                    # Metamorphic return: load return address from instruction bytes and jump
+                    # The caller will overwrite 0xdeadbeef with the actual return address
+                    self.output.append(f"{label_name}:")
+                    if self.use_32bit:
+                        self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+                    else:
+                        self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+                    self.output.append(f"    JMP RDX  ; Jump to return address")
+                else:
+                    # Standard implicit return (shouldn't happen if has_single_return logic is correct)
+                    # Standard epilogue - restore RBP only if prologue was generated
+                    if self.function_needs_indexed_stack or self.current_stack_slots > 0:
+                        if self.current_stack_slots > 0:
+                            self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}  ; Restore stack pointer")
+                        self.output.append(f"    POP {self.reg_rbp}  ; Restore frame pointer")
+                    self.output.append("    RET")
     
     def _generate_block(self, block, func_name, info):
         """Generate code for a block."""

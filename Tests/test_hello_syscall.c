@@ -19,13 +19,11 @@ void print(char *fmt, char *msg) {
 void a ()
 {
     b ();
-    return;
 }
 
 void b ()
 {
     print("%s", msg);
-    return;
 }
 
 int main() {
