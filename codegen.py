@@ -886,7 +886,7 @@ class CodeGenerator:
                             self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
                         else:
                             self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
-                        self.output.append(f"    JMP RDX  ; Jump to return address")
+                        self.output.append(f"    JMP {self.reg_rdx}  ; Jump to return address")
                     else:
                         # Standard return for functions with multiple returns
                         self.output.append("    RET")
@@ -931,7 +931,7 @@ class CodeGenerator:
                         self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
                     else:
                         self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
-                    self.output.append(f"    JMP RDX  ; Jump to return address")
+                    self.output.append(f"    JMP {self.reg_rdx}  ; Jump to return address")
                 else:
                     # Standard implicit return (shouldn't happen if has_single_return logic is correct)
                     # Standard epilogue - restore RBP only if prologue was generated
@@ -1008,7 +1008,7 @@ class CodeGenerator:
                 # Use 32-bit move (will be optimized by NASM, but we write 32 bits to it)
                 # The example uses mov rdx, 0xdeadbeef which NASM optimizes to 32-bit
                 self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
-            self.output.append(f"    JMP RDX  ; Jump to return address")
+            self.output.append(f"    JMP {self.reg_rdx}  ; Jump to return address")
         else:
             # Standard return
             if ret_stmt.expr:
