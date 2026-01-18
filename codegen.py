@@ -144,11 +144,6 @@ class CodeGenerator:
             else:
                 large_funcs.append(func)
         
-        # Generate initialization code for SIMD bit-packing
-        if self.global_var_data['packed_vars']:
-            self._generate_simd_packing_init()
-            self.output.append("")
-        
         # Generate code section
         # Add BITS directive based on mode
         if self.use_32bit:
@@ -160,6 +155,7 @@ class CodeGenerator:
         
         # Export all function symbols as global so they can be linked with external assembly files
         self.output.append("; Export functions as global symbols for linking")
+        self.output.append("GLOBAL _start  ; Entry point")
         all_function_names = set()
         for func in small_funcs + large_funcs:
             func_name = func.decl.name if func.decl else None
@@ -209,6 +205,11 @@ class CodeGenerator:
         # Generate small functions with indexed-jump support
         if small_funcs:
             self._generate_indexed_jump_table(small_funcs)
+            self.output.append("")
+        
+        # Generate SIMD bit-packing init function (after entry point, before other functions)
+        if self.global_var_data['packed_vars']:
+            self._generate_simd_packing_init()
             self.output.append("")
         
         # Generate all functions
@@ -592,47 +593,48 @@ class CodeGenerator:
         self.output.append("")
     
     def _generate_packed_var_access(self, var_name, is_write=False, value_reg='RAX'):
-        """Generate inline assembly to access a packed variable from SIMD register.
+        """Generate inline assembly to access a packed variable.
         
-        Uses direct SIMD register access for zero-latency operations, avoiding
-        memory reads that could stall the pipeline during interrupt callbacks.
+        For interrupt callbacks: Uses SIMD register for zero-latency access.
+        For normal functions: Uses simple memory access for better performance.
         """
         if var_name not in self.global_var_data['bit_positions']:
             return None  # Not a packed variable
         
-        start_bit, bits = self.global_var_data['bit_positions'][var_name]
-        mask = (1 << bits) - 1
+        # Check if we're in an interrupt callback (use zero-latency SIMD access)
+        is_interrupt = hasattr(self, '_current_function_name') and self._is_interrupt_callback(getattr(self, '_current_function_name', ''))
         
-        if is_write:
-            # Write: extract value, modify, pack back
-            # Zero-latency: all operations on registers, no memory access
-            self.output.append(f"    ; Zero-latency write to packed variable {var_name} (bits {start_bit}-{start_bit+bits-1})")
-            self.output.append(f"    ; Direct SIMD register access - no memory stall")
-            # Save the value to write (it's in value_reg, typically RAX)
-            self.output.append(f"    PUSH {value_reg}  ; Save value to write")
-            self.output.append(f"    MOVQ RAX, {self.simd_register}  ; Load packed register (register-to-register)")
-            self.output.append(f"    ; Clear old value bits")
-            mask_shifted = mask << start_bit
-            self.output.append(f"    MOV RBX, {mask_shifted}")
-            self.output.append(f"    NOT RBX  ; Invert mask")
-            self.output.append(f"    AND RAX, RBX  ; Clear bits for {var_name}")
-            self.output.append(f"    ; Insert new value")
-            self.output.append(f"    POP RBX  ; Restore value to write")
-            self.output.append(f"    AND RBX, {mask}  ; Mask to {bits} bits")
-            self.output.append(f"    SHL RBX, {start_bit}  ; Shift to position")
-            self.output.append(f"    OR RAX, RBX  ; Insert new value")
-            self.output.append(f"    MOVQ {self.simd_register}, RAX  ; Store back to SIMD register (register-to-register)")
-            self.output.append(f"    ; Zero-latency: all operations in registers, no pipeline stall")
+        if is_interrupt:
+            # Zero-latency SIMD access for interrupt callbacks
+            start_bit, bits = self.global_var_data['bit_positions'][var_name]
+            mask = (1 << bits) - 1
+            
+            if is_write:
+                self.output.append(f"    ; Zero-latency write to packed variable {var_name}")
+                self.output.append(f"    PUSH {value_reg}  ; Save value to write")
+                self.output.append(f"    MOVQ RAX, {self.simd_register}  ; Load packed register")
+                mask_shifted = mask << start_bit
+                self.output.append(f"    MOV RBX, {mask_shifted}")
+                self.output.append(f"    NOT RBX  ; Invert mask")
+                self.output.append(f"    AND RAX, RBX  ; Clear bits for {var_name}")
+                self.output.append(f"    POP RBX  ; Restore value to write")
+                self.output.append(f"    AND RBX, {mask}  ; Mask to {bits} bits")
+                if start_bit > 0:
+                    self.output.append(f"    SHL RBX, {start_bit}  ; Shift to position")
+                self.output.append(f"    OR RAX, RBX  ; Insert new value")
+                self.output.append(f"    MOVQ {self.simd_register}, RAX  ; Store back to SIMD register")
+            else:
+                self.output.append(f"    ; Zero-latency read from packed variable {var_name}")
+                self.output.append(f"    MOVQ RAX, {self.simd_register}  ; Load packed register")
+                if start_bit > 0:
+                    self.output.append(f"    SHR RAX, {start_bit}  ; Shift to extract {var_name}")
+                self.output.append(f"    AND RAX, {mask}  ; Mask to {bits} bits")
         else:
-            # Read: extract value from register
-            # Zero-latency: direct register access, no memory read
-            self.output.append(f"    ; Zero-latency read from packed variable {var_name} (bits {start_bit}-{start_bit+bits-1})")
-            self.output.append(f"    ; Direct SIMD register access - eliminates memory read stall")
-            self.output.append(f"    MOVQ RAX, {self.simd_register}  ; Load packed register (register-to-register)")
-            if start_bit > 0:
-                self.output.append(f"    SHR RAX, {start_bit}  ; Shift to extract {var_name}")
-            self.output.append(f"    AND RAX, {mask}  ; Mask to {bits} bits")
-            self.output.append(f"    ; Value now in RAX (zero-latency, no memory access, no pipeline stall)")
+            # Simple memory access for non-interrupt functions (faster)
+            if is_write:
+                self.output.append(f"    MOV BYTE [GLOBAL_{var_name}], AL  ; Store to packed variable")
+            else:
+                self.output.append(f"    MOVZX EAX, BYTE [GLOBAL_{var_name}]  ; Load packed variable")
         
         return True
     
@@ -642,16 +644,21 @@ class CodeGenerator:
         return is_interrupt_callback(func_name)
     
     def _generate_local_var_load(self, var_name):
-        """Generate code to load a local variable using indexed stack pointer.
+        """Generate code to load a local variable using optimized stack addressing.
         
-        Stack address = [R12 + slot_index*16 + offset]
-        Where R12 = stack base, slot_index fits in 32 bits (enables pointer compression)
+        Uses standard [RBP - offset] addressing for better performance (GCC style).
+        Slot tracking is maintained for pointer compression purposes.
         """
         if var_name not in self.current_function_stack:
             # Check if it's a function parameter
             if var_name in self.function_parameters:
                 param_reg = self.function_parameters[var_name]
-                self.output.append(f"    MOV RAX, {param_reg}  ; Load parameter {var_name}")
+                # Use 32-bit move for integer parameters if in 64-bit mode
+                if not self.use_32bit and self.current_function_stack.get(var_name, (0, 0)) == (0, 0):
+                    reg_name = param_reg.replace('R', 'E') if param_reg.startswith('R') else param_reg
+                    self.output.append(f"    MOVSX {self.reg_rax}, {reg_name}  ; Load parameter {var_name} (sign-extend)")
+                else:
+                    self.output.append(f"    MOV {self.reg_rax}, {param_reg}  ; Load parameter {var_name}")
                 return
             # Variable not found - might be an error
             self.output.append(f"    ; Warning: {var_name} not found in stack or parameters")
@@ -660,26 +667,24 @@ class CodeGenerator:
         
         slot_index, offset = self.current_function_stack[var_name]
         
-        # Calculate address: [R12 + slot_index*16 + offset]
-        # Use indexed addressing: R12 (base) + slot_index*16 (displacement)
-        self.output.append(f"    ; Load local variable {var_name} from slot {slot_index}, offset {offset}")
-        self.output.append(f"    ; Indexed stack: address = [R12 + {slot_index}*16 + {offset}]")
-        self.output.append(f"    ; Slot index {slot_index} fits in 32 bits for pointer compression")
+        # Calculate offset from RBP (standard GCC-style addressing for performance)
+        # Variables are allocated at RBP - 8, RBP - 16, RBP - 24, etc. (8-byte alignment)
+        # Offset calculation: saved RBP is at [RBP], first variable at [RBP - 8], etc.
+        stack_offset = (slot_index + 1) * 8 + offset  # +1 for saved RBP
         
-        # Calculate effective address: R12 + slot_index*16 + offset
-        displacement = slot_index * self.stack_slot_size + offset
-        if displacement == 0:
-            # Direct access to slot 0
-            self.output.append(f"    MOV {self.reg_rax}, [{self.stack_base_register}]  ; Load from slot 0")
+        # Use standard [RBP - offset] addressing (more efficient than [R12 + displacement])
+        if self.use_32bit:
+            self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rbp} - {stack_offset}]  ; Load {var_name}")
         else:
-            # Use displacement addressing
-            self.output.append(f"    MOV {self.reg_rax}, [{self.stack_base_register} + {displacement}]  ; Load from slot {slot_index}")
+            # Use 32-bit move for integers (more efficient than 64-bit)
+            # MOV EAX zero-extends to RAX automatically
+            self.output.append(f"    MOV EAX, DWORD [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (32-bit)")
     
     def _generate_local_var_store(self, var_name):
-        """Generate code to store a local variable using indexed stack pointer.
+        """Generate code to store a local variable using optimized stack addressing.
         
-        Stack address = [R12 + slot_index*16 + offset]
-        Where R12 = stack base, slot_index fits in 32 bits (enables pointer compression)
+        Uses standard [RBP - offset] addressing for better performance (GCC style).
+        Slot tracking is maintained for pointer compression purposes.
         """
         if var_name not in self.current_function_stack:
             # Variable not found - allocate it now
@@ -687,29 +692,21 @@ class CodeGenerator:
             offset = 0
             self.current_stack_slots += 1
             self.current_function_stack[var_name] = (slot_index, offset)
-            self.output.append(f"    ; Allocating slot {slot_index} for {var_name}")
-            # Allocate stack space (16 bytes per slot) and adjust R12 to point to allocated region
-            if slot_index == 0:
-                # First slot: allocate space and set stack base register to point to it
-                self.output.append(f"    SUB {self.reg_rsp}, {self.stack_slot_size}  ; Allocate {self.stack_slot_size} bytes on stack")
-                self.output.append(f"    MOV {self.stack_base_register}, {self.reg_rsp}  ; Stack base now points to allocated region")
-            else:
-                # Subsequent slots: just allocate more space
-                self.output.append(f"    SUB {self.reg_rsp}, {self.stack_slot_size}  ; Allocate {self.stack_slot_size} bytes on stack")
-            self.output.append(f"    INC {self.stack_index_register}  ; Increment slot index")
+            # Note: Stack space is allocated upfront in function prologue
+            # We just track the slot here for pointer compression purposes
         else:
             slot_index, offset = self.current_function_stack[var_name]
         
-        # Store value using indexed addressing
-        self.output.append(f"    ; Store to local variable {var_name} at slot {slot_index}, offset {offset}")
-        self.output.append(f"    ; Indexed stack: address = [R12 + {slot_index}*16 + {offset}]")
-        self.output.append(f"    ; Slot index {slot_index} fits in 32 bits for pointer compression")
+        # Calculate offset from RBP (standard GCC-style addressing for performance)
+        # Variables are allocated at RBP - 8, RBP - 16, RBP - 24, etc. (8-byte alignment)
+        stack_offset = (slot_index + 1) * 8 + offset  # +1 for saved RBP
         
-        displacement = slot_index * self.stack_slot_size + offset
-        if displacement == 0:
-            self.output.append(f"    MOV [{self.stack_base_register}], {self.reg_rax}  ; Store to slot 0")
+        # Use standard [RBP - offset] addressing (more efficient than [R12 + displacement])
+        # Use 32-bit move for integers (more efficient than 64-bit)
+        if self.use_32bit:
+            self.output.append(f"    MOV [{self.reg_rbp} - {stack_offset}], {self.reg_rax}  ; Store {var_name}")
         else:
-            self.output.append(f"    MOV [{self.stack_base_register} + {displacement}], {self.reg_rax}  ; Store to slot {slot_index}")
+            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {var_name} (32-bit)")
     
     def _generate_compressed_pointer(self, slot_index1, slot_index2=None):
         """Generate code to create a compressed pointer (two 32-bit indices in one 64-bit register).
@@ -798,21 +795,15 @@ class CodeGenerator:
         
         # For interrupt callbacks, preserve SIMD register if needed
         if is_interrupt:
-            # Mark that this function needs indexed stack system
+            # Mark that this function needs stack frame
             if not self.function_needs_indexed_stack:
                 self.function_needs_indexed_stack = True
-                # Generate indexed stack prologue now (lazy initialization)
-                self.output.append("    ; Indexed stack pointer prologue (16-byte intervals)")
-                self.output.append(f"    PUSH {self.reg_rbp}")
-                self.output.append(f"    PUSH {self.stack_base_register}  ; Preserve stack base register")
-                self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
-                self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Save old stack pointer")
-                self.output.append(f"    MOV {self.stack_base_register}, {self.reg_rsp}  ; Initialize to current stack pointer")
-                self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
-                self.output.append("    ; Stack address = [R12 + R13*16] for indexed access")
-            # Allocate one slot (16 bytes) for SIMD register preservation
+                # Generate standard prologue
+                self.output.append(f"    PUSH {self.reg_rbp}  ; Save old frame pointer")
+                self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
+            # Allocate 8 bytes for SIMD register preservation if needed
             self.current_stack_slots = 1
-            self.output.append(f"    INC {self.stack_index_register}  ; Allocate slot 0 for SIMD register")
+            self.output.append(f"    SUB {self.reg_rsp}, 8  ; Allocate stack space for SIMD register")
             # Note: xmm15 is typically preserved across calls, but we ensure it's accessible
         
         # Check if this is a syscall function (functions starting with "sys_" that have empty bodies)
@@ -849,19 +840,11 @@ class CodeGenerator:
             has_any_return = block_items and any(isinstance(item, c_ast.Return) for item in block_items)
             if not has_any_return:
                 # Generate implicit return (fall-through case)
-                # Use minimal epilogue if no indexed stack was used
-                if self.function_needs_indexed_stack:
+                # Standard epilogue - restore RBP only if prologue was generated
+                if self.function_needs_indexed_stack or self.current_stack_slots > 0:
                     if self.current_stack_slots > 0:
-                        self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
-                    self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
-                    self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
-                    self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
-                    self.output.append(f"    POP {self.reg_rbp}")
-                else:
-                    # Minimal epilogue - just restore RBP if we saved it
-                    if self.current_stack_slots > 0:
-                        self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
-                        self.output.append(f"    POP {self.reg_rbp}")
+                        self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}  ; Restore stack pointer")
+                    self.output.append(f"    POP {self.reg_rbp}  ; Restore frame pointer")
                 self.output.append("    RET")
     
     def _generate_block(self, block, func_name, info):
@@ -900,41 +883,17 @@ class CodeGenerator:
     
     def _generate_return(self, ret_stmt, func_name, info):
         """Generate return statement with metamorphic return site optimization."""
-        if info.get('has_single_return', False):
-            # Metamorphic return site: return address is written into instruction
-            self.output.append("    ; Metamorphic return site - address injected by caller")
-            # Use minimal epilogue if no indexed stack was used
-            if self.function_needs_indexed_stack:
-                    if self.current_stack_slots > 0:
-                        self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
-                    self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
-                    self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
-                    self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
-                    self.output.append(f"    POP {self.reg_rbp}")
-            else:
-                if self.current_stack_slots > 0:
-                    self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
-                    self.output.append(f"    POP {self.reg_rbp}")
-            # The RET address will be dynamically modified by the caller
-            self.output.append("    RET  ; Address bytes written by caller")
-        else:
-            # Standard return
-            if ret_stmt.expr:
-                self._generate_expression(ret_stmt.expr)
-                # Return value is already in RAX from expression evaluation
-            # Use minimal epilogue if no indexed stack was used
-            if self.function_needs_indexed_stack:
-                    if self.current_stack_slots > 0:
-                        self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
-                    self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
-                    self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
-                    self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
-                    self.output.append(f"    POP {self.reg_rbp}")
-            else:
-                if self.current_stack_slots > 0:
-                    self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
-                    self.output.append(f"    POP {self.reg_rbp}")
-            self.output.append("    RET")
+        # Always generate the return expression first (if any)
+        if ret_stmt.expr:
+            self._generate_expression(ret_stmt.expr)
+            # Return value is now in RAX from expression evaluation
+        
+        # Standard epilogue - only restore RBP if prologue was generated
+        if self.function_needs_indexed_stack or self.current_stack_slots > 0:
+            if self.current_stack_slots > 0:
+                self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}  ; Restore stack pointer")
+            self.output.append(f"    POP {self.reg_rbp}  ; Restore frame pointer")
+        self.output.append("    RET")
     
     def _generate_call(self, call, caller_func_name):
         """Generate function call with optimizations."""
@@ -1249,21 +1208,26 @@ class CodeGenerator:
                     self.output.append(f"    MOV {self.reg_rax}, 0")
         elif isinstance(expr, c_ast.ID):
             name = expr.name
-            # Check if this is a packed global variable
-            if name in self.global_var_data['bit_positions']:
-                # Use zero-latency SIMD register access
+            # Check lookup order: parameters > locals > packed globals > globals > assembly
+            if name in self.function_parameters:
+                # Function parameter - load from argument register (highest priority)
+                param_reg = self.function_parameters[name]
+                self.output.append(f"    MOV {self.reg_rax}, {param_reg}  ; Load parameter {name}")
+            elif name in self.current_function_stack:
+                # Local variable - use stack addressing
+                self._generate_local_var_load(name)
+            elif name in self.global_var_data['bit_positions']:
+                # Packed global variable - use SIMD register access
                 self._generate_packed_var_access(name, is_write=False)
             else:
                 # Check if it's a global variable (non-packed)
                 globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                 if name in globals:
                     # Check if this is an array - arrays should give address, not value
-                    # Get the variable declaration to check if it's an array
                     is_array = False
                     glob_vars = getattr(self, '_current_parser', None).get_global_variables() if hasattr(self, '_current_parser') else []
                     for gv in glob_vars:
                         if gv.name == name:
-                            # Check if it's an array
                             type_node = gv.type
                             while hasattr(type_node, 'type'):
                                 if isinstance(type_node, c_ast.ArrayDecl):
@@ -1273,21 +1237,15 @@ class CodeGenerator:
                             break
                     
                     if is_array:
-                        # For arrays, get the address (label), not the value
                         self.output.append(f"    MOV {self.reg_rax}, GLOBAL_{name}  ; Load array address")
                     else:
-                        # Global variable (non-packed, non-array)
                         self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load global variable")
                 elif self.asm_parser and self.asm_parser.has_symbol(name):
                     # Global variable defined in assembly
                     self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load assembly-defined global")
                     self.referenced_asm_symbols.add(name)
-                elif name in self.function_parameters:
-                    # Function parameter - load from argument register
-                    param_reg = self.function_parameters[name]
-                    self.output.append(f"    MOV {self.reg_rax}, {param_reg}  ; Load parameter {name}")
                 else:
-                    # Local variable - use indexed stack pointer
+                    # Unknown variable - try local var load as fallback
                     self._generate_local_var_load(name)
         elif isinstance(expr, c_ast.BinaryOp):
             self._generate_binary_op(expr)
@@ -1943,12 +1901,71 @@ class CodeGenerator:
             # Continue with regular assignment handling
         
         if assign.op == '=':
-            self._generate_expression(assign.rvalue)
-            # Check if we have a struct member assignment (address on stack)
+            # Check if we have a struct member assignment
             if isinstance(assign.lvalue, c_ast.StructRef):
-                # Struct member assignment
-                self.output.append(f"    POP {self.reg_rbx}  ; Get member address")
-                self.output.append(f"    MOV [{self.reg_rbx}], {self.reg_rax}  ; Store to struct member")
+                # Struct member assignment: first get the address, then evaluate rvalue
+                # Get the struct pointer base
+                struct_type = assign.lvalue.type if isinstance(assign.lvalue.type, str) else '.'
+                member_name = assign.lvalue.field.name if hasattr(assign.lvalue.field, 'name') else None
+                
+                # Calculate member offset
+                member_offsets = {'x': 0, 'y': 4, 'z': 8, 'width': 8, 'height': 12, 'a': 0, 'b': 4, 'c': 8, 'd': 12}
+                member_offset = member_offsets.get(member_name, 0)
+                
+                if struct_type == '->':
+                    # Pointer access: p->x = value
+                    # First, get the pointer value
+                    if isinstance(assign.lvalue.name, c_ast.ID):
+                        ptr_name = assign.lvalue.name.name
+                        if ptr_name in self.function_parameters:
+                            # Parameter - it's in a register
+                            param_reg = self.function_parameters[ptr_name]
+                            self.output.append(f"    MOV {self.reg_rbx}, {param_reg}  ; Get struct pointer {ptr_name}")
+                        else:
+                            # Local variable
+                            self._generate_local_var_load(ptr_name)
+                            self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Get struct pointer")
+                    else:
+                        self._generate_expression(assign.lvalue.name)
+                        self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Get struct pointer")
+                    
+                    # Add member offset
+                    if member_offset > 0:
+                        self.output.append(f"    ADD {self.reg_rbx}, {member_offset}  ; Add member offset for {member_name}")
+                    
+                    # Now generate the rvalue
+                    self._generate_expression(assign.rvalue)
+                    
+                    # Store the value
+                    self.output.append(f"    MOV DWORD [{self.reg_rbx}], EAX  ; Store to struct member {member_name}")
+                else:
+                    # Direct access: s.x = value
+                    # Generate address of struct
+                    if isinstance(assign.lvalue.name, c_ast.ID):
+                        struct_name = assign.lvalue.name.name
+                        globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                        if struct_name in globals:
+                            self.output.append(f"    LEA {self.reg_rbx}, [GLOBAL_{struct_name}]  ; Get struct address")
+                        elif struct_name in self.current_function_stack:
+                            slot_index, offset = self.current_function_stack[struct_name]
+                            stack_offset = (slot_index + 1) * 8 + offset
+                            self.output.append(f"    LEA {self.reg_rbx}, [{self.reg_rbp} - {stack_offset}]  ; Get local struct address")
+                        else:
+                            self._generate_expression(assign.lvalue.name)
+                            self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}")
+                    else:
+                        self._generate_expression(assign.lvalue.name)
+                        self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}")
+                    
+                    # Add member offset
+                    if member_offset > 0:
+                        self.output.append(f"    ADD {self.reg_rbx}, {member_offset}  ; Add member offset for {member_name}")
+                    
+                    # Now generate the rvalue
+                    self._generate_expression(assign.rvalue)
+                    
+                    # Store the value
+                    self.output.append(f"    MOV DWORD [{self.reg_rbx}], EAX  ; Store to struct member {member_name}")
             elif isinstance(assign.lvalue, c_ast.ID):
                 name = assign.lvalue.name
                 # Check if this is a packed global variable
@@ -2185,7 +2202,7 @@ class CodeGenerator:
                 # Can't process declaration without a valid name
                 return
         
-        # Allocate a 16-byte slot for the variable (indexed stack)
+        # Allocate stack space for the variable (standard GCC-style)
         slot_index = self.current_stack_slots
         self.current_stack_slots += 1
         
@@ -2194,22 +2211,16 @@ class CodeGenerator:
         # Multiple small variables could share a slot, but for now one per slot
         self.current_function_stack[name] = (slot_index, 0)
         
-        # Increment stack index register to allocate new slot
-        # Mark that this function needs indexed stack system
+        # Mark that this function needs stack frame
         if not self.function_needs_indexed_stack:
             self.function_needs_indexed_stack = True
-            # Generate indexed stack prologue now (lazy initialization)
-            self.output.append("    ; Indexed stack pointer prologue (16-byte intervals)")
-            self.output.append(f"    PUSH {self.reg_rbp}")
-            self.output.append(f"    PUSH {self.stack_base_register}  ; Preserve stack base register")
-            self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
-            self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Save old stack pointer")
-            self.output.append(f"    MOV {self.stack_base_register}, {self.reg_rsp}  ; Initialize to current stack pointer")
-            self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
-            self.output.append("    ; Stack address = [R12 + R13*16] for indexed access")
+            # Generate standard prologue (GCC style for performance)
+            self.output.append(f"    PUSH {self.reg_rbp}  ; Save old frame pointer")
+            self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
         
-        self.output.append(f"    ; Allocate slot {slot_index} (16 bytes) for {name}")
-        self.output.append(f"    INC {self.stack_index_register}  ; Increment slot index")
+        # Allocate 8 bytes on stack for this variable (standard size for integers)
+        # We'll allocate incrementally for simplicity (could optimize to allocate all at once)
+        self.output.append(f"    SUB {self.reg_rsp}, 8  ; Allocate stack space for {name}")
         
         if decl.init:
             self._generate_expression(decl.init)
