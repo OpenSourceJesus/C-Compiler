@@ -273,7 +273,8 @@ class CodeGenerator:
             self.output.append(f"    ; {index_reg} contains function index (RDI preserved for arguments)")
             self.output.append(f"    MOV {self.reg_rax}, JUMP_TABLE")
             self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax} + {index_reg}*8]")  # 64-bit: 8 bytes per pointer
-        self.output.append(f"    JMP {self.reg_rax}")
+        self.output.append(f"    CALL {self.reg_rax}  ; Call function via pointer")
+        self.output.append(f"    RET  ; Return to caller after function returns")
         self.output.append("")
     
     def _generate_function_table(self, small_funcs):
@@ -1172,12 +1173,56 @@ class CodeGenerator:
                 if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
                     # For character constants, extract the character value
                     if value.startswith("'") and len(value) >= 3:
-                        # Single character constant like 'a'
-                        char_val = ord(value[1]) if len(value) > 2 else 0
+                        # Single character constant like 'a' or '\n'
+                        # Handle escape sequences
+                        inner = value[1:-1]  # Remove quotes
+                        if len(inner) == 1:
+                            char_val = ord(inner)
+                        elif len(inner) == 2 and inner[0] == '\\':
+                            # Escape sequence
+                            if inner[1] == 'n':
+                                char_val = ord('\n')  # 10
+                            elif inner[1] == 't':
+                                char_val = ord('\t')  # 9
+                            elif inner[1] == 'r':
+                                char_val = ord('\r')  # 13
+                            elif inner[1] == '\\':
+                                char_val = ord('\\')  # 92
+                            elif inner[1] == '0':
+                                char_val = ord('\0')  # 0
+                            elif inner[1] == "'":
+                                char_val = ord("'")  # 39
+                            elif inner[1] == '"':
+                                char_val = ord('"')  # 34
+                            else:
+                                # Unknown escape, use the character itself
+                                char_val = ord(inner[1])
+                        else:
+                            # Fallback: use first character
+                            char_val = ord(inner[0]) if len(inner) > 0 else 0
                         self.output.append(f"    MOV {self.reg_rax}, {char_val}")
                     elif value.startswith('"') and len(value) >= 3:
                         # String literal - use first character
-                        char_val = ord(value[1]) if len(value) > 2 else 0
+                        inner = value[1:-1]  # Remove quotes
+                        if len(inner) > 0:
+                            # Handle escape sequences in string literals
+                            if inner.startswith('\\') and len(inner) >= 2:
+                                if inner[1] == 'n':
+                                    char_val = ord('\n')
+                                elif inner[1] == 't':
+                                    char_val = ord('\t')
+                                elif inner[1] == 'r':
+                                    char_val = ord('\r')
+                                elif inner[1] == '\\':
+                                    char_val = ord('\\')
+                                elif inner[1] == '0':
+                                    char_val = ord('\0')
+                                else:
+                                    char_val = ord(inner[1])
+                            else:
+                                char_val = ord(inner[0])
+                        else:
+                            char_val = 0
                         self.output.append(f"    MOV {self.reg_rax}, {char_val}")
                     else:
                         # Empty or invalid string, use 0
@@ -1932,6 +1977,35 @@ class CodeGenerator:
                 self._generate_expression(assign.lvalue.subscript)
                 self.output.append(f"    PUSH {self.reg_rax}  ; Save index")
                 
+                # Determine element size (default to 4 for int, 1 for char)
+                element_size = 4  # Default to int size
+                element_type = 'int'  # Default type
+                if isinstance(assign.lvalue.name, c_ast.ID):
+                    name = assign.lvalue.name.name
+                    # Check if it's a global variable and get its type
+                    parser = getattr(self, '_current_parser', None)
+                    if parser:
+                        globals = parser.get_global_variables()
+                        for g in globals:
+                            if g.name == name:
+                                # Find the element type by traversing the type structure
+                                type_node = g.type
+                                while hasattr(type_node, 'type'):
+                                    if isinstance(type_node, c_ast.ArrayDecl):
+                                        # Get the element type
+                                        elem_type = type_node.type
+                                        if isinstance(elem_type, c_ast.TypeDecl):
+                                            type_name = elem_type.declname if hasattr(elem_type, 'declname') else ''
+                                            # Check type name or type string
+                                            type_str = str(elem_type.type).lower() if hasattr(elem_type, 'type') else ''
+                                            if 'char' in type_str or 'char' in type_name.lower():
+                                                element_size = 1
+                                                element_type = 'char'
+                                                break
+                                        break
+                                    type_node = type_node.type
+                                break
+                
                 # Generate base address
                 if isinstance(assign.lvalue.name, c_ast.ID):
                     # Array variable name
@@ -1953,16 +2027,21 @@ class CodeGenerator:
                 # Get index from stack
                 self.output.append(f"    POP {self.reg_rax}  ; Get index")
                 
-                # Calculate address: base + index * sizeof(int)
-                self.output.append("    ; Array assignment: base + index * 4")
+                # Calculate address: base + index * element_size
+                self.output.append(f"    ; Array assignment: base + index * {element_size}")
                 self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save index")
-                self.output.append(f"    MOV {self.reg_rax}, 4  ; Size of int")
-                self.output.append(f"    MUL {self.reg_rcx}  ; {self.reg_rax} = index * 4")
+                self.output.append(f"    MOV {self.reg_rax}, {element_size}  ; Size of {element_type}")
+                self.output.append(f"    MUL {self.reg_rcx}  ; {self.reg_rax} = index * {element_size}")
                 self.output.append(f"    ADD {self.reg_rax}, {self.reg_rbx}  ; {self.reg_rax} = base + offset")
                 
                 # Store value to memory
                 self.output.append(f"    POP {self.reg_rbx}  ; Get value to assign")
-                self.output.append(f"    MOV [{self.reg_rax}], {self.reg_rbx}  ; Store to array element")
+                if element_size == 1:
+                    # Store byte for char arrays
+                    self.output.append(f"    MOV BYTE [{self.reg_rax}], BL  ; Store byte to array element")
+                else:
+                    # Store full register for int arrays
+                    self.output.append(f"    MOV [{self.reg_rax}], {self.reg_rbx}  ; Store to array element")
     
     def _generate_ternary_op(self, ternary):
         """Generate code for ternary operator: condition ? true_expr : false_expr"""

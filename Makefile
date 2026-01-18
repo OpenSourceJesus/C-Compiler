@@ -32,7 +32,6 @@ tests:
 			echo "=========================================="; \
 			echo "Test $$test_count: $$test_file"; \
 			echo "=========================================="; \
-			echo ""; \
 			if /usr/bin/python3 benchmark.py "$$test_file" $$opt_level_flag $$runs_flag; then \
 				success_count=$$((success_count + 1)); \
 				echo ""; \
@@ -43,8 +42,6 @@ tests:
 				echo "✗ Test $$test_count ($$test_file) FAILED"; \
 			fi; \
 			echo ""; \
-			echo "------------------------------------------"; \
-			echo ""; \
 		fi; \
 	done; \
 	for test_dir in Tests/*/; do \
@@ -53,7 +50,6 @@ tests:
 			echo "=========================================="; \
 			echo "Test $$test_count: $$test_dir"; \
 			echo "=========================================="; \
-			echo ""; \
 			if /usr/bin/python3 benchmark.py "$$test_dir" $$opt_level_flag $$runs_flag; then \
 				success_count=$$((success_count + 1)); \
 				echo ""; \
@@ -63,8 +59,6 @@ tests:
 				echo ""; \
 				echo "✗ Test $$test_count ($$test_dir) FAILED"; \
 			fi; \
-			echo ""; \
-			echo "------------------------------------------"; \
 			echo ""; \
 		fi; \
 	done; \

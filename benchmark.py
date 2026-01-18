@@ -45,18 +45,20 @@ def get_file_size(filepath):
     except OSError:
         return 0
 
-def run_benchmark(executable_path, name, iterations):
+def run_benchmark(executable_path, name, iterations, verbose=False):
     """Run benchmark and return statistics.
     
     Args:
         executable_path: Path to the executable to benchmark
         name: Name of the compiler/executable being benchmarked
         iterations: Number of iterations to run
+        verbose: If True, print individual run times and progress messages
     """
     times = []
     
-    print(f"   Running {name} ({iterations} iterations)...")
-    print()
+    if verbose:
+        print(f"   Running {name} ({iterations} iterations)...")
+        print()
     
     # Ensure executable path is absolute
     if not os.path.isabs(executable_path):
@@ -86,7 +88,8 @@ def run_benchmark(executable_path, name, iterations):
                 cwd=os.path.dirname(executable_path) or os.getcwd()
             )
         except Exception as e:
-            print(f"   Run {i}: ERROR - Failed to execute: {e}")
+            if verbose:
+                print(f"   Run {i}: ERROR - Failed to execute: {e}")
             continue
         
         end = time.perf_counter()
@@ -94,11 +97,14 @@ def run_benchmark(executable_path, name, iterations):
         
         if elapsed > 0:
             times.append(elapsed)
-            print(f"   Run {i}: {elapsed:18.15f} seconds")
+            if verbose:
+                print(f"   Run {i}: {elapsed:18.15f} seconds")
         else:
-            print(f"   Run {i}: ERROR - Invalid time measurement")
+            if verbose:
+                print(f"   Run {i}: ERROR - Invalid time measurement")
     
-    print()
+    if verbose:
+        print()
     
     if not times:
         print(f"   Error: Could not measure time for {name}")
@@ -111,10 +117,10 @@ def run_benchmark(executable_path, name, iterations):
     time_range = max_time - min_time
     
     print(f"   {name} Statistics:")
-    print(f"     Average: {avg:18.15f} seconds")
-    print(f"     Minimum: {min_time:18.15f} seconds")
-    print(f"     Maximum: {max_time:18.15f} seconds")
-    print(f"     Range:   {time_range:18.15f} seconds")
+    print(f"     Average:  {avg:18.15f} seconds")
+    print(f"     Minimum:  {min_time:18.15f} seconds")
+    print(f"     Maximum:  {max_time:18.15f} seconds")
+    print(f"     Range:    {time_range:18.15f} seconds")
     print()
     
     return {
@@ -240,13 +246,11 @@ def visualize_results(gcc_stats, custom_stats, gcc_size, custom_size, opt_level)
     script_dir = Path(__file__).parent.absolute()
     output_file = script_dir / 'benchmark_results.png'
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    print(f"Visualization saved to: {output_file}")
     
     # Display the plot (if running interactively and display is available)
     try:
         if os.environ.get('DISPLAY'):
             plt.show(block=False)  # Non-blocking display
-            print("Plot displayed. Close the window to continue.")
     except Exception as e:
         # If display is not available, just save the file
         pass
@@ -344,19 +348,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         print(f"Error: {test_path} does not exist")
         return False
     
-    print(f"Found {len(c_files)} C file(s) to compile:")
-    for f in c_files:
-        print(f"  - {f}")
-    
-    if asm_files:
-        print(f"Found {len(asm_files)} assembly file(s):")
-        for f in asm_files:
-            print(f"  - {f}")
-    
     if linker_scripts:
-        print(f"Found {len(linker_scripts)} linker script(s):")
-        for f in linker_scripts:
-            print(f"  - {f}")
+        pass  # Linker scripts found but not printing
     
     print()
     
@@ -385,10 +378,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 path.unlink()
     
     # Compile with GCC
-    print(f"1. Compiling with GCC {opt_level}...")
-    if use_32bit:
-        print("   Using 32-bit compilation mode (-m32)")
-    
     # Check if any assembly file defines _start (custom startup)
     has_custom_startup = False
     if asm_files:
@@ -399,7 +388,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                     # Check for _start definition (global _start or _start:)
                     if '.global _start' in content or '_start:' in content:
                         has_custom_startup = True
-                        print("   Detected custom startup file (defines _start)")
                         break
             except Exception:
                 pass
@@ -419,12 +407,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         gcc_cmd.extend(asm_files)
         gcc_cmd.extend(['-o', str(gcc_output)])
         
-        if len(gcc_cmd) > 10:  # If command is very long, show summary
-            mode_str = " (32-bit)" if use_32bit else ""
-            print(f"   Running: gcc {opt_level}{mode_str} [{len(c_files)} C files, {len(asm_files)} ASM files] -o {gcc_output}")
-            print(f"   Output directory: {gcc_output_dir}")
-        else:
-            print(f"   Running: {' '.join(gcc_cmd)}")
         result = subprocess.run(
             gcc_cmd,
             check=True,
@@ -445,22 +427,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             error_lines = [line for line in e.stderr.split('\n') if 'Error:' in line]
             # Also check all stderr lines for linker/PIE errors
             all_stderr_lines = [line for line in e.stderr.split('\n') if line.strip()]
-            
-            if error_lines:
-                print("Error: GCC compilation failed")
-                print(f"   Compilation errors found:")
-                for error_line in error_lines[:20]:  # Show first 20 errors
-                    print(f"   {error_line}")
-                if len(error_lines) > 20:
-                    print(f"   ... and {len(error_lines) - 20} more errors")
-            else:
-                # If no "Error:" lines, show last part of stderr
-                stderr_lines = e.stderr.split('\n')
-                print("Error: GCC compilation failed")
-                print(f"   Last {min(30, len(stderr_lines))} lines of output:")
-                for line in stderr_lines[-30:]:
-                    if line.strip():
-                        print(f"   {line}")
             
             # Check if errors suggest 32-bit mode is needed
             # Look for assembly-related errors that might be fixed by 32-bit mode
@@ -484,34 +450,36 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 for line in all_stderr_lines
             )
             
-            # Combine both error types
-            should_retry_due_to_errors = has_asm_errors or has_pie_errors
-            
             # Retry with 32-bit mode if:
             # - We have assembly errors AND there are assembly files, OR
             # - We have PIE errors (can occur even without assembly files)
-            if should_retry_due_to_errors and not use_32bit:
+            if not use_32bit:
                 if (has_asm_errors and asm_files) or has_pie_errors:
                     should_retry_32bit = True
-                    print()
-                    if has_pie_errors:
-                        print("   Detected PIE/linker errors. Retrying with 32-bit mode (-m32)...")
-                    else:
-                        print("   Detected assembly-related errors. Retrying with 32-bit mode (-m32)...")
+            
+            # Only print errors if we're not going to retry
+            if not should_retry_32bit:
+                if error_lines:
+                    print("Error: GCC compilation failed")
+                    print(f"   Compilation errors found:")
+                    for error_line in error_lines[:20]:  # Show first 20 errors
+                        print(f"   {error_line}")
+                    if len(error_lines) > 20:
+                        print(f"   ... and {len(error_lines) - 20} more errors")
                 else:
-                    # Debug: why didn't we retry?
-                    print()
-                    print(f"   Debug: has_asm_errors={has_asm_errors}, has_pie_errors={has_pie_errors}, use_32bit={use_32bit}, asm_files={asm_files}")
+                    # If no "Error:" lines, show last part of stderr
+                    stderr_lines = e.stderr.split('\n')
+                    print("Error: GCC compilation failed")
+                    print(f"   Last {min(30, len(stderr_lines))} lines of output:")
+                    for line in stderr_lines[-30:]:
+                        if line.strip():
+                            print(f"   {line}")
         if e.stdout:
             # Sometimes errors go to stdout
             stdout_lines = e.stdout.split('\n')
             error_lines = [line for line in stdout_lines if 'Error:' in line]
             all_stdout_lines = [line for line in stdout_lines if line.strip()]
             if error_lines and not error_text:
-                print("Error: GCC compilation failed")
-                print(f"   Errors from stdout:")
-                for error_line in error_lines[:10]:
-                    print(f"   {error_line}")
                 # Check if we should retry with 32-bit
                 if not use_32bit:
                     has_asm_errors = any(
@@ -532,16 +500,17 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                     # Retry if we have assembly errors with assembly files, or PIE errors
                     if (has_asm_errors and asm_files) or has_pie_errors:
                         should_retry_32bit = True
-                        print()
-                        if has_pie_errors:
-                            print("   Detected PIE/linker errors. Retrying with 32-bit mode (-m32)...")
-                        else:
-                            print("   Detected assembly-related errors. Retrying with 32-bit mode (-m32)...")
+                
+                # Only print errors if we're not going to retry
+                if not should_retry_32bit:
+                    print("Error: GCC compilation failed")
+                    print(f"   Errors from stdout:")
+                    for error_line in error_lines[:10]:
+                        print(f"   {error_line}")
         
         # Retry with 32-bit mode if needed
         if should_retry_32bit:
             use_32bit = True
-            print(f"   Retrying compilation with 32-bit mode (-m32)...")
             try:
                 # Build GCC command again with -m32 flag
                 gcc_cmd = ['gcc', opt_level, '-DGCC', '-m32']
@@ -552,11 +521,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 gcc_cmd.extend(asm_files)
                 gcc_cmd.extend(['-o', str(gcc_output)])
                 
-                if len(gcc_cmd) > 10:
-                    print(f"   Running: gcc {opt_level} -m32 [{len(c_files)} C files, {len(asm_files)} ASM files] -o {gcc_output}")
-                else:
-                    print(f"   Running: {' '.join(gcc_cmd)}")
-                
                 result = subprocess.run(
                     gcc_cmd,
                     check=True,
@@ -566,7 +530,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                     cwd=script_dir
                 )
                 gcc_compiled = True
-                print("   ✓ Compilation succeeded with 32-bit mode")
             except subprocess.CalledProcessError as e2:
                 print("Error: GCC compilation failed even with 32-bit mode")
                 if e2.stderr:
@@ -610,12 +573,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     os.chmod(gcc_executable, 0o755)
     
     gcc_size = get_file_size(gcc_executable)
-    print(f"   GCC executable size: {gcc_size} bytes")
-    print()
     
     # Compile with custom compiler
-    print("2. Compiling with custom compiler...")
-    print(f"   Output directory: {custom_output_dir}")
     python_cmd = '/usr/bin/python3'
     
     # Pass the directory or file path to the compiler
@@ -751,7 +710,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     # Add linker script if found (use the first one if multiple)
     if linker_scripts:
         link_cmd.extend(['-T', linker_scripts[0]])
-        print(f"   Using linker script: {linker_scripts[0]}")
     
     try:
         result = subprocess.run(
@@ -821,32 +779,22 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     os.chmod(custom_executable, 0o755)
     
     custom_size = get_file_size(custom_executable)
-    print(f"   Custom compiler executable size: {custom_size} bytes")
-    print()
     
     # Run benchmarks
-    print(f"3. Running benchmarks ({iterations} iterations each)...")
-    print()
-    
-    gcc_avg = run_benchmark(str(gcc_executable), f"GCC {opt_level}", iterations)
-    print()
-    custom_avg = run_benchmark(str(custom_executable), "Custom Compiler", iterations)
-    print()
+    gcc_avg = run_benchmark(str(gcc_executable), f"GCC {opt_level}", iterations, verbose=False)
+    custom_avg = run_benchmark(str(custom_executable), "Custom Compiler", iterations, verbose=False)
     
     # Results summary
-    print("=" * 50)
-    print("Results Summary")
-    print("=" * 50)
     print(f"GCC {opt_level}:")
     if gcc_avg is not None:
-        print(f"  Average time: {gcc_avg['avg']:18.15f} seconds")
+        print(f"  Average time:  {gcc_avg['avg']:18.15f} seconds")
     else:
         print("  Average time: ERROR - Could not measure")
     print(f"  Executable size: {gcc_size} bytes")
     print()
     print("Custom Compiler:")
     if custom_avg is not None:
-        print(f"  Average time: {custom_avg['avg']:18.15f} seconds")
+        print(f"  Average time:  {custom_avg['avg']:18.15f} seconds")
     else:
         print("  Average time: ERROR - Could not measure")
     print(f"  Executable size: {custom_size} bytes")
@@ -881,9 +829,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             else:
                 percent_larger = ((custom_size - gcc_size) / gcc_size) * 100
                 print(f"  -> Custom compiler produces {percent_larger:.2f}% LARGER binary")
-    
-    print()
-    print("=" * 50)
     
     # Create visualizations
     visualize_results(gcc_avg, custom_avg, gcc_size, custom_size, opt_level)
@@ -975,18 +920,11 @@ def main():
             print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N]")
             sys.exit(1)
     
-    print("=" * 50)
-    print(f"Benchmark: GCC {opt_level} vs Custom Compiler")
-    print("=" * 50)
-    print()
-    print(f"Test path: {test_path}")
+    # Print configuration info (but keep it minimal)
     if exclude_patterns:
         print(f"Excluding files matching: {', '.join(exclude_patterns)}")
     if use_32bit:
         print("Compilation mode: 32-bit")
-    print(f"GCC optimization level: {opt_level}")
-    print(f"Number of benchmark runs: {iterations}")
-    print()
     
     success = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations)
     
