@@ -262,12 +262,17 @@ class CodeGenerator:
         self.output.append("")
         self.output.append("; Indexed-jump dispatcher")
         self.output.append("INDEXED_JUMP:")
-        self.output.append(f"    ; {self.reg_rdi} contains function index")
-        self.output.append(f"    MOV {self.reg_rax}, JUMP_TABLE")
         if self.use_32bit:
+            # In 32-bit, RDI contains function index (was saved/restored around call)
+            self.output.append(f"    ; {self.reg_rdi} contains function index")
+            self.output.append(f"    MOV {self.reg_rax}, JUMP_TABLE")
             self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax} + {self.reg_rdi}*4]")  # 32-bit: 4 bytes per pointer
         else:
-            self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax} + {self.reg_rdi}*8]")  # 64-bit: 8 bytes per pointer
+            # In 64-bit, use R11 (scratch register) for index to preserve RDI
+            index_reg = 'R11'
+            self.output.append(f"    ; {index_reg} contains function index (RDI preserved for arguments)")
+            self.output.append(f"    MOV {self.reg_rax}, JUMP_TABLE")
+            self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax} + {index_reg}*8]")  # 64-bit: 8 bytes per pointer
         self.output.append(f"    JMP {self.reg_rax}")
         self.output.append("")
     
@@ -336,8 +341,49 @@ class CodeGenerator:
                 
                 self.output.append(f"GLOBAL_{var_name}:")
                 if is_array:
-                    # Array declaration: allocate array_size * 4 bytes (assuming int)
-                    self.output.append(f"    TIMES {array_size} DD 0  ; {var_name}[{array_size}]")
+                    # Check if array has string initializer
+                    has_string_init = False
+                    string_value = None
+                    if var.init and isinstance(var.init, c_ast.Constant):
+                        value = var.init.value
+                        if isinstance(value, str) and ((value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'"))):
+                            has_string_init = True
+                            # Extract string content (remove quotes)
+                            if value.startswith('"'):
+                                string_value = value[1:-1].replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\\\', '\\')
+                            else:
+                                string_value = value[1:-1]
+                    
+                    if has_string_init and string_value:
+                        # String array: determine size from string + null terminator
+                        actual_size = len(string_value) + 1  # +1 for null terminator
+                        # Use DB (bytes) for char arrays
+                        # NASM doesn't support escape sequences in single quotes, so output bytes directly
+                        # Split string into parts, handling special characters
+                        for char in string_value:
+                            if char == '\n':
+                                self.output.append("    DB 10  ; newline")
+                            elif char == '\t':
+                                self.output.append("    DB 9   ; tab")
+                            elif char == '\r':
+                                self.output.append("    DB 13  ; carriage return")
+                            elif ord(char) < 32 or ord(char) > 126:
+                                # Non-printable character - output as numeric value
+                                self.output.append(f"    DB {ord(char)}  ; non-printable")
+                            else:
+                                # Regular printable character
+                                if char == "'" or char == '"':
+                                    # Escape quote in string literal
+                                    self.output.append(f"    DB {ord(char)}  ; quote")
+                                else:
+                                    self.output.append(f"    DB '{char}'")
+                        self.output.append(f"    DB 0  ; null terminator")
+                    elif array_size > 0:
+                        # Array declaration: allocate array_size * 4 bytes (assuming int)
+                        self.output.append(f"    TIMES {array_size} DD 0  ; {var_name}[{array_size}]")
+                    else:
+                        # Implicit size array - allocate minimum space (will be sized from initializer if present)
+                        self.output.append(f"    DD 0  ; {var_name}[] (implicit size)")
                 elif var.init:
                     # Has initializer
                     if isinstance(var.init, c_ast.Constant):
@@ -768,6 +814,31 @@ class CodeGenerator:
             self.output.append(f"    INC {self.stack_index_register}  ; Allocate slot 0 for SIMD register")
             # Note: xmm15 is typically preserved across calls, but we ensure it's accessible
         
+        # Check if this is a syscall function (functions starting with "sys_" that have empty bodies)
+        is_syscall = func_name.startswith("sys_")
+        if is_syscall and func_def.body:
+            # Check if body is empty
+            if isinstance(func_def.body, c_ast.Compound):
+                block_items = func_def.body.block_items
+                is_empty = block_items is None or len(block_items) == 0
+            else:
+                is_empty = False  # Non-compound body means there's something there
+            
+            if is_empty:
+                # Generate syscall code
+                if func_name == "sys_write":
+                    # sys_write(fd, buf, len) - parameters are already in RDI, RSI, RDX
+                    self.output.append("    ; sys_write syscall")
+                    if self.use_32bit:
+                        self.output.append(f"    MOV {self.reg_rax}, 4  ; sys_write (32-bit)")
+                        self.output.append("    INT 0x80")
+                    else:
+                        self.output.append(f"    MOV {self.reg_rax}, 1  ; sys_write")
+                        self.output.append("    SYSCALL")
+                    # No epilogue needed - syscall doesn't modify stack
+                    self.output.append("    RET")
+                    return
+        
         # Generate function body
         if func_def.body:
             self._generate_block(func_def.body, func_name, info)
@@ -1053,14 +1124,22 @@ class CodeGenerator:
                 func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
                 if func_idx >= 0:
                     self.output.append(f"    ; Indexed-jump call to {func_name}")
-                    self.output.append(f"    MOV {self.reg_rdi}, {func_idx}")
+                    # Use R11 (scratch register) for function index to preserve argument registers
+                    if self.use_32bit:
+                        # In 32-bit, temporarily use RDI but save/restore around the call
+                        self.output.append(f"    PUSH {self.reg_rdi}  ; Save first argument")
+                        self.output.append(f"    MOV {self.reg_rdi}, {func_idx}  ; Function index")
+                        self.output.append("    CALL INDEXED_JUMP")
+                        self.output.append(f"    POP {self.reg_rdi}  ; Restore first argument")
+                    else:
+                        # In 64-bit, use R11 (scratch register) for index
+                        self.output.append(f"    MOV R11, {func_idx}  ; Function index in R11 (preserves RDI)")
+                        self.output.append("    CALL INDEXED_JUMP")
                     
                     # Metamorphic return site disabled - RET_ADDR_OFFSET not implemented
                     # if callee_info.get('has_single_return', False) and return_site_label:
                     #     self.output.append(f"    LEA RAX, [rel {return_site_label}]")
                     #     self.output.append(f"    MOV [FUNC_{func_name}+RET_ADDR_OFFSET], RAX")
-                    
-                    self.output.append("    CALL INDEXED_JUMP")
                 else:
                     # Fallback to direct call if not in jump table
                     self.output.append(f"    CALL FUNC_{func_name}")
@@ -1133,8 +1212,27 @@ class CodeGenerator:
                 # Check if it's a global variable (non-packed)
                 globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                 if name in globals:
-                    # Global variable (non-packed)
-                    self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load global variable")
+                    # Check if this is an array - arrays should give address, not value
+                    # Get the variable declaration to check if it's an array
+                    is_array = False
+                    glob_vars = getattr(self, '_current_parser', None).get_global_variables() if hasattr(self, '_current_parser') else []
+                    for gv in glob_vars:
+                        if gv.name == name:
+                            # Check if it's an array
+                            type_node = gv.type
+                            while hasattr(type_node, 'type'):
+                                if isinstance(type_node, c_ast.ArrayDecl):
+                                    is_array = True
+                                    break
+                                type_node = type_node.type
+                            break
+                    
+                    if is_array:
+                        # For arrays, get the address (label), not the value
+                        self.output.append(f"    MOV {self.reg_rax}, GLOBAL_{name}  ; Load array address")
+                    else:
+                        # Global variable (non-packed, non-array)
+                        self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load global variable")
                 elif self.asm_parser and self.asm_parser.has_symbol(name):
                     # Global variable defined in assembly
                     self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load assembly-defined global")
