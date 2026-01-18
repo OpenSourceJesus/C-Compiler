@@ -12,10 +12,11 @@ from pathlib import Path
 class CParser:
     """Parser for C code using pycparser."""
     
-    def __init__(self):
+    def __init__(self, include_paths=None):
         self.parser = c_parser.CParser()
         self.ast = None
         self._alignas_info = {}  # Store _Alignas information extracted during preprocessing
+        self.include_paths = include_paths or []  # Additional include directories
     
     @staticmethod
     def _extract_alignas_info(content):
@@ -124,10 +125,16 @@ class CParser:
                     '-Dasm=',                        # Remove asm keyword
                     '-D__asm__=',                    # Remove __asm__ keyword
                     '-D__asm=',                      # Remove __asm keyword
+                    '-I=' + os.path.split(filename)[0]
                 ]
                 
                 # Add source directory to include path for relative includes
                 cpp_args.append(f'-I{source_dir}')
+                
+                # Add user-specified include paths (convert to absolute paths)
+                for inc_path in self.include_paths:
+                    abs_inc_path = os.path.abspath(inc_path)
+                    cpp_args.append(f'-I{abs_inc_path}')
                 
                 # Include wrapper header if it exists
                 if os.path.exists(wrapper_header):
@@ -273,9 +280,10 @@ class GlobalVariableExtractor(c_ast.NodeVisitor):
 class MultiFileParser:
     """Parser that aggregates functions and globals from multiple C files."""
     
-    def __init__(self):
+    def __init__(self, include_paths=None):
         self.parsers = []  # List of CParser instances, one per file
         self.file_paths = []  # List of file paths
+        self.include_paths = include_paths or []  # Additional include directories
     
     def parse_files(self, file_paths):
         """Parse multiple C files and aggregate their ASTs."""
@@ -283,7 +291,7 @@ class MultiFileParser:
         self.parsers = []
         
         for file_path in file_paths:
-            parser = CParser()
+            parser = CParser(include_paths=self.include_paths)
             try:
                 parser.parse_file(file_path)
                 self.parsers.append(parser)

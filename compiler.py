@@ -287,6 +287,8 @@ def main():
 	parser.add_argument('--qemu-kernel', help='Path to kernel file for QEMU system mode (-kernel option)')
 	parser.add_argument('--qemu-bios', help='Path to BIOS file for QEMU system mode (-bios option)')
 	parser.add_argument('--32-bit', dest='use_32bit', action='store_true', help='Generate 32-bit code (elf32 format)')
+	parser.add_argument('-I', action='append', dest='include_paths', default=[], metavar='DIR',
+	                    help='Add directory to include search path (can be specified multiple times)')
 	
 	args = parser.parse_args()
 	
@@ -296,7 +298,7 @@ def main():
 	if input_path.is_file():
 		# Single file mode
 		c_files = [str(input_path)]
-		c_parser = CParser()
+		c_parser = CParser(include_paths=args.include_paths)
 		try:
 			ast = c_parser.parse_file(args.input_path)
 			# for node in ast:
@@ -320,7 +322,7 @@ def main():
 					print(f"  {c_file}", file=sys.stderr)
 			
 			# Parse all files
-			c_parser = MultiFileParser()
+			c_parser = MultiFileParser(include_paths=args.include_paths)
 			try:
 				c_parser.parse_files(c_files)
 				if args.verbose:
