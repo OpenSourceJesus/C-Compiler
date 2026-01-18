@@ -9,18 +9,33 @@ import shutil
 import glob
 from pathlib import Path
 from statistics import mean, stdev
+import matplotlib
+# Try to use interactive backend if display is available, otherwise use Agg
+try:
+    if os.environ.get('DISPLAY'):
+        matplotlib.use('TkAgg')  # Interactive backend if display available
+    else:
+        matplotlib.use('Agg')  # Non-interactive backend for headless environments
+except:
+    matplotlib.use('Agg')  # Fallback to non-interactive backend
+import matplotlib.pyplot as plt
 from parser import find_c_files
 from asm_parser import find_asm_files
 
 # Configuration
 DEFAULT_ITERATIONS = 5
 
-def find_assembler():
-    """Find available assembler (nasm or yasm)."""
+def find_assembler(use_32bit=False):
+    """Find available assembler (nasm or yasm).
+    
+    Args:
+        use_32bit: If True, return elf32 format instead of elf64
+    """
+    format_type = 'elf32' if use_32bit else 'elf64'
     if shutil.which('nasm'):
-        return ('nasm', 'elf64')
+        return ('nasm', format_type)
     elif shutil.which('yasm'):
-        return ('yasm', 'elf64')
+        return ('yasm', format_type)
     return None
 
 def get_file_size(filepath):
@@ -102,7 +117,141 @@ def run_benchmark(executable_path, name, iterations):
     print(f"     Range:   {time_range:18.15f} seconds")
     print()
     
-    return avg
+    return {
+        'avg': avg,
+        'min': min_time,
+        'max': max_time,
+        'range': time_range,
+        'times': times
+    }
+
+def visualize_results(gcc_stats, custom_stats, gcc_size, custom_size, opt_level):
+    """Create matplotlib visualizations of benchmark results.
+    
+    Args:
+        gcc_stats: Dictionary with GCC benchmark statistics (or None)
+        custom_stats: Dictionary with custom compiler statistics (or None)
+        gcc_size: GCC executable size in bytes
+        custom_size: Custom compiler executable size in bytes
+        opt_level: GCC optimization level string
+    """
+    if gcc_stats is None or custom_stats is None:
+        print("Warning: Cannot create visualizations - missing benchmark data")
+        return
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(15, 10))
+    
+    # 1. Average execution time comparison (bar chart)
+    ax1 = plt.subplot(2, 2, 1)
+    compilers = ['GCC ' + opt_level, 'Custom Compiler']
+    avg_times = [gcc_stats['avg'], custom_stats['avg']]
+    colors = ['#2e86ab', '#a23b72']
+    bars = ax1.bar(compilers, avg_times, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+    ax1.set_ylabel('Average Execution Time (seconds)', fontsize=11, fontweight='bold')
+    ax1.set_title('Average Execution Time Comparison', fontsize=12, fontweight='bold', pad=15)
+    ax1.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # Add value labels on bars
+    for bar, time_val in zip(bars, avg_times):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+                f'{time_val:.6f}s',
+                ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    # 2. Individual run times (line plot with markers)
+    ax2 = plt.subplot(2, 2, 2)
+    gcc_runs = list(range(1, len(gcc_stats['times']) + 1))
+    custom_runs = list(range(1, len(custom_stats['times']) + 1))
+    ax2.plot(gcc_runs, gcc_stats['times'], marker='o', linestyle='-', 
+             label='GCC ' + opt_level, color='#2e86ab', linewidth=2, markersize=6)
+    ax2.plot(custom_runs, custom_stats['times'], marker='s', linestyle='-', 
+             label='Custom Compiler', color='#a23b72', linewidth=2, markersize=6)
+    ax2.set_xlabel('Run Number', fontsize=11, fontweight='bold')
+    ax2.set_ylabel('Execution Time (seconds)', fontsize=11, fontweight='bold')
+    ax2.set_title('Individual Run Times', fontsize=12, fontweight='bold', pad=15)
+    ax2.legend(loc='best', fontsize=10)
+    ax2.grid(alpha=0.3, linestyle='--')
+    
+    # 3. Executable size comparison (bar chart)
+    ax3 = plt.subplot(2, 2, 3)
+    sizes = [gcc_size, custom_size]
+    bars = ax3.bar(compilers, sizes, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+    ax3.set_ylabel('Executable Size (bytes)', fontsize=11, fontweight='bold')
+    ax3.set_title('Executable Size Comparison', fontsize=12, fontweight='bold', pad=15)
+    ax3.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    # Add value labels on bars
+    for bar, size_val in zip(bars, sizes):
+        height = bar.get_height()
+        # Format size nicely (KB if > 1024)
+        if size_val >= 1024:
+            size_str = f'{size_val/1024:.2f} KB\n({size_val:,} bytes)'
+        else:
+            size_str = f'{size_val:,} bytes'
+        ax3.text(bar.get_x() + bar.get_width()/2., height,
+                size_str,
+                ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    # 4. Performance ratio and statistics
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.axis('off')
+    
+    # Calculate ratios
+    speedup_ratio = custom_stats['avg'] / gcc_stats['avg']
+    size_ratio = custom_size / gcc_size if gcc_size > 0 else 0
+    
+    # Build statistics text
+    stats_text = "Performance Statistics\n" + "=" * 30 + "\n\n"
+    stats_text += f"Speedup Ratio: {speedup_ratio:.4f}x\n"
+    if speedup_ratio < 1.0:
+        percent_faster = ((gcc_stats['avg'] - custom_stats['avg']) / gcc_stats['avg']) * 100
+        stats_text += f"Custom is {percent_faster:.2f}% FASTER\n\n"
+    else:
+        percent_slower = ((custom_stats['avg'] - gcc_stats['avg']) / gcc_stats['avg']) * 100
+        stats_text += f"Custom is {percent_slower:.2f}% SLOWER\n\n"
+    
+    stats_text += f"Size Ratio: {size_ratio:.4f}x\n"
+    if size_ratio < 1.0:
+        percent_smaller = ((gcc_size - custom_size) / gcc_size) * 100
+        stats_text += f"Custom is {percent_smaller:.2f}% SMALLER\n\n"
+    else:
+        percent_larger = ((custom_size - gcc_size) / gcc_size) * 100
+        stats_text += f"Custom is {percent_larger:.2f}% LARGER\n\n"
+    
+    stats_text += "Time Statistics:\n"
+    stats_text += f"  GCC Min: {gcc_stats['min']:.6f}s\n"
+    stats_text += f"  GCC Max: {gcc_stats['max']:.6f}s\n"
+    stats_text += f"  Custom Min: {custom_stats['min']:.6f}s\n"
+    stats_text += f"  Custom Max: {custom_stats['max']:.6f}s\n"
+    
+    ax4.text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
+             verticalalignment='center', bbox=dict(boxstyle='round', 
+             facecolor='wheat', alpha=0.5))
+    
+    # Overall title
+    fig.suptitle('Benchmark Results: GCC vs Custom Compiler', 
+                 fontsize=14, fontweight='bold', y=0.995)
+    
+    # Adjust layout
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    
+    # Save figure
+    script_dir = Path(__file__).parent.absolute()
+    output_file = script_dir / 'benchmark_results.png'
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    print(f"Visualization saved to: {output_file}")
+    
+    # Display the plot (if running interactively and display is available)
+    try:
+        if os.environ.get('DISPLAY'):
+            plt.show(block=False)  # Non-blocking display
+            print("Plot displayed. Close the window to continue.")
+    except Exception as e:
+        # If display is not available, just save the file
+        pass
+    
+    plt.close()
 
 def find_linker_scripts(directory):
     """Recursively find all linker script files (.ld) in a directory."""
@@ -240,11 +389,32 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     if use_32bit:
         print("   Using 32-bit compilation mode (-m32)")
     
+    # Check if any assembly file defines _start (custom startup)
+    has_custom_startup = False
+    if asm_files:
+        for asm_file in asm_files:
+            try:
+                with open(asm_file, 'r') as f:
+                    content = f.read()
+                    # Check for _start definition (global _start or _start:)
+                    if '.global _start' in content or '_start:' in content:
+                        has_custom_startup = True
+                        print("   Detected custom startup file (defines _start)")
+                        break
+            except Exception:
+                pass
+    
+    # Try compilation, and if it fails with assembly errors, retry with 32-bit mode
+    gcc_compiled = False
+    
     try:
         # Build GCC command with all C files and assembly files
-        gcc_cmd = ['gcc', opt_level]
+        gcc_cmd = ['gcc', opt_level, '-DGCC']
         if use_32bit:
             gcc_cmd.append('-m32')
+        # Use -nostdlib if custom startup is detected to avoid _start conflict
+        if has_custom_startup:
+            gcc_cmd.append('-nostdlib')
         gcc_cmd.extend(c_files)
         gcc_cmd.extend(asm_files)
         gcc_cmd.extend(['-o', str(gcc_output)])
@@ -263,40 +433,170 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             text=True,
             cwd=script_dir
         )
+        gcc_compiled = True
     except subprocess.CalledProcessError as e:
-        print("Error: GCC compilation failed")
+        # Check if we should retry with 32-bit mode
+        should_retry_32bit = False
+        error_text = ""
+        
         if e.stderr:
+            error_text = e.stderr
             # Extract actual errors (lines containing "Error:")
             error_lines = [line for line in e.stderr.split('\n') if 'Error:' in line]
+            # Also check all stderr lines for linker/PIE errors
+            all_stderr_lines = [line for line in e.stderr.split('\n') if line.strip()]
+            
             if error_lines:
+                print("Error: GCC compilation failed")
                 print(f"   Compilation errors found:")
                 for error_line in error_lines[:20]:  # Show first 20 errors
                     print(f"   {error_line}")
                 if len(error_lines) > 20:
                     print(f"   ... and {len(error_lines) - 20} more errors")
-                
-                # Check if errors are related to 64-bit mode and suggest 32-bit mode
-                has_64bit_errors = any('64-bit mode' in line or 'not supported in 64-bit' in line for line in error_lines)
-                if has_64bit_errors and not use_32bit:
-                    print()
-                    print("   Suggestion: Some assembly files appear to be 32-bit code.")
-                    print("   Try running with --32bit flag to compile in 32-bit mode.")
             else:
                 # If no "Error:" lines, show last part of stderr
                 stderr_lines = e.stderr.split('\n')
+                print("Error: GCC compilation failed")
                 print(f"   Last {min(30, len(stderr_lines))} lines of output:")
                 for line in stderr_lines[-30:]:
                     if line.strip():
                         print(f"   {line}")
+            
+            # Check if errors suggest 32-bit mode is needed
+            # Look for assembly-related errors that might be fixed by 32-bit mode
+            has_asm_errors = any(
+                'no such instruction' in line.lower() or
+                'too many memory references' in line.lower() or
+                '64-bit mode' in line or
+                'not supported in 64-bit' in line or
+                'invalid instruction suffix' in line.lower() or
+                'operand type mismatch' in line.lower()
+                for line in error_lines
+            )
+            
+            # Also check for PIE/linker errors that might be fixed by 32-bit mode
+            has_pie_errors = any(
+                'pie' in line.lower() or
+                ('relocation' in line.lower() and 'x86_64' in line and 'can not be used' in line.lower()) or
+                ('relocation' in line.lower() and 'r_x86_64' in line.lower()) or
+                'failed to set dynamic section sizes' in line.lower() or
+                'collect2: error: ld returned' in line.lower()
+                for line in all_stderr_lines
+            )
+            
+            # Combine both error types
+            should_retry_due_to_errors = has_asm_errors or has_pie_errors
+            
+            # Retry with 32-bit mode if:
+            # - We have assembly errors AND there are assembly files, OR
+            # - We have PIE errors (can occur even without assembly files)
+            if should_retry_due_to_errors and not use_32bit:
+                if (has_asm_errors and asm_files) or has_pie_errors:
+                    should_retry_32bit = True
+                    print()
+                    if has_pie_errors:
+                        print("   Detected PIE/linker errors. Retrying with 32-bit mode (-m32)...")
+                    else:
+                        print("   Detected assembly-related errors. Retrying with 32-bit mode (-m32)...")
+                else:
+                    # Debug: why didn't we retry?
+                    print()
+                    print(f"   Debug: has_asm_errors={has_asm_errors}, has_pie_errors={has_pie_errors}, use_32bit={use_32bit}, asm_files={asm_files}")
         if e.stdout:
             # Sometimes errors go to stdout
             stdout_lines = e.stdout.split('\n')
             error_lines = [line for line in stdout_lines if 'Error:' in line]
-            if error_lines:
+            all_stdout_lines = [line for line in stdout_lines if line.strip()]
+            if error_lines and not error_text:
+                print("Error: GCC compilation failed")
                 print(f"   Errors from stdout:")
                 for error_line in error_lines[:10]:
                     print(f"   {error_line}")
-        return False
+                # Check if we should retry with 32-bit
+                if not use_32bit:
+                    has_asm_errors = any(
+                        'no such instruction' in line.lower() or
+                        'too many memory references' in line.lower() or
+                        'operand type mismatch' in line.lower()
+                        for line in error_lines
+                    )
+                    # Also check for PIE/linker errors in stdout
+                    has_pie_errors = any(
+                        'pie' in line.lower() or
+                        ('relocation' in line.lower() and 'x86_64' in line and 'can not be used' in line.lower()) or
+                        ('relocation' in line.lower() and 'r_x86_64' in line.lower()) or
+                        'failed to set dynamic section sizes' in line.lower() or
+                        'collect2: error: ld returned' in line.lower()
+                        for line in all_stdout_lines
+                    )
+                    # Retry if we have assembly errors with assembly files, or PIE errors
+                    if (has_asm_errors and asm_files) or has_pie_errors:
+                        should_retry_32bit = True
+                        print()
+                        if has_pie_errors:
+                            print("   Detected PIE/linker errors. Retrying with 32-bit mode (-m32)...")
+                        else:
+                            print("   Detected assembly-related errors. Retrying with 32-bit mode (-m32)...")
+        
+        # Retry with 32-bit mode if needed
+        if should_retry_32bit:
+            use_32bit = True
+            print(f"   Retrying compilation with 32-bit mode (-m32)...")
+            try:
+                # Build GCC command again with -m32 flag
+                gcc_cmd = ['gcc', opt_level, '-DGCC', '-m32']
+                # Use -nostdlib if custom startup is detected to avoid _start conflict
+                if has_custom_startup:
+                    gcc_cmd.append('-nostdlib')
+                gcc_cmd.extend(c_files)
+                gcc_cmd.extend(asm_files)
+                gcc_cmd.extend(['-o', str(gcc_output)])
+                
+                if len(gcc_cmd) > 10:
+                    print(f"   Running: gcc {opt_level} -m32 [{len(c_files)} C files, {len(asm_files)} ASM files] -o {gcc_output}")
+                else:
+                    print(f"   Running: {' '.join(gcc_cmd)}")
+                
+                result = subprocess.run(
+                    gcc_cmd,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=script_dir
+                )
+                gcc_compiled = True
+                print("   ✓ Compilation succeeded with 32-bit mode")
+            except subprocess.CalledProcessError as e2:
+                print("Error: GCC compilation failed even with 32-bit mode")
+                if e2.stderr:
+                    # Extract actual errors (lines containing "Error:")
+                    error_lines = [line for line in e2.stderr.split('\n') if 'Error:' in line]
+                    if error_lines:
+                        print(f"   Compilation errors found:")
+                        for error_line in error_lines[:20]:  # Show first 20 errors
+                            print(f"   {error_line}")
+                        if len(error_lines) > 20:
+                            print(f"   ... and {len(error_lines) - 20} more errors")
+                    else:
+                        # If no "Error:" lines, show last part of stderr
+                        stderr_lines = e2.stderr.split('\n')
+                        print(f"   Last {min(30, len(stderr_lines))} lines of output:")
+                        for line in stderr_lines[-30:]:
+                            if line.strip():
+                                print(f"   {line}")
+                if e2.stdout:
+                    # Sometimes errors go to stdout
+                    stdout_lines = e2.stdout.split('\n')
+                    error_lines = [line for line in stdout_lines if 'Error:' in line]
+                    if error_lines:
+                        print(f"   Errors from stdout:")
+                        for error_line in error_lines[:10]:
+                            print(f"   {error_line}")
+                return False
+        
+        if not gcc_compiled:
+            return False
     except FileNotFoundError:
         print("Error: gcc not found")
         return False
@@ -327,9 +627,14 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     custom_asm_file = custom_output_dir / f'{custom_output_name}.asm'
     
+    # Build compiler command with 32-bit flag if needed
+    compiler_cmd = [python_cmd, 'compiler.py', input_path, '-o', str(custom_asm_file), '--no-assemble']
+    if use_32bit:
+        compiler_cmd.append('--32-bit')
+    
     try:
         result = subprocess.run(
-            [python_cmd, 'compiler.py', input_path, '-o', str(custom_asm_file), '--no-assemble'],
+            compiler_cmd,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -352,7 +657,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         return False
     
     # Assemble and link
-    assembler_info = find_assembler()
+    assembler_info = find_assembler(use_32bit)
     if not assembler_info:
         print("Error: Neither nasm nor yasm found")
         return False
@@ -371,6 +676,31 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             cwd=script_dir
         )
     except subprocess.CalledProcessError as e:
+        error_text = e.stderr if e.stderr else ""
+        all_error_lines = [line for line in error_text.split('\n') if line.strip()]
+        
+        # Check for address size errors that might be fixed by 32-bit mode
+        has_addr_size_errors = any(
+            'impossible combination of address sizes' in line.lower() or
+            'invalid combination of opcode and operands' in line.lower() or
+            '32-bit' in line.lower() and '64-bit' in line.lower() and 'invalid' in line.lower()
+            for line in all_error_lines
+        )
+        
+        if has_addr_size_errors and not use_32bit:
+            print("Error: Assembly failed (address size mismatch)")
+            if e.stderr:
+                print(f"   Error output: {e.stderr[:500]}")  # Show first 500 chars
+            print()
+            print("   Detected address size errors. Retrying with 32-bit mode...")
+            # Clean up files
+            if asm_file.exists():
+                asm_file.unlink()
+            if obj_file.exists():
+                obj_file.unlink()
+            # Recursively retry with 32-bit mode
+            return compile_and_benchmark(test_path, output_base_name, exclude_patterns, True, opt_level, iterations)
+        
         print("Error: Assembly failed")
         if e.stderr:
             print(f"   Error output: {e.stderr}")
@@ -383,6 +713,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         return False
     
     # Assemble any .S files separately (they use GCC-style assembly, not nasm)
+    # Use the same 32-bit mode that was used for GCC compilation
     asm_obj_files = []
     for asm_file in asm_files:
         if asm_file.endswith('.S') or asm_file.endswith('.s'):
@@ -390,6 +721,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             asm_obj = custom_output_dir / Path(asm_file).name.replace('.S', '.o').replace('.s', '.o')
             try:
                 # Use gcc to assemble .S files (it handles both .S and .s)
+                # Use the same 32-bit mode that was determined during GCC compilation
+                # Don't define GCC for custom compiler - it needs FUNC_ prefixes
                 gcc_asm_cmd = ['gcc', '-c', asm_file, '-o', str(asm_obj)]
                 if use_32bit:
                     gcc_asm_cmd.insert(1, '-m32')
@@ -410,6 +743,11 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     # Build linker command with all object files
     link_cmd = ['ld', str(obj_file)] + asm_obj_files + ['-o', str(custom_output)]
     
+    # Add 32-bit emulation if needed
+    if use_32bit:
+        link_cmd.insert(1, '-m')
+        link_cmd.insert(2, 'elf_i386')
+    
     # Add linker script if found (use the first one if multiple)
     if linker_scripts:
         link_cmd.extend(['-T', linker_scripts[0]])
@@ -425,6 +763,47 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             cwd=script_dir
         )
     except subprocess.CalledProcessError as e:
+        # Check if this is an architecture mismatch error that can be fixed with 32-bit mode
+        error_text = e.stderr if e.stderr else ""
+        is_arch_mismatch = (
+            'i386 architecture' in error_text and 'x86-64' in error_text and
+            'incompatible' in error_text.lower()
+        ) or (
+            'architecture' in error_text.lower() and 'incompatible' in error_text.lower()
+        )
+        
+        # If we're not in 32-bit mode and see an architecture mismatch, retry with 32-bit
+        if is_arch_mismatch and not use_32bit:
+            print("Error: Linking failed (architecture mismatch)")
+            if e.stderr:
+                print(f"   Error output: {e.stderr}")
+            print()
+            print("   Detected architecture mismatch. Retrying with 32-bit mode...")
+            # Clean up the object file that was created with wrong architecture
+            if obj_file.exists():
+                obj_file.unlink()
+            # Recursively retry with 32-bit mode
+            return compile_and_benchmark(test_path, output_base_name, exclude_patterns, True, opt_level, iterations)
+        
+        # Check for undefined symbol errors that might indicate we need to retry
+        error_text = e.stderr if e.stderr else ""
+        has_undefined_symbols = any(
+            'undefined reference' in line.lower() and 'FUNC_' in line
+            for line in error_text.split('\n')
+        )
+        
+        # If we see undefined FUNC_ symbols and we're using the custom compiler,
+        # it means the assembly wasn't generated correctly or the .S file needs GCC define
+        # This shouldn't happen if everything is working, but let's handle it
+        if has_undefined_symbols and not use_32bit and asm_files:
+            print("Error: Linking failed (undefined symbols)")
+            if e.stderr:
+                print(f"   Error output: {e.stderr}")
+            print()
+            print("   Detected undefined symbols. This might be a 32/64-bit mismatch issue.")
+            print("   However, undefined FUNC_ symbols suggest an issue with symbol generation.")
+            # Don't retry automatically - this is likely a bug that needs fixing
+        
         print("Error: Linking failed")
         if e.stderr:
             print(f"   Error output: {e.stderr}")
@@ -460,32 +839,32 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     print("=" * 50)
     print(f"GCC {opt_level}:")
     if gcc_avg is not None:
-        print(f"  Average time: {gcc_avg:18.15f} seconds")
+        print(f"  Average time: {gcc_avg['avg']:18.15f} seconds")
     else:
         print("  Average time: ERROR - Could not measure")
     print(f"  Executable size: {gcc_size} bytes")
     print()
     print("Custom Compiler:")
     if custom_avg is not None:
-        print(f"  Average time: {custom_avg:18.15f} seconds")
+        print(f"  Average time: {custom_avg['avg']:18.15f} seconds")
     else:
         print("  Average time: ERROR - Could not measure")
     print(f"  Executable size: {custom_size} bytes")
     print()
     
     # Calculate comparisons
-    if gcc_avg is not None and custom_avg is not None and gcc_avg > 0:
-        speedup = custom_avg / gcc_avg
-        time_diff = custom_avg - gcc_avg
+    if gcc_avg is not None and custom_avg is not None and gcc_avg['avg'] > 0:
+        speedup = custom_avg['avg'] / gcc_avg['avg']
+        time_diff = custom_avg['avg'] - gcc_avg['avg']
         
         print(f"Speedup ratio (Custom/GCC): {speedup:.15f}x")
         print(f"Time difference: {time_diff:+.15f} seconds (Custom - GCC)")
         
-        if custom_avg < gcc_avg:
-            percent_faster = ((gcc_avg - custom_avg) / gcc_avg) * 100
+        if custom_avg['avg'] < gcc_avg['avg']:
+            percent_faster = ((gcc_avg['avg'] - custom_avg['avg']) / gcc_avg['avg']) * 100
             print(f"  -> Custom compiler is {percent_faster:.2f}% FASTER")
         else:
-            percent_slower = ((custom_avg - gcc_avg) / gcc_avg) * 100
+            percent_slower = ((custom_avg['avg'] - gcc_avg['avg']) / gcc_avg['avg']) * 100
             print(f"  -> Custom compiler is {percent_slower:.2f}% SLOWER")
         
         print()
@@ -505,6 +884,10 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     print()
     print("=" * 50)
+    
+    # Create visualizations
+    visualize_results(gcc_avg, custom_avg, gcc_size, custom_size, opt_level)
+    
     return True
 
 def main():

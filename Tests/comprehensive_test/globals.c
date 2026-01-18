@@ -10,6 +10,17 @@ int global_min = 1000;
 /* SIMD-packed global variables (1-8 bits) using _Alignas convention */
 /* These will be packed into xmm15 SIMD register for zero-latency access */
 
+#ifdef GCC
+#define int1_t char
+#define int2_t char
+#define int3_t char
+#define int4_t char
+#define int5_t char
+#define int6_t char
+#define int7_t char
+#define int8_t char
+#endif
+#ifndef GCC
 #define int1_t auto _Alignas(1) char
 #define int2_t auto _Alignas(2) char
 #define int3_t auto _Alignas(3) char
@@ -18,6 +29,7 @@ int global_min = 1000;
 #define int6_t auto _Alignas(6) char
 #define int7_t auto _Alignas(7) char
 #define int8_t auto _Alignas(8) char
+#endif
 
 /* 1-bit flag */
 int1_t flag_1bit = 0;

@@ -1,9 +1,16 @@
 /* Interrupt callback functions - should use zero-latency SIMD register access */
 
 /* SIMD-packed kernel flags (accessed via zero-latency SIMD register) */
+#ifdef GCC
+#define int1_t char
+#define int2_t char
+#define int3_t char
+#endif
+#ifndef GCC
 #define int1_t auto _Alignas(1) char
 #define int2_t auto _Alignas(2) char
 #define int3_t auto _Alignas(3) char
+#endif
 
 extern int1_t flag_1bit;
 extern int2_t counter_2bit;

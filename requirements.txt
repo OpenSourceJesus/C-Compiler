@@ -1,2 +1,3 @@
 pycparser>=2.21
 pycparser-fake-libc>=1.2
+matplotlib>=3.5.0

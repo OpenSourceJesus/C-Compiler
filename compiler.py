@@ -14,12 +14,17 @@ from asm_parser import parse_asm_files, find_asm_files
 from symbol_collector import collect_symbols
 
 
-def find_assembler():
-	"""Find available assembler (nasm or yasm)."""
+def find_assembler(use_32bit=False):
+	"""Find available assembler (nasm or yasm).
+	
+	Args:
+		use_32bit: If True, return elf32 format instead of elf64
+	"""
+	format_type = 'elf32' if use_32bit else 'elf64'
 	if shutil.which('nasm'):
-		return ('nasm', 'elf64')
+		return ('nasm', format_type)
 	elif shutil.which('yasm'):
-		return ('yasm', 'elf64')
+		return ('yasm', format_type)
 	else:
 		return None
 
@@ -115,10 +120,18 @@ def find_linker_script(input_path):
 	return None
 
 
-def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_script=None):
-	"""Assemble and link the generated assembly file."""
+def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_script=None, use_32bit=False):
+	"""Assemble and link the generated assembly file.
+	
+	Args:
+		asm_file: Path to assembly file
+		output_executable: Output executable path
+		verbose: Enable verbose output
+		linker_script: Path to linker script
+		use_32bit: If True, use 32-bit mode (elf32, -m elf_i386)
+	"""
 	# Find assembler
-	assembler_info = find_assembler()
+	assembler_info = find_assembler(use_32bit)
 	if not assembler_info:
 		print("Error: Neither nasm nor yasm found. Please install one:", file=sys.stderr)
 		print("  sudo apt-get install nasm    # Debian/Ubuntu", file=sys.stderr)
@@ -160,6 +173,11 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 	try:
 		# Build linker command
 		link_cmd = ['ld', obj_file, '-o', output_executable]
+		
+		# Add 32-bit emulation if needed
+		if use_32bit:
+			link_cmd.insert(1, '-m')
+			link_cmd.insert(2, 'elf_i386')
 		
 		# Add linker script if provided
 		if linker_script:
@@ -268,6 +286,7 @@ def main():
 	parser.add_argument('--qemu-system', action='store_true', help='Run in QEMU system mode instead of user mode')
 	parser.add_argument('--qemu-kernel', help='Path to kernel file for QEMU system mode (-kernel option)')
 	parser.add_argument('--qemu-bios', help='Path to BIOS file for QEMU system mode (-bios option)')
+	parser.add_argument('--32-bit', dest='use_32bit', action='store_true', help='Generate 32-bit code (elf32 format)')
 	
 	args = parser.parse_args()
 	
@@ -387,7 +406,7 @@ def main():
 	
 	# Generate code
 	try:
-		codegen = CodeGenerator(function_data, global_var_data, asm_parser)
+		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit)
 		output_code = codegen.generate(c_parser)
 		
 		# Write output
@@ -423,7 +442,7 @@ def main():
 			if linker_script and args.verbose:
 				print(f"Found linker script: {linker_script}", file=sys.stderr)
 			
-			success = assemble_and_link(output_file, executable_name, args.verbose, linker_script)
+			success = assemble_and_link(output_file, executable_name, args.verbose, linker_script, args.use_32bit)
 			if not success:
 				sys.exit(1)
 			
