@@ -172,16 +172,72 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 	
 	try:
 		# Build linker command
-		link_cmd = ['ld', obj_file, '-o', output_executable]
+		# Use -N to make text and data readable and writable (omagic for both)
+		# This is needed for data access in bare executables
+		link_cmd = ['ld', '-N', obj_file, '-o', output_executable]
 		
 		# Add 32-bit emulation if needed
 		if use_32bit:
 			link_cmd.insert(1, '-m')
 			link_cmd.insert(2, 'elf_i386')
 		
-		# Add linker script if provided
+		# Make code section writable for metamorphic return sites
+		# If a linker script is provided, modify it to include W (write) in text FLAGS
+		# since PHDRS FLAGS override the -N flag
+		actual_linker_script = linker_script
 		if linker_script:
-			link_cmd.extend(['-T', linker_script])
+			try:
+				with open(linker_script, 'r') as f:
+					script_content = f.read()
+					# Check if PHDRS has text FLAGS that need W added
+					import re
+					# Pattern to match text PT_LOAD FLAGS - replace with numeric value 7 (R|W|X = 4|2|1)
+					# ELF flags: PF_R=4, PF_W=2, PF_X=1, so R|W|X = 7
+					pattern = r'(text\s+PT_LOAD\s+FLAGS\s*\()([^)]+)(\))'
+					def add_write_flag(match):
+						flags_expr = match.group(2).strip()
+						# Convert symbolic flags to numeric if needed, or ensure W is included
+						if 'W' in flags_expr.upper() or 'w' in flags_expr:
+							# Already has W, but ensure it's numeric
+							if flags_expr.isdigit() or (flags_expr.startswith('0x') and all(c in '0123456789abcdefABCDEF' for c in flags_expr[2:])):
+								# Already numeric, check if it includes W (bit 2)
+								try:
+									val = int(flags_expr, 0)
+									if val & 2:  # Already has W
+										return match.group(0)
+									else:
+										return match.group(1) + str(val | 2) + match.group(3)
+								except:
+									pass
+							# Has W symbolically, convert to numeric
+							return match.group(1) + '7' + match.group(3)  # R|W|X = 7
+						else:
+							# No W, add it - use numeric 7 for R|W|X
+							return match.group(1) + '7' + match.group(3)
+					
+					modified_content = re.sub(pattern, add_write_flag, script_content, flags=re.IGNORECASE)
+					
+					if modified_content != script_content:
+						# Create temporary modified linker script
+						import tempfile
+						temp_script = tempfile.NamedTemporaryFile(mode='w', suffix='.ld', delete=False)
+						temp_script.write(modified_content)
+						temp_script.close()
+						actual_linker_script = temp_script.name
+			except Exception as e:
+				# If modification fails, use original script
+				if verbose:
+					print(f"Warning: Could not modify linker script for writable text: {e}", file=sys.stderr)
+				pass
+		
+		# Add linker script if provided
+		if actual_linker_script:
+			link_cmd.extend(['-T', actual_linker_script])
+		
+		# Make code section writable for metamorphic return sites
+		# -N (omagic) makes text section writable and data section executable
+		# This is required for self-modifying code (metamorphic return sites)
+		link_cmd.append('-N')
 		
 		result = subprocess.run(
 			link_cmd,

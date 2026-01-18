@@ -84,6 +84,7 @@ class CodeGenerator:
         self.label_counter = 0  # Counter for unique labels
         self.saved_fp_in_rbx = False  # Track if function pointer is saved in RBX from if condition
         self.fp_in_rax = False  # Track if function pointer is already in RAX from condition
+        self.metamorphic_labels = {}  # Track metamorphic return site labels: {func_name: label_name}
     
     def _safe_append(self, line):
         """Safely append a line to output, ensuring no AST node objects are included.
@@ -193,7 +194,25 @@ class CodeGenerator:
                 for f in small_funcs + large_funcs
             )
             if has_main:
-                self.output.append("    CALL FUNC_main  ; Call main function")
+                # Check if main has single return (metamorphic return site)
+                main_info = self.function_data.get("main", {})
+                if main_info.get('has_single_return', False):
+                    # Use metamorphic return site for main
+                    return_site_label = "__after_main"
+                    metamorphic_label = "FUNC_main_METAMORPHIC"
+                    self.output.append("    ; Metamorphic return site: write return address into instruction bytes")
+                    if self.use_32bit:
+                        self.output.append(f"    LEA {self.reg_rax}, [{metamorphic_label}+1]  ; Address of immediate value")
+                        self.output.append(f"    LEA {self.reg_rdx}, [{return_site_label}]  ; Get return address")
+                        self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address")
+                    else:
+                        self.output.append(f"    LEA {self.reg_rax}, [rel {metamorphic_label}+1]  ; Address of immediate value")
+                        self.output.append(f"    LEA {self.reg_rdx}, [rel {return_site_label}]  ; Get return address")
+                        self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address (32-bit, like example)")
+                    self.output.append("    JMP FUNC_main  ; Jump to main function")
+                    self.output.append(f"{return_site_label}:  ; Return site after main")
+                else:
+                    self.output.append("    CALL FUNC_main  ; Call main function")
                 self.output.append(f"    ; Main return value is in {self.reg_rax}, save it for exit")
                 self.output.append(f"    MOV {self.reg_rdi}, {self.reg_rax}  ; Save return value to {self.reg_rdi} (exit code)")
             else:
@@ -297,6 +316,8 @@ class CodeGenerator:
     
     def _generate_data_section(self, parser):
         """Generate data section for global variables and STACK_BASE."""
+        # Use .rodata for read-only data (strings) and .data for writable data
+        # For now, put everything in .data for compatibility
         self.output.append("SECTION .data")
         self.output.append("")
         
@@ -309,50 +330,48 @@ class CodeGenerator:
         self.output.append("")
         
         globals = parser.get_global_variables()
-        if not globals:
-            return
         
-        # Deduplicate global variables by name
-        seen_globals = {}  # {var_name: var_node} to deduplicate
-        for var in globals:
-            var_name = var.name if var.name else None
-            if not var_name:
-                continue
-            # Only keep the first occurrence of each global
-            if var_name not in seen_globals:
-                seen_globals[var_name] = var
-        
-        packed_var_names = {var['name'] for var in self.global_var_data['packed_vars']}
-        
-        for var_name, var in seen_globals.items():
-            # Only generate data for non-packed variables
-            # Packed variables are stored in SIMD register
-            if var_name not in packed_var_names:
-                # Check if this is an array
-                is_array = False
-                array_size = 0
-                # Check type structure for arrays
-                type_node = var.type
-                while hasattr(type_node, 'type'):
-                    if isinstance(type_node, c_ast.ArrayDecl):
-                        is_array = True
-                        if type_node.dim:
-                            if isinstance(type_node.dim, c_ast.Constant):
-                                try:
-                                    array_size = int(type_node.dim.value)
-                                except:
+        # Generate global variables (if any)
+        if globals:
+            # Deduplicate global variables by name
+            seen_globals = {}  # {var_name: var_node} to deduplicate
+            for var in globals:
+                var_name = var.name if var.name else None
+                if not var_name:
+                    continue
+                # Only keep the first occurrence of each global
+                if var_name not in seen_globals:
+                    seen_globals[var_name] = var
+            
+            packed_var_names = {var['name'] for var in self.global_var_data['packed_vars']}
+            
+            for var_name, var in seen_globals.items():
+                # Only generate data for non-packed variables
+                # Packed variables are stored in SIMD register
+                if var_name not in packed_var_names:
+                    # Check if this is an array
+                    is_array = False
+                    array_size = 0
+                    # Check type structure for arrays
+                    type_node = var.type
+                    while hasattr(type_node, 'type'):
+                        if isinstance(type_node, c_ast.ArrayDecl):
+                            is_array = True
+                            if type_node.dim:
+                                if isinstance(type_node.dim, c_ast.Constant):
+                                    try:
+                                        array_size = int(type_node.dim.value)
+                                    except:
+                                        array_size = 10  # Default size
+                                else:
                                     array_size = 10  # Default size
-                            else:
-                                array_size = 10  # Default size
-                        break
-                    type_node = type_node.type
-                
-                self.output.append(f"GLOBAL_{var_name}:")
-                if is_array:
-                    # Check if array has string initializer
+                            break
+                        type_node = type_node.type
+                    
+                    # Check if array has string initializer (before defining label)
                     has_string_init = False
                     string_value = None
-                    if var.init and isinstance(var.init, c_ast.Constant):
+                    if is_array and var.init and isinstance(var.init, c_ast.Constant):
                         value = var.init.value
                         if isinstance(value, str) and ((value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'"))):
                             has_string_init = True
@@ -363,6 +382,10 @@ class CodeGenerator:
                                 string_value = value[1:-1]
                     
                     if has_string_init and string_value:
+                        # String array: put in .text section as read-only data for accessibility
+                        # Switch to .text section for string constants
+                        self.output.append("SECTION .text")
+                        self.output.append(f"GLOBAL_{var_name}:")
                         # String array: determine size from string + null terminator
                         actual_size = len(string_value) + 1  # +1 for null terminator
                         # Use DB (bytes) for char arrays
@@ -386,71 +409,82 @@ class CodeGenerator:
                                 else:
                                     self.output.append(f"    DB '{char}'")
                         self.output.append(f"    DB 0  ; null terminator")
-                    elif array_size > 0:
-                        # Array declaration: allocate array_size * 4 bytes (assuming int)
-                        self.output.append(f"    TIMES {array_size} DD 0  ; {var_name}[{array_size}]")
+                        # Switch back to .data section
+                        self.output.append("SECTION .data")
                     else:
-                        # Implicit size array - allocate minimum space (will be sized from initializer if present)
-                        self.output.append(f"    DD 0  ; {var_name}[] (implicit size)")
-                elif var.init:
-                    # Has initializer
-                    if isinstance(var.init, c_ast.Constant):
-                        value = var.init.value
-                        # Handle string constants - convert to numeric if needed
-                        if isinstance(value, str) and len(value) > 1:
-                            # For string constants longer than 1 char, use address or convert
-                            # For now, just use 0 and let the linker handle it
-                            self.output.append(f"    DD 0  ; {var_name} (string constant)")
-                        else:
-                            # Try to convert value to integer for assembly
-                            try:
-                                # Handle numeric values
-                                if isinstance(value, str):
-                                    # Try parsing as integer (hex, decimal, etc.)
-                                    if value.startswith('0x') or value.startswith('0X'):
-                                        num_value = int(value, 16)
-                                    else:
-                                        num_value = int(value)
+                        # Non-string array or variable - define in .data section
+                        self.output.append(f"GLOBAL_{var_name}:")
+                        if is_array:
+                            if array_size > 0:
+                                # Array declaration: allocate array_size * 4 bytes (assuming int)
+                                self.output.append(f"    TIMES {array_size} DD 0  ; {var_name}[{array_size}]")
+                            else:
+                                # Implicit size array - allocate minimum space (will be sized from initializer if present)
+                                self.output.append(f"    DD 0  ; {var_name}[] (implicit size)")
+                        elif var.init:
+                            # Has initializer
+                            if isinstance(var.init, c_ast.Constant):
+                                value = var.init.value
+                                # Handle string constants - convert to numeric if needed
+                                if isinstance(value, str) and len(value) > 1:
+                                    # For string constants longer than 1 char, use address or convert
+                                    # For now, just use 0 and let the linker handle it
+                                    self.output.append(f"    DD 0  ; {var_name} (string constant)")
                                 else:
-                                    num_value = int(value)
-                                self.output.append(f"    DD {num_value}  ; {var_name}")
-                            except (ValueError, TypeError):
-                                # If conversion fails, use 0
+                                    # Try to convert value to integer for assembly
+                                    try:
+                                        # Handle numeric values
+                                        if isinstance(value, str):
+                                            # Try parsing as integer (hex, decimal, etc.)
+                                            if value.startswith('0x') or value.startswith('0X'):
+                                                num_value = int(value, 16)
+                                            else:
+                                                num_value = int(value)
+                                        else:
+                                            num_value = int(value)
+                                        self.output.append(f"    DD {num_value}  ; {var_name}")
+                                    except (ValueError, TypeError):
+                                        # If conversion fails, use 0
+                                        self.output.append(f"    DD 0  ; {var_name} (initialized at runtime)")
+                            else:
+                                # Non-constant initializer - initialize to 0
                                 self.output.append(f"    DD 0  ; {var_name} (initialized at runtime)")
-                    else:
-                        self.output.append(f"    DD 0  ; {var_name} (initialized at runtime)")
-                else:
-                    self.output.append(f"    DD 0  ; {var_name}")
-            else:
-                # Packed variable - still need a storage location for initialization
-                # but it will be packed into SIMD register
-                self.output.append(f"GLOBAL_{var_name}:")
-                if var.init:
-                    if isinstance(var.init, c_ast.Constant):
-                        value = var.init.value
-                        # Handle string constants - convert to numeric if needed
-                        if isinstance(value, str) and len(value) > 1:
-                            # For string constants, use 0
-                            self.output.append(f"    DB 0  ; {var_name} (packed, string constant)")
                         else:
-                            # Try to convert value to integer for assembly
-                            try:
-                                if isinstance(value, str):
-                                    if value.startswith('0x') or value.startswith('0X'):
-                                        num_value = int(value, 16)
+                            # No initializer
+                            self.output.append(f"    DD 0  ; {var_name}")
+                else:
+                    # Packed variable - still need a storage location for initialization
+                    # but it will be packed into SIMD register
+                    self.output.append(f"GLOBAL_{var_name}:")
+                    if var.init:
+                        if isinstance(var.init, c_ast.Constant):
+                            value = var.init.value
+                            # Handle string constants - convert to numeric if needed
+                            if isinstance(value, str) and len(value) > 1:
+                                # For string constants, use 0
+                                self.output.append(f"    DB 0  ; {var_name} (packed, string constant)")
+                            else:
+                                # Try to convert value to integer for assembly
+                                try:
+                                    if isinstance(value, str):
+                                        if value.startswith('0x') or value.startswith('0X'):
+                                            num_value = int(value, 16)
+                                        else:
+                                            num_value = int(value)
                                     else:
                                         num_value = int(value)
-                                else:
-                                    num_value = int(value)
-                                # Ensure value fits in byte for DB
-                                num_value = num_value & 0xFF
-                                self.output.append(f"    DB {num_value}  ; {var_name} (packed into SIMD register)")
-                            except (ValueError, TypeError):
-                                self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
+                                    # Ensure value fits in byte for DB
+                                    num_value = num_value & 0xFF
+                                    self.output.append(f"    DB {num_value}  ; {var_name} (packed into SIMD register)")
+                                except (ValueError, TypeError):
+                                    self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
+                        else:
+                            self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
                     else:
                         self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
-                else:
-                    self.output.append(f"    DB 0  ; {var_name} (packed into SIMD register)")
+        
+        # No need to generate memory locations for metamorphic return sites
+        # The return addresses are written directly into instruction bytes
         
         self.output.append("")
     
@@ -813,8 +847,8 @@ class CodeGenerator:
             self.output.append(f"    SUB {self.reg_rsp}, 8  ; Allocate stack space for SIMD register")
             # Note: xmm15 is typically preserved across calls, but we ensure it's accessible
         
-        # Check if this is a syscall function (functions starting with "sys_" that have empty bodies)
-        is_syscall = func_name.startswith("sys_")
+        # Check if this is a syscall function (functions starting with "print" that have empty bodies)
+        is_syscall = func_name.startswith("print")
         if is_syscall and func_def.body:
             # Check if body is empty
             if isinstance(func_def.body, c_ast.Compound):
@@ -825,14 +859,14 @@ class CodeGenerator:
             
             if is_empty:
                 # Generate syscall code
-                if func_name == "sys_write":
+                if func_name == "print":
                     # sys_write(fd, buf, len) - parameters are already in RDI, RSI, RDX
-                    self.output.append("    ; sys_write syscall")
+                    self.output.append("    ; print syscall")
                     if self.use_32bit:
-                        self.output.append(f"    MOV {self.reg_rax}, 4  ; sys_write (32-bit)")
+                        self.output.append(f"    MOV {self.reg_rax}, 4  ; print (32-bit)")
                         self.output.append("    INT 0x80")
                     else:
-                        self.output.append(f"    MOV {self.reg_rax}, 1  ; sys_write")
+                        self.output.append(f"    MOV {self.reg_rax}, 1  ; print (64-bit)")
                         self.output.append("    SYSCALL")
                     # No epilogue needed - syscall doesn't modify stack
                     self.output.append("    RET")
@@ -890,17 +924,57 @@ class CodeGenerator:
     
     def _generate_return(self, ret_stmt, func_name, info):
         """Generate return statement with metamorphic return site optimization."""
-        # Always generate the return expression first (if any)
-        if ret_stmt.expr:
-            self._generate_expression(ret_stmt.expr)
-            # Return value is now in RAX from expression evaluation
-        
-        # Standard epilogue - only restore RBP if prologue was generated
-        if self.function_needs_indexed_stack or self.current_stack_slots > 0:
-            if self.current_stack_slots > 0:
-                self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}  ; Restore stack pointer")
-            self.output.append(f"    POP {self.reg_rbp}  ; Restore frame pointer")
-        self.output.append("    RET")
+        if info.get('has_single_return', False):
+            # Metamorphic return site: return address is embedded in instruction bytes
+            # Generate a label for the metamorphic return site
+            if func_name not in self.metamorphic_labels:
+                self.metamorphic_labels[func_name] = f"FUNC_{func_name}_METAMORPHIC"
+            
+            label_name = self.metamorphic_labels[func_name]
+            
+            # Use minimal epilogue if no indexed stack was used
+            if self.function_needs_indexed_stack:
+                if self.current_stack_slots > 0:
+                    self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
+                self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
+                if not self.use_32bit:
+                    self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
+                    self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
+                self.output.append(f"    POP {self.reg_rbp}")
+            else:
+                if self.current_stack_slots > 0:
+                    self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
+                    self.output.append(f"    POP {self.reg_rbp}")
+            
+            # Metamorphic return: load return address from instruction bytes and jump
+            # The caller will overwrite 0xdeadbeef with the actual return address
+            self.output.append(f"{label_name}:")
+            if self.use_32bit:
+                self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+            else:
+                # Use 32-bit move (will be optimized by NASM, but we write 32 bits to it)
+                # The example uses mov rdx, 0xdeadbeef which NASM optimizes to 32-bit
+                self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+            self.output.append(f"    JMP RDX  ; Jump to return address")
+        else:
+            # Standard return
+            if ret_stmt.expr:
+                self._generate_expression(ret_stmt.expr)
+                # Return value is already in RAX from expression evaluation
+            # Use minimal epilogue if no indexed stack was used
+            if self.function_needs_indexed_stack:
+                if self.current_stack_slots > 0:
+                    self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
+                self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
+                if not self.use_32bit:
+                    self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
+                    self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
+                self.output.append(f"    POP {self.reg_rbp}")
+            else:
+                if self.current_stack_slots > 0:
+                    self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
+                    self.output.append(f"    POP {self.reg_rbp}")
+            self.output.append("    RET")
     
     def _generate_call(self, call, caller_func_name):
         """Generate function call with optimizations."""
@@ -1031,12 +1105,69 @@ class CodeGenerator:
         
         callee_info = self.function_data.get(func_name, {})
         
-        # Prepare arguments (simplified - assume up to 6 args in registers)
-        if call.args:
-            for i, arg in enumerate(call.args.exprs[:6]):
-                reg = ([self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx] if self.use_32bit else [self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx, self.reg_r8, self.reg_r9])[i]
-                self._generate_expression(arg)
-                self.output.append(f"    MOV {reg}, {self.reg_rax}")
+        # Special handling for print function (syscall)
+        if func_name == "print":
+            # print function: print("%s", msg) -> sys_write(1, msg, len)
+            # Set up syscall arguments: RDI=1 (stdout), RSI=buffer, RDX=length
+            if call.args and len(call.args.exprs) >= 2:
+                # First argument is format string (ignored), second is buffer
+                # Evaluate second argument to get buffer address
+                self._generate_expression(call.args.exprs[1])
+                self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Buffer address")
+                
+                # Set file descriptor to stdout (1)
+                self.output.append(f"    MOV {self.reg_rdi}, 1  ; stdout file descriptor")
+                
+                # Compute length: try to get it from global variable if it's a string literal/array
+                # Check if second argument is a global variable with known string
+                buf_arg = call.args.exprs[1]
+                string_length = None
+                if isinstance(buf_arg, c_ast.ID):
+                    # Check if it's a global variable with string initializer
+                    var_name = buf_arg.name
+                    glob_vars = getattr(self, '_current_parser', None).get_global_variables() if hasattr(self, '_current_parser') else []
+                    for gv in glob_vars:
+                        if gv.name == var_name and gv.init and isinstance(gv.init, c_ast.Constant):
+                            value = gv.init.value
+                            if isinstance(value, str) and ((value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'"))):
+                                # Extract string content
+                                if value.startswith('"'):
+                                    string_value = value[1:-1].replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\\\', '\\')
+                                else:
+                                    string_value = value[1:-1]
+                                # Length is string length (excluding null terminator for syscall)
+                                string_length = len(string_value)
+                                break
+                
+                if string_length is not None:
+                    # Use compile-time length
+                    self.output.append(f"    MOV {self.reg_rdx}, {string_length}  ; String length (compile-time)")
+                else:
+                    # Compute length at runtime by finding null terminator
+                    # Use RCX as pointer, RDX as length counter
+                    self.output.append(f"    MOV RCX, {self.reg_rsi}  ; Copy buffer address to RCX")
+                    self.output.append(f"    MOV {self.reg_rdx}, 0  ; Initialize length counter")
+                    length_label = f"_strlen_{self.return_site_index}"
+                    self.output.append(f"{length_label}:")
+                    self.output.append(f"    MOV AL, BYTE [RCX]  ; Load byte")
+                    self.output.append(f"    CMP AL, 0  ; Check for null terminator")
+                    self.output.append(f"    JE {length_label}_done")
+                    self.output.append(f"    INC RCX  ; Move to next byte")
+                    self.output.append(f"    INC {self.reg_rdx}  ; Increment length")
+                    self.output.append(f"    JMP {length_label}")
+                    self.output.append(f"{length_label}_done:")
+            else:
+                # Fallback: set default values
+                self.output.append(f"    MOV {self.reg_rdi}, 1  ; stdout")
+                self.output.append(f"    MOV {self.reg_rsi}, 0  ; No buffer")
+                self.output.append(f"    MOV {self.reg_rdx}, 0  ; No length")
+        else:
+            # Prepare arguments (simplified - assume up to 6 args in registers)
+            if call.args:
+                for i, arg in enumerate(call.args.exprs[:6]):
+                    reg = ([self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx] if self.use_32bit else [self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx, self.reg_r8, self.reg_r9])[i]
+                    self._generate_expression(arg)
+                    self.output.append(f"    MOV {reg}, {self.reg_rax}")
         
         # Handle return site for single-return functions (quantized call-back)
         return_site_label = None
@@ -1085,14 +1216,68 @@ class CodeGenerator:
                     self.output.append(f"    ; External function call: {func_name}")
                     self.output.append(f"    CALL FUNC_{func_name}  ; Assumed to be defined externally")
         else:
-            # Use direct call for performance (indexed-jump adds overhead)
-            # Direct calls are faster than indirect calls through jump table
-            self.output.append(f"    CALL FUNC_{func_name}")
+            # Generate call based on function type
+            if callee_info.get('is_small', False):
+                # Indexed-jump call for small functions
+                func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
+                if func_idx >= 0:
+                    self.output.append(f"    ; Indexed-jump call to {func_name}")
+                    # In 64-bit mode, use R11 to preserve RDI for function arguments
+                    if self.use_32bit:
+                        self.output.append(f"    MOV {self.reg_rdi}, {func_idx}")
+                    else:
+                        self.output.append(f"    MOV R11, {func_idx}  ; Function index (preserve RDI for arguments)")
+                    
+                    # Write return address to instruction bytes for metamorphic return sites
+                    if callee_info.get('has_single_return', False) and return_site_label:
+                        metamorphic_label = f"FUNC_{func_name}_METAMORPHIC"
+                        self.output.append(f"    ; Metamorphic return site: write return address into instruction bytes")
+                        if self.use_32bit:
+                            self.output.append(f"    LEA {self.reg_rax}, [{metamorphic_label}+1]  ; Address of immediate value")
+                            self.output.append(f"    LEA {self.reg_rdx}, [{return_site_label}]  ; Get return address")
+                            self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address")
+                        else:
+                            self.output.append(f"    LEA {self.reg_rax}, [rel {metamorphic_label}+1]  ; Address of immediate value")
+                            self.output.append(f"    LEA {self.reg_rdx}, [rel {return_site_label}]  ; Get return address")
+                            self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address (32-bit, like example)")
+                    
+                    self.output.append("    CALL INDEXED_JUMP")
+                else:
+                    # Fallback to direct call if not in jump table
+                    self.output.append(f"    CALL FUNC_{func_name}")
+            else:
+                # Standard call or call with metamorphic return
+                if callee_info.get('has_single_return', False) and return_site_label:
+                    # Metamorphic return site: write return address directly into instruction bytes
+                    # The callee has: mov rdx, 0xdeadbeef; jmp rdx
+                    # We need to write the return address to the immediate value location
+                    # The immediate value starts at offset +2 from the label (after mov opcode and register)
+                    metamorphic_label = f"FUNC_{func_name}_METAMORPHIC"
+                    self.output.append(f"    ; Metamorphic return site: write return address into instruction bytes")
+                    if self.use_32bit:
+                        # 32-bit: mov edx, imm32 is 5 bytes: BA (opcode) + 4 bytes immediate
+                        # Offset is +1 (after opcode BA)
+                        self.output.append(f"    LEA {self.reg_rax}, [{metamorphic_label}+1]  ; Address of immediate value in mov edx, 0xdeadbeef")
+                        self.output.append(f"    LEA {self.reg_rdx}, [{return_site_label}]  ; Get return address")
+                        self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address to instruction bytes")
+                    else:
+                        # NASM optimizes mov rdx, 0xdeadbeef to 32-bit move (5 bytes: BA + 4 bytes immediate)
+                        # Offset is +1 (after opcode BA)
+                        self.output.append(f"    LEA {self.reg_rax}, [rel {metamorphic_label}+1]  ; Address of immediate value in mov rdx, 0xdeadbeef")
+                        self.output.append(f"    LEA {self.reg_rdx}, [rel {return_site_label}]  ; Get return address")
+                        self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address to instruction bytes (32-bit, like example)")
+                    self.output.append(f"    JMP FUNC_{func_name}  ; Jump to function")
+                else:
+                    # Standard call
+                    self.output.append(f"    CALL FUNC_{func_name}")
         
-        # Return site label (without alignment for better performance)
-        # The quantized call-back optimization is not currently used, so skip alignment
+        # Place return site after call (quantized call-back with 16-byte alignment)
         if return_site_label:
-            self.output.append(f"{return_site_label}:")
+            self.output.append(f"    ALIGN {self.alignment}")
+            self.output.append(f"{return_site_label}:  ; Quantized call-back (16-byte aligned)")
+            # Calculate offset from base (fits in single byte since aligned to 16 bytes)
+            offset_byte = (len(self.return_sites) - 1)
+            self.output.append(f"    ; Return site offset: {offset_byte} (stored in single byte)")
     
     def _generate_expression(self, expr):
         """Generate code for an expression (simplified)."""
@@ -1209,7 +1394,12 @@ class CodeGenerator:
                             break
                     
                     if is_array:
-                        self.output.append(f"    MOV {self.reg_rax}, GLOBAL_{name}  ; Load array address")
+                        # Load array address - use position-independent addressing in 64-bit mode
+                        if self.use_32bit:
+                            self.output.append(f"    MOV {self.reg_rax}, GLOBAL_{name}  ; Load array address")
+                        else:
+                            # Use RIP-relative addressing for position-independent code
+                            self.output.append(f"    LEA {self.reg_rax}, [rel GLOBAL_{name}]  ; Load array address (PIC)")
                     else:
                         self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load global variable")
                 elif self.asm_parser and self.asm_parser.has_symbol(name):

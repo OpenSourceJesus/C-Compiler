@@ -8,17 +8,27 @@
 char msg[] = "Hello World!\n";
 
 /* Function to make write syscall - compiler will detect this pattern and generate syscall code */
-#ifndef GCC
-void sys_write(int fd, char *buf, int len) {
+#ifdef GCC
+#define print printf
+#else
+void print(char *fmt, char *msg) {
     /* Empty body - compiler will generate syscall code */
 }
 #endif
 
+void a ()
+{
+    b ();
+    return;
+}
+
+void b ()
+{
+    print("%s", msg);
+    return;
+}
+
 int main() {
-#ifdef GCC
-    printf("%s", msg);
-#else
-    sys_write(1, msg, 13);  /* 1 = stdout, msg = string, 13 = length */
-#endif
+    a ();
     return 0;
 }
