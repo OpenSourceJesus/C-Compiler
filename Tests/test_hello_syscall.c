@@ -27,6 +27,12 @@ void b ()
 }
 
 int main() {
-    a ();
+    volatile int iterations = 1000000;  /* 1 million iterations */
+    
+    /* Loop to test actual execution time, not just startup */
+    for (int i = 0; i < iterations; i++) {
+        a ();
+    }
+    
     return 0;
 }

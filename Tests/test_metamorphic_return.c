@@ -35,7 +35,13 @@ void print(char *fmt, char *msg) {
 #endif
 
 int main() {
-    overwrite_msg();  /* Call function that overwrites msg - tests metamorphic return sites */
+    volatile int iterations = 1000000;  /* 1 million iterations */
+    
+    /* Loop to test actual execution time, not just startup */
+    for (int i = 0; i < iterations; i++) {
+        overwrite_msg();  /* Call function that overwrites msg - tests metamorphic return sites */
+    }
+    
     print("%s", msg);
     return 0;
 }

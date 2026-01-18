@@ -274,7 +274,7 @@ def find_linker_scripts(directory):
     
     return linker_scripts
 
-def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O3', iterations=DEFAULT_ITERATIONS):
+def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O3', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True):
     """Compile a single file or folder and run benchmarks.
     
     Args:
@@ -284,6 +284,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         use_32bit: If True, compile in 32-bit mode with -m32 flag
         opt_level: GCC optimization level (e.g., '-O2', '-O3', '-Os')
         iterations: Number of benchmark iterations to run
+        enable_metamorphic_return_sites: If True, enable metamorphic return sites optimization
     """
     test_path = Path(test_path).resolve()
     script_dir = Path(__file__).parent.absolute()
@@ -309,17 +310,17 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             c_files = [str(test_path)]
         else:
             print(f"Error: {test_path} is not a .c file")
-            return False
+            return {'success': False}
     elif test_path.is_dir():
         # Recursively find all .c files in directory and subdirectories
         try:
             c_files = find_c_files(test_path)
             if not c_files:
                 print(f"Error: No .c files found in {test_path}")
-                return False
+                return {'success': False}
         except Exception as e:
             print(f"Error finding C files: {e}")
-            return False
+            return {'success': False}
         
         # Recursively find all assembly files (.S and .s)
         try:
@@ -556,10 +557,10 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                         print(f"   Errors from stdout:")
                         for error_line in error_lines[:10]:
                             print(f"   {error_line}")
-                return False
+                return {'success': False}
         
         if not gcc_compiled:
-            return False
+            return {'success': False}
     except FileNotFoundError:
         print("Error: gcc not found")
         return False
@@ -590,6 +591,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     compiler_cmd = [python_cmd, 'compiler.py', input_path, '-o', str(custom_asm_file), '--no-assemble']
     if use_32bit:
         compiler_cmd.append('--32-bit')
+    if not enable_metamorphic_return_sites:
+        compiler_cmd.append('--no-metamorphic-return-sites')
     
     try:
         result = subprocess.run(
@@ -792,7 +795,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         print("  Average time: ERROR - Could not measure")
     print(f"  Executable size: {gcc_size} bytes")
     print()
-    print("Custom Compiler:")
+    print(f"Custom Compiler (metamorphic return sites: {'enabled' if enable_metamorphic_return_sites else 'disabled'}):")
     if custom_avg is not None:
         print(f"  Average time:  {custom_avg['avg']:18.15f} seconds")
     else:
@@ -833,7 +836,15 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     # Create visualizations
     visualize_results(gcc_avg, custom_avg, gcc_size, custom_size, opt_level)
     
-    return True
+    # Return results for comparison
+    return {
+        'success': True,
+        'gcc_avg': gcc_avg,
+        'custom_avg': custom_avg,
+        'gcc_size': gcc_size,
+        'custom_size': custom_size,
+        'metamorphic_enabled': enable_metamorphic_return_sites
+    }
 
 def main():
     """Main benchmark function."""
@@ -925,11 +936,73 @@ def main():
         print(f"Excluding files matching: {', '.join(exclude_patterns)}")
     if use_32bit:
         print("Compilation mode: 32-bit")
+    print()
     
-    success = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations)
+    # Run benchmark with metamorphic return sites enabled
+    print("=" * 70)
+    print("Running benchmark WITH metamorphic return sites")
+    print("=" * 70)
+    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True)
     
-    if not success:
+    if not result_with or not result_with.get('success', False):
+        print("Error: Benchmark with metamorphic return sites failed")
         sys.exit(1)
+    
+    print()
+    print("=" * 70)
+    print("Running benchmark WITHOUT metamorphic return sites")
+    print("=" * 70)
+    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False)
+    
+    if not result_without or not result_without.get('success', False):
+        print("Error: Benchmark without metamorphic return sites failed")
+        sys.exit(1)
+    
+    # Compare results
+    print()
+    print("=" * 70)
+    print("Comparison: Metamorphic Return Sites ON vs OFF")
+    print("=" * 70)
+    
+    if result_with.get('custom_avg') and result_without.get('custom_avg'):
+        with_avg = result_with['custom_avg']['avg']
+        without_avg = result_without['custom_avg']['avg']
+        
+        if with_avg > 0 and without_avg > 0:
+            speedup_ratio = without_avg / with_avg
+            time_diff = with_avg - without_avg
+            percent_change = ((with_avg - without_avg) / without_avg) * 100
+            
+            print(f"With metamorphic return sites:    {with_avg:18.15f} seconds")
+            print(f"Without metamorphic return sites: {without_avg:18.15f} seconds")
+            print(f"Speedup ratio (WITH/WITHOUT):     {speedup_ratio:.15f}x")
+            print(f"Time difference:                  {time_diff:+.15f} seconds")
+            
+            if with_avg < without_avg:
+                print(f"  -> Metamorphic return sites make code {abs(percent_change):.2f}% FASTER")
+            else:
+                print(f"  -> Metamorphic return sites make code {abs(percent_change):.2f}% SLOWER")
+        
+        # Size comparison
+        with_size = result_with.get('custom_size', 0)
+        without_size = result_without.get('custom_size', 0)
+        if with_size > 0 and without_size > 0:
+            size_diff = with_size - without_size
+            size_ratio = with_size / without_size
+            percent_size_change = ((with_size - without_size) / without_size) * 100
+            
+            print()
+            print(f"With metamorphic return sites:    {with_size} bytes")
+            print(f"Without metamorphic return sites: {without_size} bytes")
+            print(f"Size difference:                  {size_diff:+d} bytes")
+            print(f"Size ratio (WITH/WITHOUT):        {size_ratio:.15f}x")
+            
+            if with_size < without_size:
+                print(f"  -> Metamorphic return sites make code {abs(percent_size_change):.2f}% SMALLER")
+            else:
+                print(f"  -> Metamorphic return sites make code {abs(percent_size_change):.2f}% LARGER")
+    
+    print()
 
 if __name__ == '__main__':
     main()

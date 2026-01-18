@@ -102,12 +102,18 @@ void test_func7(void) {
 }
 
 int main(void) {
-    test_func1(1);
-    test_func2();
-    test_func3();
-    test_func4();
-    test_func5();
-    test_func6();
-    test_func7();
+    volatile int iterations = 1000000;  /* 1 million iterations */
+    
+    /* Loop to test actual execution time, not just startup */
+    for (int i = 0; i < iterations; i++) {
+        test_func1(1);
+        test_func2();
+        test_func3();
+        test_func4();
+        test_func5();
+        test_func6();
+        test_func7();
+    }
+    
     return 0;
 }

@@ -30,11 +30,12 @@ def safe_str(obj):
 class CodeGenerator:
     """Code generator with indexed-jump, metamorphic return sites, quantized call-backs, and SIMD bit-packing."""
     
-    def __init__(self, function_data, global_var_data=None, asm_parser=None, use_32bit=False):
+    def __init__(self, function_data, global_var_data=None, asm_parser=None, use_32bit=False, enable_metamorphic_return_sites=True):
         self.function_data = function_data
         self.global_var_data = global_var_data or {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
         self.asm_parser = asm_parser  # Assembly parser for external symbols
         self.use_32bit = use_32bit  # 32-bit mode flag
+        self.enable_metamorphic_return_sites = enable_metamorphic_return_sites  # Enable/disable metamorphic return sites
         self.output = []
         self.small_functions = []
         self.function_offsets = {}
@@ -196,7 +197,7 @@ class CodeGenerator:
             if has_main:
                 # Check if main has single return (metamorphic return site)
                 main_info = self.function_data.get("main", {})
-                if main_info.get('has_single_return', False):
+                if self.enable_metamorphic_return_sites and main_info.get('has_single_return', False):
                     # Use metamorphic return site for main
                     return_site_label = "__after_main"
                     metamorphic_label = "FUNC_main_METAMORPHIC"
@@ -871,7 +872,7 @@ class CodeGenerator:
                     # No epilogue needed - syscall doesn't modify stack
                     
                     # Use metamorphic return site if function has single return
-                    if info.get('has_single_return', False):
+                    if self.enable_metamorphic_return_sites and info.get('has_single_return', False):
                         # Metamorphic return site for syscall function
                         # Generate a label for the metamorphic return site (if not already generated)
                         if func_name not in self.metamorphic_labels:
@@ -902,7 +903,7 @@ class CodeGenerator:
             if not has_any_return:
                 # Generate implicit return (fall-through case)
                 # Use metamorphic return site if function has single return (implicit)
-                if info.get('has_single_return', False):
+                if self.enable_metamorphic_return_sites and info.get('has_single_return', False):
                     # Metamorphic return site for implicit return
                     # Generate a label for the metamorphic return site (if not already generated)
                     if func_name not in self.metamorphic_labels:
@@ -977,7 +978,7 @@ class CodeGenerator:
     
     def _generate_return(self, ret_stmt, func_name, info):
         """Generate return statement with metamorphic return site optimization."""
-        if info.get('has_single_return', False):
+        if self.enable_metamorphic_return_sites and info.get('has_single_return', False):
             # Metamorphic return site: return address is embedded in instruction bytes
             # Generate a label for the metamorphic return site
             if func_name not in self.metamorphic_labels:
@@ -1224,7 +1225,7 @@ class CodeGenerator:
         
         # Handle return site for single-return functions (quantized call-back)
         return_site_label = None
-        if callee_info.get('has_single_return', False):
+        if self.enable_metamorphic_return_sites and callee_info.get('has_single_return', False):
             # Generate quantized call-back label (will be placed after the call)
             return_site_label = f"RET_SITE_{caller_func_name}_{self.return_site_index}"
             self.return_site_index += 1
@@ -1282,7 +1283,7 @@ class CodeGenerator:
                         self.output.append(f"    MOV R11, {func_idx}  ; Function index (preserve RDI for arguments)")
                     
                     # Write return address to instruction bytes for metamorphic return sites
-                    if callee_info.get('has_single_return', False) and return_site_label:
+                    if self.enable_metamorphic_return_sites and callee_info.get('has_single_return', False) and return_site_label:
                         metamorphic_label = f"FUNC_{func_name}_METAMORPHIC"
                         self.output.append(f"    ; Metamorphic return site: write return address into instruction bytes")
                         if self.use_32bit:
@@ -1300,7 +1301,7 @@ class CodeGenerator:
                     self.output.append(f"    CALL FUNC_{func_name}")
             else:
                 # Standard call or call with metamorphic return
-                if callee_info.get('has_single_return', False) and return_site_label:
+                if self.enable_metamorphic_return_sites and callee_info.get('has_single_return', False) and return_site_label:
                     # Metamorphic return site: write return address directly into instruction bytes
                     # The callee has: mov rdx, 0xdeadbeef; jmp rdx
                     # We need to write the return address to the immediate value location

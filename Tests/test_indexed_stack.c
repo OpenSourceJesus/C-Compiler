@@ -29,8 +29,16 @@ int test_multiple_slots() {
 }
 
 int main() {
-    int result1 = test_local_vars();
-    int result2 = test_stack_operations(10, 20);
-    int result3 = test_multiple_slots();
-    return result1 + result2 + result3;
+    volatile int iterations = 1000000;  /* 1 million iterations */
+    volatile int result = 0;
+    
+    /* Loop to test actual execution time, not just startup */
+    for (int i = 0; i < iterations; i++) {
+        int result1 = test_local_vars();
+        int result2 = test_stack_operations(10, 20);
+        int result3 = test_multiple_slots();
+        result += result1 + result2 + result3;
+    }
+    
+    return result % 256;  /* Modulo to keep return value in valid range */
 }
