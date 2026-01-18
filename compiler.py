@@ -386,12 +386,19 @@ def main():
 				print(f"Warning: Failed to parse assembly files: {e}", file=sys.stderr)
 				asm_parser = None
 	elif input_path.is_file():
-		# Look for assembly files in the same directory as the C file
+		# For single C files, only look for assembly files with the same base name
+		# (e.g., test.c looks for test.S or test.s in the same directory)
+		# Don't recursively search parent directories
 		asm_dir = input_path.parent
-		asm_files = find_asm_files(asm_dir)
+		base_name = input_path.stem
+		asm_files = []
+		for ext in ['.S', '.s']:  # Only GAS format, not .asm (our NASM output)
+			potential_asm = asm_dir / (base_name + ext)
+			if potential_asm.exists():
+				asm_files.append(str(potential_asm))
 		if asm_files:
 			if args.verbose:
-				print(f"Found {len(asm_files)} assembly file(s) in directory:", file=sys.stderr)
+				print(f"Found {len(asm_files)} assembly file(s) for {input_path.name}:", file=sys.stderr)
 				for asm_file in asm_files:
 					print(f"  {asm_file}", file=sys.stderr)
 			try:

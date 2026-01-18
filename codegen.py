@@ -153,9 +153,13 @@ class CodeGenerator:
         self.output.append("SECTION .text")
         self.output.append("")
         
+        # Check if _start is already defined in assembly files
+        has_external_start = self.asm_parser and self.asm_parser.has_symbol('_start')
+        
         # Export all function symbols as global so they can be linked with external assembly files
         self.output.append("; Export functions as global symbols for linking")
-        self.output.append("GLOBAL _start  ; Entry point")
+        if not has_external_start:
+            self.output.append("GLOBAL _start  ; Entry point")
         all_function_names = set()
         for func in small_funcs + large_funcs:
             func_name = func.decl.name if func.decl else None
@@ -165,42 +169,44 @@ class CodeGenerator:
             self.output.append(f"GLOBAL FUNC_{func_name}")
         self.output.append("")
         
-        # Generate main entry point
-        self.output.append("; Program entry point")
-        self.output.append("_start:")
-        
-        # Ensure stack is 16-byte aligned (required for x86-64 ABI)
-        # RSP is already set by the kernel, but we align it to be safe
-        self.output.append("    ; Align stack to 16 bytes (x86-64 ABI requirement)")
-        if self.use_32bit:
-            self.output.append(f"    AND {self.reg_rsp}, 0xFFFFFFF0  ; Align to 16-byte boundary (32-bit)")
-        else:
-            self.output.append(f"    AND {self.reg_rsp}, 0xFFFFFFFFFFFFFFF0  ; Align to 16-byte boundary")
-        
-        # Initialize SIMD bit-packing if needed
-        if self.global_var_data['packed_vars']:
-            self.output.append("    CALL _init_simd_packing  ; Initialize SIMD bit-packing")
-        
-        # Call main function if it exists
-        has_main = any(
-            (f.decl.name if f.decl else "unknown") == "main"
-            for f in small_funcs + large_funcs
-        )
-        if has_main:
-            self.output.append("    CALL FUNC_main  ; Call main function")
-            self.output.append(f"    ; Main return value is in {self.reg_rax}, save it for exit")
-            self.output.append(f"    MOV {self.reg_rdi}, {self.reg_rax}  ; Save return value to {self.reg_rdi} (exit code)")
-        else:
-            self.output.append(f"    MOV {self.reg_rdi}, 0   ; No main function, exit with code 0")
-        
-        # Exit with return code from main (in RDI)
-        self.output.append("    ; Exit system call (sys_exit)")
-        if self.use_32bit:
-            self.output.append(f"    MOV {self.reg_rax}, 1  ; sys_exit (32-bit)")
-        else:
-            self.output.append(f"    MOV {self.reg_rax}, 60  ; sys_exit")
-        self.output.append("    INT 0x80" if self.use_32bit else "    SYSCALL")
-        self.output.append("")
+        # Only generate _start if not already defined in assembly files
+        if not has_external_start:
+            # Generate main entry point
+            self.output.append("; Program entry point")
+            self.output.append("_start:")
+            
+            # Ensure stack is 16-byte aligned (required for x86-64 ABI)
+            # RSP is already set by the kernel, but we align it to be safe
+            self.output.append("    ; Align stack to 16 bytes (x86-64 ABI requirement)")
+            if self.use_32bit:
+                self.output.append(f"    AND {self.reg_rsp}, 0xFFFFFFF0  ; Align to 16-byte boundary (32-bit)")
+            else:
+                self.output.append(f"    AND {self.reg_rsp}, 0xFFFFFFFFFFFFFFF0  ; Align to 16-byte boundary")
+            
+            # Initialize SIMD bit-packing if needed
+            if self.global_var_data['packed_vars']:
+                self.output.append("    CALL _init_simd_packing  ; Initialize SIMD bit-packing")
+            
+            # Call main function if it exists
+            has_main = any(
+                (f.decl.name if f.decl else "unknown") == "main"
+                for f in small_funcs + large_funcs
+            )
+            if has_main:
+                self.output.append("    CALL FUNC_main  ; Call main function")
+                self.output.append(f"    ; Main return value is in {self.reg_rax}, save it for exit")
+                self.output.append(f"    MOV {self.reg_rdi}, {self.reg_rax}  ; Save return value to {self.reg_rdi} (exit code)")
+            else:
+                self.output.append(f"    MOV {self.reg_rdi}, 0   ; No main function, exit with code 0")
+            
+            # Exit with return code from main (in RDI)
+            self.output.append("    ; Exit system call (sys_exit)")
+            if self.use_32bit:
+                self.output.append(f"    MOV {self.reg_rax}, 1  ; sys_exit (32-bit)")
+            else:
+                self.output.append(f"    MOV {self.reg_rax}, 60  ; sys_exit")
+            self.output.append("    INT 0x80" if self.use_32bit else "    SYSCALL")
+            self.output.append("")
         
         # Generate small functions with indexed-jump support
         if small_funcs:
@@ -754,6 +760,7 @@ class CodeGenerator:
         # Reset stack tracking for this function
         self.current_function_stack = {}
         self.current_stack_slots = 0
+        self.current_stack_offset = 0  # Track cumulative byte offset from RBP
         # Reset function pointer tracking
         self.saved_fp_in_rbx = False
         self.fp_in_rax = False
@@ -1286,7 +1293,12 @@ class CodeGenerator:
         elif op.op == '*':
             self.output.append(f"    MUL {self.reg_rbx}")
         elif op.op == '/':
-            self.output.append(f"    DIV {self.reg_rbx}")
+            # Division: RAX = RBX / RAX (note: operands need swapping)
+            # DIV divides RDX:RAX by operand, result in RAX, remainder in RDX
+            self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save divisor")
+            self.output.append(f"    MOV {self.reg_rax}, {self.reg_rbx}  ; Dividend to RAX")
+            self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear RDX for unsigned division")
+            self.output.append(f"    DIV {self.reg_rcx}  ; RAX = RAX / RCX")
         elif op.op == '==':
             self.output.append(f"    CMP {self.reg_rax}, {self.reg_rbx}")
             self.output.append("    SETE AL")
@@ -1379,6 +1391,31 @@ class CodeGenerator:
     
     def _generate_unary_op(self, op):
         """Generate code for unary operation."""
+        # Handle address-of operator FIRST (before generating expression)
+        # because &var should NOT load the value first
+        if op.op == '&':
+            # Address-of: &var
+            if isinstance(op.expr, c_ast.ID):
+                name = op.expr.name
+                # Check if it's a global variable
+                globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                if name in globals:
+                    # Global variable address
+                    self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Address of global variable")
+                else:
+                    # Local variable address - use LEA with RBP offset
+                    if name in self.current_function_stack:
+                        slot_index, offset = self.current_function_stack[name]
+                        stack_offset = (slot_index + 1) * 8 + offset  # Match _generate_local_var_load
+                        self.output.append(f"    LEA RAX, [{self.reg_rbp} - {stack_offset}]  ; Address of local variable {name}")
+                    else:
+                        self.output.append(f"    ; Warning: variable {name} not found for address-of")
+            else:
+                # Complex expression - generate and use as address
+                self._generate_expression(op.expr)
+            return  # Early return for address-of
+        
+        # For other unary ops, generate the expression first
         self._generate_expression(op.expr)
         if op.op == '-':
             self.output.append(f"    NEG {self.reg_rax}")
@@ -1388,29 +1425,6 @@ class CodeGenerator:
             # Pointer dereference: *ptr
             self.output.append("    ; Pointer dereference: *ptr")
             self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax}]  ; Load value at address in {self.reg_rax}")
-        elif op.op == '&':
-            # Address-of: &var
-            # Handle address-of operator
-            if isinstance(op.expr, c_ast.ID):
-                name = op.expr.name
-                # Check if it's a global variable
-                globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
-                if name in globals:
-                    # Global variable address
-                    self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Address of global variable")
-                else:
-                    # Local variable address
-                    if name in self.current_function_stack:
-                        slot_index, offset = self.current_function_stack[name]
-                        displacement = slot_index * self.stack_slot_size + offset
-                        self.output.append(f"    MOV RAX, {self.stack_base_register}")
-                        if displacement > 0:
-                            self.output.append(f"    ADD RAX, {displacement}")
-                    else:
-                        self.output.append(f"    ; Warning: variable {name} not found for address-of")
-            else:
-                # Complex expression - generate and use as address
-                self._generate_expression(op.expr)
         elif op.op == '~':
             # Bitwise NOT: ~expr
             self.output.append("    ; Bitwise NOT: ~expr")
@@ -1439,17 +1453,11 @@ class CodeGenerator:
                     if name in globals:
                         self.output.append(f"    MOV [GLOBAL_{name}], {self.reg_rax}")
                     else:
-                        # Store to local
-                        self.output.append(f"    PUSH {self.reg_rax}")
-                        # We need to get the address to store
+                        # Store to local - use RBP-based addressing
                         if name in self.current_function_stack:
                             slot_index, offset = self.current_function_stack[name]
-                            displacement = slot_index * self.stack_slot_size + offset
-                            self.output.append(f"    MOV {self.reg_rbx}, {self.stack_base_register}")
-                            if displacement > 0:
-                                self.output.append(f"    ADD {self.reg_rbx}, {displacement}")
-                            self.output.append(f"    POP {self.reg_rax}")
-                            self.output.append(f"    MOV [{self.reg_rbx}], {self.reg_rax}")
+                            stack_offset = (slot_index + 1) * 8 + offset
+                            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
                 self.output.append(f"    POP {self.reg_rax}  ; Return original value")
         elif op.op == 'p--':
             # Post-decrement: var--
@@ -1475,15 +1483,11 @@ class CodeGenerator:
                     if name in globals:
                         self.output.append(f"    MOV [GLOBAL_{name}], {self.reg_rax}")
                     else:
+                        # Store to local - use RBP-based addressing
                         if name in self.current_function_stack:
                             slot_index, offset = self.current_function_stack[name]
-                            displacement = slot_index * self.stack_slot_size + offset
-                            self.output.append(f"    PUSH {self.reg_rax}")
-                            self.output.append(f"    MOV {self.reg_rbx}, {self.stack_base_register}")
-                            if displacement > 0:
-                                self.output.append(f"    ADD {self.reg_rbx}, {displacement}")
-                            self.output.append(f"    POP {self.reg_rax}")
-                            self.output.append(f"    MOV [{self.reg_rbx}], {self.reg_rax}")
+                            stack_offset = (slot_index + 1) * 8 + offset
+                            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
                 self.output.append(f"    POP {self.reg_rax}  ; Return original value")
         elif op.op == '++':
             # Pre-increment: ++var
@@ -1503,15 +1507,11 @@ class CodeGenerator:
                     else:
                         self._generate_local_var_load(name)
                         self.output.append(f"    INC {self.reg_rax}")
+                        # Store to local - use RBP-based addressing
                         if name in self.current_function_stack:
                             slot_index, offset = self.current_function_stack[name]
-                            displacement = slot_index * self.stack_slot_size + offset
-                            self.output.append(f"    PUSH {self.reg_rax}")
-                            self.output.append(f"    MOV {self.reg_rbx}, {self.stack_base_register}")
-                            if displacement > 0:
-                                self.output.append(f"    ADD {self.reg_rbx}, {displacement}")
-                            self.output.append(f"    POP {self.reg_rax}")
-                            self.output.append(f"    MOV [{self.reg_rbx}], {self.reg_rax}")
+                            stack_offset = (slot_index + 1) * 8 + offset
+                            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
         elif op.op == '--':
             # Pre-decrement: --var
             if isinstance(op.expr, c_ast.ID):
@@ -1530,15 +1530,11 @@ class CodeGenerator:
                     else:
                         self._generate_local_var_load(name)
                         self.output.append(f"    DEC {self.reg_rax}")
+                        # Store to local - use RBP-based addressing
                         if name in self.current_function_stack:
                             slot_index, offset = self.current_function_stack[name]
-                            displacement = slot_index * self.stack_slot_size + offset
-                            self.output.append(f"    PUSH {self.reg_rax}")
-                            self.output.append(f"    MOV {self.reg_rbx}, {self.stack_base_register}")
-                            if displacement > 0:
-                                self.output.append(f"    ADD {self.reg_rbx}, {displacement}")
-                            self.output.append(f"    POP {self.reg_rax}")
-                            self.output.append(f"    MOV [{self.reg_rbx}], {self.reg_rax}")
+                            stack_offset = (slot_index + 1) * 8 + offset
+                            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
     
     def _generate_array_ref(self, arr_ref):
         """Generate code for array indexing: arr[index]"""
@@ -1729,16 +1725,36 @@ class CodeGenerator:
                     self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Base address of struct")
                 else:
                     if name in self.current_function_stack:
+                        # Use LEA with RBP-based addressing (not the old R12-based)
                         slot_index, offset = self.current_function_stack[name]
-                        displacement = slot_index * self.stack_slot_size + offset
-                        self.output.append(f"    MOV RAX, {self.stack_base_register}")
-                        if displacement > 0:
-                            self.output.append(f"    ADD RAX, {displacement}")
+                        stack_offset = (slot_index + 1) * 8 + offset  # Match _generate_local_var_load
+                        self.output.append(f"    LEA RAX, [{self.reg_rbp} - {stack_offset}]  ; Base address of local struct {name}")
             else:
                 self._generate_expression(struct_ref.name)
         elif struct_type == '->':
-            self._generate_expression(struct_ref.name)
-            self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax}]  ; Load pointer value")
+            # Pointer member access: p->member
+            # Generate expression for the pointer - this gives us the address directly
+            # For parameters, the value IS the pointer (no extra dereference needed)
+            # For local variables that hold pointers, we need to load the pointer value
+            if isinstance(struct_ref.name, c_ast.ID):
+                name = struct_ref.name.name
+                if name in self.function_parameters:
+                    # Parameter: the register already contains the pointer value
+                    param_reg = self.function_parameters[name]
+                    self.output.append(f"    MOV {self.reg_rax}, {param_reg}  ; Get struct pointer {name}")
+                elif name in self.current_function_stack:
+                    # Local variable holding a pointer: load the pointer value
+                    self._generate_local_var_load(name)
+                    # RAX now contains the pointer value - no extra dereference needed
+                else:
+                    # Global pointer
+                    self._generate_expression(struct_ref.name)
+                    self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax}]  ; Load pointer value from global")
+            else:
+                # Complex expression - generate it and dereference if needed
+                self._generate_expression(struct_ref.name)
+                # For complex expressions (like function return values), assume it's already the pointer
+                # Only dereference if we're loading from a stored pointer variable
         else:
             if isinstance(struct_ref.name, c_ast.StructRef):
                 self._generate_struct_ref(struct_ref.name)
@@ -1848,7 +1864,10 @@ class CodeGenerator:
                         self.output.append(f"    ADD {self.reg_rax}, {member_offset}")
                 
                 # Save member address
-                self.output.append(f"    PUSH {self.reg_rax}  ; Save member address")
+                self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Save member address in RBX")
+                # Load current value from member
+                self.output.append(f"    MOV EAX, DWORD [{self.reg_rbx}]  ; Load current value from member")
+                self.output.append(f"    PUSH {self.reg_rbx}  ; Save member address for later store")
             else:
                 # Complex lvalue - generate expression
                 self._generate_expression(assign.lvalue)
@@ -1895,8 +1914,14 @@ class CodeGenerator:
             elif base_op == '^':
                 self.output.append(f"    XOR {self.reg_rax}, {self.reg_rbx}")
             
-            # Now assign the result (fall through to regular assignment)
-            # We'll handle the assignment below
+            # Now assign the result
+            # For struct members, we already pushed the address - pop it and store
+            if isinstance(assign.lvalue, c_ast.StructRef):
+                self.output.append(f"    POP {self.reg_rbx}  ; Get member address back")
+                self.output.append(f"    MOV DWORD [{self.reg_rbx}], EAX  ; Store result to member")
+                return  # Done with compound struct assignment
+            
+            # For non-struct lvalues, fall through to regular assignment
             assign.op = '='  # Change to regular assignment
             # Continue with regular assignment handling
         
@@ -1967,6 +1992,9 @@ class CodeGenerator:
                     # Store the value
                     self.output.append(f"    MOV DWORD [{self.reg_rbx}], EAX  ; Store to struct member {member_name}")
             elif isinstance(assign.lvalue, c_ast.ID):
+                # Generate the rvalue expression first
+                self._generate_expression(assign.rvalue)
+                
                 name = assign.lvalue.name
                 # Check if this is a packed global variable
                 if name in self.global_var_data['bit_positions']:
@@ -1987,7 +2015,8 @@ class CodeGenerator:
                         self._generate_local_var_store(name)
             elif isinstance(assign.lvalue, c_ast.ArrayRef):
                 # Array assignment: arr[index] = value
-                # Value is already in RAX
+                # First generate the rvalue
+                self._generate_expression(assign.rvalue)
                 self.output.append(f"    PUSH {self.reg_rax}  ; Save value to assign")
                 
                 # Generate index
@@ -2202,13 +2231,52 @@ class CodeGenerator:
                 # Can't process declaration without a valid name
                 return
         
-        # Allocate stack space for the variable (standard GCC-style)
-        slot_index = self.current_stack_slots
-        self.current_stack_slots += 1
+        # Calculate size based on type
+        var_size = 8  # Default size for primitives
+        if hasattr(decl, 'type'):
+            type_node = decl.type
+            # Check for struct type - walk down to find the actual type
+            while type_node:
+                if hasattr(type_node, 'type'):
+                    inner_type = type_node.type
+                    # Check if inner_type is a Struct (has 'name' attribute but no 'names')
+                    if hasattr(inner_type, 'name') and not hasattr(inner_type, 'names'):
+                        # Struct type - look up size
+                        struct_name = inner_type.name
+                        struct_sizes = {
+                            'Point': 8,      # 2 ints
+                            'Rectangle': 16, # 4 ints
+                            'Inner': 16,     # estimate
+                            'Middle': 32,    # estimate
+                            'Outer': 64,     # estimate
+                        }
+                        var_size = struct_sizes.get(struct_name, 8)
+                        break
+                    type_node = inner_type
+                else:
+                    break
         
-        # Store variable location: (slot_index, offset_within_slot)
-        # For simplicity, we'll use offset 0 within each slot
-        # Multiple small variables could share a slot, but for now one per slot
+        # Round up size to 8-byte alignment
+        var_size = ((var_size + 7) // 8) * 8
+        
+        # Track stack allocation in bytes (not slots)
+        # current_stack_offset tracks cumulative bytes allocated from RBP
+        if not hasattr(self, 'current_stack_offset'):
+            self.current_stack_offset = 0
+        
+        # Allocate stack space for this variable
+        self.current_stack_offset += var_size
+        
+        # Store variable location as (byte_offset, var_size)
+        # The byte_offset is the distance from RBP to the variable's start
+        # We store it in slot_index position; the load function will use it directly
+        # To make the existing formula (slot_index + 1) * 8 + offset work:
+        # We want result = current_stack_offset
+        # (slot_index + 1) * 8 + offset = current_stack_offset
+        # Set slot_index = (current_stack_offset / 8) - 1, offset = 0
+        # But this only works for 8-byte aligned offsets
+        slot_index = (self.current_stack_offset // 8) - 1
+        self.current_stack_slots = self.current_stack_offset // 8  # Keep in sync
         self.current_function_stack[name] = (slot_index, 0)
         
         # Mark that this function needs stack frame
@@ -2218,9 +2286,8 @@ class CodeGenerator:
             self.output.append(f"    PUSH {self.reg_rbp}  ; Save old frame pointer")
             self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
         
-        # Allocate 8 bytes on stack for this variable (standard size for integers)
-        # We'll allocate incrementally for simplicity (could optimize to allocate all at once)
-        self.output.append(f"    SUB {self.reg_rsp}, 8  ; Allocate stack space for {name}")
+        # Allocate appropriate stack space for this variable
+        self.output.append(f"    SUB {self.reg_rsp}, {var_size}  ; Allocate stack space for {name}")
         
         if decl.init:
             self._generate_expression(decl.init)
