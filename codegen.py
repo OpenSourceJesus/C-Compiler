@@ -1085,49 +1085,14 @@ class CodeGenerator:
                     self.output.append(f"    ; External function call: {func_name}")
                     self.output.append(f"    CALL FUNC_{func_name}  ; Assumed to be defined externally")
         else:
-            # Generate call based on function type
-            if callee_info.get('is_small', False):
-                # Indexed-jump call for small functions
-                func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
-                if func_idx >= 0:
-                    self.output.append(f"    ; Indexed-jump call to {func_name}")
-                    # Use R11 (scratch register) for function index to preserve argument registers
-                    if self.use_32bit:
-                        # In 32-bit, temporarily use RDI but save/restore around the call
-                        self.output.append(f"    PUSH {self.reg_rdi}  ; Save first argument")
-                        self.output.append(f"    MOV {self.reg_rdi}, {func_idx}  ; Function index")
-                        self.output.append("    CALL INDEXED_JUMP")
-                        self.output.append(f"    POP {self.reg_rdi}  ; Restore first argument")
-                    else:
-                        # In 64-bit, use R11 (scratch register) for index
-                        self.output.append(f"    MOV R11, {func_idx}  ; Function index in R11 (preserves RDI)")
-                        self.output.append("    CALL INDEXED_JUMP")
-                    
-                    # Metamorphic return site disabled - RET_ADDR_OFFSET not implemented
-                    # if callee_info.get('has_single_return', False) and return_site_label:
-                    #     self.output.append(f"    LEA RAX, [rel {return_site_label}]")
-                    #     self.output.append(f"    MOV [FUNC_{func_name}+RET_ADDR_OFFSET], RAX")
-                else:
-                    # Fallback to direct call if not in jump table
-                    self.output.append(f"    CALL FUNC_{func_name}")
-            else:
-                # Standard call or call with metamorphic return
-                # Metamorphic return site disabled - RET_ADDR_OFFSET not implemented
-                # if callee_info.get('has_single_return', False) and return_site_label:
-                #     self.output.append(f"    LEA RAX, [rel {return_site_label}]")
-                #     self.output.append(f"    MOV [FUNC_{func_name}+RET_ADDR_OFFSET], RAX")
-                #     self.output.append(f"    JMP FUNC_{func_name}")
-                # else:
-                # Standard call
-                self.output.append(f"    CALL FUNC_{func_name}")
+            # Use direct call for performance (indexed-jump adds overhead)
+            # Direct calls are faster than indirect calls through jump table
+            self.output.append(f"    CALL FUNC_{func_name}")
         
-        # Place return site after call (quantized call-back with 16-byte alignment)
+        # Return site label (without alignment for better performance)
+        # The quantized call-back optimization is not currently used, so skip alignment
         if return_site_label:
-            self.output.append(f"    ALIGN {self.alignment}")
-            self.output.append(f"{return_site_label}:  ; Quantized call-back (16-byte aligned)")
-            # Calculate offset from base (fits in single byte since aligned to 16 bytes)
-            offset_byte = (len(self.return_sites) - 1)
-            self.output.append(f"    ; Return site offset: {offset_byte} (stored in single byte)")
+            self.output.append(f"{return_site_label}:")
     
     def _generate_expression(self, expr):
         """Generate code for an expression (simplified)."""
@@ -1280,6 +1245,70 @@ class CodeGenerator:
     
     def _generate_binary_op(self, op):
         """Generate code for binary operation."""
+        # Optimize: if right operand is a small constant, use immediate operations
+        if isinstance(op.right, c_ast.Constant) and op.op in ['+', '-', '*']:
+            try:
+                const_val = int(op.right.value)
+                self._generate_expression(op.left)
+                
+                if op.op == '+':
+                    if const_val == 0:
+                        pass  # No-op
+                    else:
+                        self.output.append(f"    ADD {self.reg_rax}, {const_val}")
+                    return
+                elif op.op == '-':
+                    if const_val == 0:
+                        pass  # No-op
+                    else:
+                        self.output.append(f"    SUB {self.reg_rax}, {const_val}")
+                    return
+                elif op.op == '*':
+                    if const_val == 0:
+                        self.output.append(f"    XOR {self.reg_rax}, {self.reg_rax}")
+                    elif const_val == 1:
+                        pass  # No-op
+                    elif const_val == 2:
+                        self.output.append(f"    ADD {self.reg_rax}, {self.reg_rax}")
+                    elif const_val in [4, 8, 16, 32, 64, 128, 256]:
+                        shift = {4:2, 8:3, 16:4, 32:5, 64:6, 128:7, 256:8}[const_val]
+                        self.output.append(f"    SHL {self.reg_rax}, {shift}")
+                    else:
+                        # Use IMUL for other constants
+                        self.output.append(f"    IMUL {self.reg_rax}, {self.reg_rax}, {const_val}")
+                    return
+            except (ValueError, TypeError):
+                pass  # Fall through to general case
+        
+        # Optimize: if left operand is a constant for commutative ops, swap
+        if isinstance(op.left, c_ast.Constant) and op.op in ['+', '*']:
+            try:
+                const_val = int(op.left.value)
+                self._generate_expression(op.right)
+                
+                if op.op == '+':
+                    if const_val == 0:
+                        pass  # No-op
+                    else:
+                        self.output.append(f"    ADD {self.reg_rax}, {const_val}")
+                    return
+                elif op.op == '*':
+                    if const_val == 0:
+                        self.output.append(f"    XOR {self.reg_rax}, {self.reg_rax}")
+                    elif const_val == 1:
+                        pass  # No-op
+                    elif const_val == 2:
+                        self.output.append(f"    ADD {self.reg_rax}, {self.reg_rax}")
+                    elif const_val in [4, 8, 16, 32, 64, 128, 256]:
+                        shift = {4:2, 8:3, 16:4, 32:5, 64:6, 128:7, 256:8}[const_val]
+                        self.output.append(f"    SHL {self.reg_rax}, {shift}")
+                    else:
+                        self.output.append(f"    IMUL {self.reg_rax}, {self.reg_rax}, {const_val}")
+                    return
+            except (ValueError, TypeError):
+                pass  # Fall through to general case
+        
+        # General case: evaluate both operands
         self._generate_expression(op.left)
         self.output.append(f"    PUSH {self.reg_rax}")
         self._generate_expression(op.right)
@@ -1921,7 +1950,26 @@ class CodeGenerator:
                 self.output.append(f"    MOV DWORD [{self.reg_rbx}], EAX  ; Store result to member")
                 return  # Done with compound struct assignment
             
-            # For non-struct lvalues, fall through to regular assignment
+            # For ID lvalues, store directly (result is already in RAX)
+            if isinstance(assign.lvalue, c_ast.ID):
+                name = assign.lvalue.name
+                if name in self.global_var_data['bit_positions']:
+                    self._generate_packed_var_access(name, is_write=True, value_reg=self.reg_rax)
+                else:
+                    globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
+                    if name in globals:
+                        self.output.append(f"    MOV [GLOBAL_{name}], {self.reg_rax}")
+                    else:
+                        self._generate_local_var_store(name)
+                return  # Done with compound ID assignment
+            
+            # For ArrayRef lvalues, we need to store to the array element
+            if isinstance(assign.lvalue, c_ast.ArrayRef):
+                # Array element was already computed before, but we need to recompute for store
+                # This is inefficient but correct - could be optimized later
+                pass  # Fall through to regular assignment
+            
+            # For other non-struct lvalues, fall through to regular assignment
             assign.op = '='  # Change to regular assignment
             # Continue with regular assignment handling
         
