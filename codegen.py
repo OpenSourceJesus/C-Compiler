@@ -200,10 +200,15 @@ class CodeGenerator:
             if has_main:
                 # Check if main has single return (metamorphic return site)
                 main_info = self.function_data.get("main", {})
-                if self.enable_metamorphic_return_sites and main_info.get('has_single_return', False):
+                # Only use metamorphic return for large functions (not small ones)
+                # Small functions use normal RET since they're in the jump table
+                if self.enable_metamorphic_return_sites and main_info.get('has_single_return', False) and not main_info.get('is_small', False):
                     # Use metamorphic return site for main
                     return_site_label = "__after_main"
                     metamorphic_label = "FUNC_main_METAMORPHIC"
+                    # Register the label so it gets generated
+                    if "main" not in self.metamorphic_labels:
+                        self.metamorphic_labels["main"] = metamorphic_label
                     self.output.append("    ; Metamorphic return site: write return address into instruction bytes")
                     if self.use_32bit:
                         self.output.append(f"    LEA {self.reg_rax}, [{metamorphic_label}+1]  ; Address of immediate value")
@@ -929,7 +934,7 @@ class CodeGenerator:
                     self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
                 self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
                 if not self.use_32bit:
-                    self.output.append(f"    MOV {self.stack_base_register}, [rel STACK_BASE]  ; Load stack base")
+                    self.output.append(f"    MOV {self.stack_base_register}, 0x7FFF0000  ; Load stack base (immediate)")
                     self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
             # Allocate 8 bytes for SIMD register preservation if needed
             self.current_stack_slots = 1
@@ -959,26 +964,9 @@ class CodeGenerator:
                         self.output.append("    SYSCALL")
                     # No epilogue needed - syscall doesn't modify stack
                     
-                    # Use metamorphic return site if function has single return
-                    if self.enable_metamorphic_return_sites and info.get('has_single_return', False):
-                        # Metamorphic return site for syscall function
-                        # Generate a label for the metamorphic return site (if not already generated)
-                        if func_name not in self.metamorphic_labels:
-                            self.metamorphic_labels[func_name] = f"FUNC_{func_name}_METAMORPHIC"
-                        
-                        label_name = self.metamorphic_labels[func_name]
-                        
-                        # Metamorphic return: load return address from instruction bytes and jump
-                        # The caller will overwrite 0xdeadbeef with the actual return address
-                        self.output.append(f"{label_name}:")
-                        if self.use_32bit:
-                            self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
-                        else:
-                            self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
-                        self.output.append(f"    JMP {self.reg_rdx}  ; Jump to return address")
-                    else:
-                        # Standard return for functions with multiple returns
-                        self.output.append("    RET")
+                    # Syscall functions are typically small and called via INDEXED_JUMP,
+                    # so use normal RET instead of metamorphic return for compatibility
+                    self.output.append("    RET")
                     return
         
         # Generate function body
@@ -990,39 +978,40 @@ class CodeGenerator:
             has_any_return = block_items and any(isinstance(item, c_ast.Return) for item in block_items)
             if not has_any_return:
                 # Generate implicit return (fall-through case)
-                # Use metamorphic return site if function has single return (implicit)
-                if self.enable_metamorphic_return_sites and info.get('has_single_return', False):
-                    # Metamorphic return site for implicit return
-                    # Generate a label for the metamorphic return site (if not already generated)
-                    if func_name not in self.metamorphic_labels:
-                        self.metamorphic_labels[func_name] = f"FUNC_{func_name}_METAMORPHIC"
-                    
-                    label_name = self.metamorphic_labels[func_name]
-                    
-                    # Use minimal epilogue if no indexed stack was used
-                    if self.function_needs_indexed_stack:
-                        if self.current_stack_slots > 0:
-                            self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
-                        self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
-                        if not self.use_32bit:
-                            self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
-                            self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
-                        self.output.append(f"    POP {self.reg_rbp}")
-                    else:
-                        if self.current_stack_slots > 0:
-                            self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
-                            self.output.append(f"    POP {self.reg_rbp}")
-                    
-                    # Metamorphic return: load return address from instruction bytes and jump
-                    # The caller will overwrite 0xdeadbeef with the actual return address
-                    self.output.append(f"{label_name}:")
-                    if self.use_32bit:
-                        self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
-                    else:
-                        self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
-                    self.output.append(f"    JMP {self.reg_rdx}  ; Jump to return address")
+                # Small functions (in jump table) use normal RET since they're called via INDEXED_JUMP
+                # Use metamorphic return site if function has single return (implicit) and is not small
+                if self.enable_metamorphic_return_sites and info.get('has_single_return', False) and not info.get('is_small', False):
+                            # Metamorphic return site for implicit return
+                            # Generate a label for the metamorphic return site (if not already generated)
+                            if func_name not in self.metamorphic_labels:
+                                self.metamorphic_labels[func_name] = f"FUNC_{func_name}_METAMORPHIC"
+                            
+                            label_name = self.metamorphic_labels[func_name]
+                            
+                            # Use minimal epilogue if no indexed stack was used
+                            if self.function_needs_indexed_stack:
+                                if self.current_stack_slots > 0:
+                                    self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
+                                self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
+                                if not self.use_32bit:
+                                    self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
+                                    self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
+                                self.output.append(f"    POP {self.reg_rbp}")
+                            else:
+                                if self.current_stack_slots > 0:
+                                    self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
+                                    self.output.append(f"    POP {self.reg_rbp}")
+                            
+                            # Metamorphic return: load return address from instruction bytes and jump
+                            # The caller will overwrite 0xdeadbeef with the actual return address
+                            self.output.append(f"{label_name}:")
+                            if self.use_32bit:
+                                self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+                            else:
+                                self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+                            self.output.append(f"    JMP {self.reg_rdx}  ; Jump to return address")
                 else:
-                    # Standard implicit return (shouldn't happen if has_single_return logic is correct)
+                    # Standard implicit return for small functions or functions without single return
                     # Standard epilogue - restore RBP only if prologue was generated
                     if self.function_needs_indexed_stack or self.current_stack_slots > 0:
                         if self.current_stack_slots > 0:
@@ -1066,7 +1055,8 @@ class CodeGenerator:
     
     def _generate_return(self, ret_stmt, func_name, info):
         """Generate return statement with metamorphic return site optimization."""
-        if self.enable_metamorphic_return_sites and info.get('has_single_return', False):
+        # Small functions (in jump table) use normal RET since they're called via INDEXED_JUMP
+        if self.enable_metamorphic_return_sites and info.get('has_single_return', False) and not info.get('is_small', False):
             # Metamorphic return site: return address is embedded in instruction bytes
             # Generate a label for the metamorphic return site
             if func_name not in self.metamorphic_labels:
@@ -1370,18 +1360,9 @@ class CodeGenerator:
                     else:
                         self.output.append(f"    MOV R11, {func_idx}  ; Function index (preserve RDI for arguments)")
                     
-                    # Write return address to instruction bytes for metamorphic return sites
-                    if self.enable_metamorphic_return_sites and callee_info.get('has_single_return', False) and return_site_label:
-                        metamorphic_label = f"FUNC_{func_name}_METAMORPHIC"
-                        self.output.append(f"    ; Metamorphic return site: write return address into instruction bytes")
-                        if self.use_32bit:
-                            self.output.append(f"    LEA {self.reg_rax}, [{metamorphic_label}+1]  ; Address of immediate value")
-                            self.output.append(f"    LEA {self.reg_rdx}, [{return_site_label}]  ; Get return address")
-                            self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address")
-                        else:
-                            self.output.append(f"    LEA {self.reg_rax}, [rel {metamorphic_label}+1]  ; Address of immediate value")
-                            self.output.append(f"    LEA {self.reg_rdx}, [rel {return_site_label}]  ; Get return address")
-                            self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address (32-bit, like example)")
+                    # Don't use metamorphic return for functions called via INDEXED_JUMP
+                    # They should use normal RET to return to INDEXED_JUMP, which will then RET to caller
+                    # Metamorphic return only works for direct calls
                     
                     self.output.append("    CALL INDEXED_JUMP")
                 else:
@@ -1827,8 +1808,11 @@ class CodeGenerator:
                 # Check if it's a global variable
                 globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                 if name in globals:
-                    # Global variable address
-                    self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Address of global variable")
+                    # Global variable address - use position-independent addressing in 64-bit mode
+                    if self.use_32bit:
+                        self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Address of global variable")
+                    else:
+                        self.output.append(f"    LEA RAX, [rel GLOBAL_{name}]  ; Address of global variable (PIC)")
                 else:
                     # Local variable address - use LEA with RBP offset
                     if name in self.current_function_stack:
@@ -2194,7 +2178,11 @@ class CodeGenerator:
                 name = struct_ref.name.name
                 globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                 if name in globals:
-                    self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Base address of struct")
+                    # Base address of struct - use position-independent addressing in 64-bit mode
+                    if self.use_32bit:
+                        self.output.append(f"    MOV RAX, GLOBAL_{name}  ; Base address of struct")
+                    else:
+                        self.output.append(f"    LEA RAX, [rel GLOBAL_{name}]  ; Base address of struct (PIC)")
                 else:
                     if name in self.current_function_stack:
                         # Use LEA with RBP-based addressing (not the old R12-based)
@@ -2306,7 +2294,11 @@ class CodeGenerator:
                         name = assign.lvalue.name.name
                         globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                         if name in globals:
-                            self.output.append(f"    MOV RAX, GLOBAL_{name}")
+                            # Global array address - use position-independent addressing in 64-bit mode
+                            if self.use_32bit:
+                                self.output.append(f"    MOV RAX, GLOBAL_{name}")
+                            else:
+                                self.output.append(f"    LEA RAX, [rel GLOBAL_{name}]  ; Base address of array (PIC)")
                         else:
                             if name in self.current_function_stack:
                                 slot_index, offset = self.current_function_stack[name]
@@ -2550,8 +2542,11 @@ class CodeGenerator:
                     # Check if it's a global variable
                     globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                     if name in globals:
-                        # Global array
-                        self.output.append(f"    MOV {self.reg_rbx}, GLOBAL_{name}  ; Base address of array")
+                        # Global array - use position-independent addressing in 64-bit mode
+                        if self.use_32bit:
+                            self.output.append(f"    MOV {self.reg_rbx}, GLOBAL_{name}  ; Base address of array")
+                        else:
+                            self.output.append(f"    LEA {self.reg_rbx}, [rel GLOBAL_{name}]  ; Base address of array (PIC)")
                     else:
                         # Local array - treat as pointer
                         self._generate_local_var_load(name)
@@ -2566,16 +2561,34 @@ class CodeGenerator:
                 
                 # Calculate address: base + index * element_size
                 self.output.append(f"    ; Array assignment: base + index * {element_size}")
-                self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save index")
-                self.output.append(f"    MOV {self.reg_rax}, {element_size}  ; Size of {element_type}")
-                self.output.append(f"    MUL {self.reg_rcx}  ; {self.reg_rax} = index * {element_size}")
-                self.output.append(f"    ADD {self.reg_rax}, {self.reg_rbx}  ; {self.reg_rax} = base + offset")
+                # Use LEA with scaled addressing for small element sizes (more efficient, doesn't corrupt RDX)
+                if element_size == 1:
+                    # char: base + index * 1
+                    self.output.append(f"    LEA {self.reg_rax}, [{self.reg_rbx} + {self.reg_rax}*1]  ; base + index")
+                elif element_size == 2:
+                    # short: base + index * 2
+                    self.output.append(f"    LEA {self.reg_rax}, [{self.reg_rbx} + {self.reg_rax}*2]  ; base + index*2")
+                elif element_size == 4:
+                    # int: base + index * 4
+                    self.output.append(f"    LEA {self.reg_rax}, [{self.reg_rbx} + {self.reg_rax}*4]  ; base + index*4")
+                elif element_size == 8:
+                    # long/pointer: base + index * 8
+                    self.output.append(f"    LEA {self.reg_rax}, [{self.reg_rbx} + {self.reg_rax}*8]  ; base + index*8")
+                # Note: RBX is used for base address, but we need to preserve it if it's callee-saved
+                # For now, we'll use it as a temporary since array assignments are typically in leaf functions
+                else:
+                    # For other sizes, use MUL (but this corrupts RDX, so be careful)
+                    self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save index")
+                    self.output.append(f"    MOV {self.reg_rax}, {element_size}  ; Size of {element_type}")
+                    self.output.append(f"    MUL {self.reg_rcx}  ; {self.reg_rax} = index * {element_size}")
+                    self.output.append(f"    ADD {self.reg_rax}, {self.reg_rbx}  ; {self.reg_rax} = base + offset")
                 
                 # Store value to memory
-                self.output.append(f"    POP {self.reg_rbx}  ; Get value to assign")
+                # Use RCX instead of RBX to avoid corrupting callee-saved register
+                self.output.append(f"    POP {self.reg_rcx}  ; Get value to assign")
                 if element_size == 1:
                     # Store byte for char arrays
-                    self.output.append(f"    MOV BYTE [{self.reg_rax}], BL  ; Store byte to array element")
+                    self.output.append(f"    MOV BYTE [{self.reg_rax}], CL  ; Store byte to array element")
                 else:
                     # Store full register for int arrays
                     self.output.append(f"    MOV [{self.reg_rax}], {self.reg_rbx}  ; Store to array element")
@@ -2782,7 +2795,7 @@ class CodeGenerator:
                 self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
             self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
             if not self.use_32bit:
-                self.output.append(f"    MOV {self.stack_base_register}, [rel STACK_BASE]  ; Load stack base")
+                self.output.append(f"    MOV {self.stack_base_register}, 0x7FFF0000  ; Load stack base (immediate)")
                 self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
         
         # Allocate appropriate stack space for this variable

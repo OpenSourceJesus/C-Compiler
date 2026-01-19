@@ -92,6 +92,23 @@ def run_benchmark(executable_path, name, iterations, verbose=False):
                 print(f"   Run {i}: ERROR - Failed to execute: {e}")
             continue
         
+        # Check for segmentation fault
+        # On Linux, when a process is killed by a signal, the exit code is 128 + signal_number
+        # SIGSEGV is signal 11, so segfault results in exit code 139 (128 + 11)
+        returncode = result.returncode
+        is_segfault = (returncode == 139)  # SIGSEGV (128 + 11)
+        
+        if is_segfault:
+            if verbose:
+                print(f"   Run {i}: SEGFAULT - Process crashed with return code {returncode}")
+            continue
+        
+        # Check for other non-zero exit codes (might indicate other failures)
+        if returncode != 0:
+            if verbose:
+                print(f"   Run {i}: ERROR - Process exited with non-zero code {returncode}")
+            continue
+        
         end = time.perf_counter()
         elapsed = end - start
         
@@ -897,6 +914,18 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     # Create visualizations
     visualize_results(gcc_avg, custom_avg, gcc_size, custom_size, opt_level)
+    
+    # Check if either benchmark failed (e.g., due to segmentation faults)
+    if gcc_avg is None or custom_avg is None:
+        print("Error: Benchmark failed - one or more executables crashed (segmentation fault or other error)")
+        return {
+            'success': False,
+            'gcc_avg': gcc_avg,
+            'custom_avg': custom_avg,
+            'gcc_size': gcc_size,
+            'custom_size': custom_size,
+            'metamorphic_enabled': enable_metamorphic_return_sites
+        }
     
     # Return results for comparison
     return {
