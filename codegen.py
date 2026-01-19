@@ -3,6 +3,7 @@
 from pycparser import c_ast
 import struct
 import sys
+from register_allocator import analyze_all_functions_for_registers
 
 
 def safe_str(obj):
@@ -30,12 +31,13 @@ def safe_str(obj):
 class CodeGenerator:
     """Code generator with indexed-jump, metamorphic return sites, quantized call-backs, and SIMD bit-packing."""
     
-    def __init__(self, function_data, global_var_data=None, asm_parser=None, use_32bit=False, enable_metamorphic_return_sites=True):
+    def __init__(self, function_data, global_var_data=None, asm_parser=None, use_32bit=False, enable_metamorphic_return_sites=True, register_allocator=None):
         self.function_data = function_data
         self.global_var_data = global_var_data or {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
         self.asm_parser = asm_parser  # Assembly parser for external symbols
         self.use_32bit = use_32bit  # 32-bit mode flag
         self.enable_metamorphic_return_sites = enable_metamorphic_return_sites  # Enable/disable metamorphic return sites
+        self.register_allocator = register_allocator  # Register allocator for efficient register usage
         self.output = []
         self.small_functions = []
         self.function_offsets = {}
@@ -46,6 +48,7 @@ class CodeGenerator:
         self.current_line = 0  # Track current output line for return site tracking
         self.simd_register = 'xmm15'  # Last SIMD register for bit-packing
         self.referenced_asm_symbols = set()  # Track which assembly symbols we've included
+        self.variable_registers = {}  # Track which variables are currently in registers: {var_name: register}
         
         # Register names based on bit mode
         if use_32bit:
@@ -685,11 +688,46 @@ class CodeGenerator:
         return is_interrupt_callback(func_name)
     
     def _generate_local_var_load(self, var_name):
-        """Generate code to load a local variable using optimized stack addressing.
+        """Generate code to load a local variable using optimized register or stack addressing.
         
-        Uses standard [RBP - offset] addressing for better performance (GCC style).
-        Slot tracking is maintained for pointer compression purposes.
+        First checks if variable is in a register (from register allocator), otherwise uses stack.
         """
+        # Check if variable is in a register (from register allocator)
+        if self.register_allocator and self._current_function_name:
+            reg = self.register_allocator.get_register(self._current_function_name, var_name)
+            if reg:
+                # Variable is in a register - move it to RAX
+                if reg != self.reg_rax:
+                    if self.use_32bit:
+                        reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
+                        self.output.append(f"    MOV {self.reg_rax}, {reg_32}  ; Load {var_name} from register {reg}")
+                    else:
+                        # In 64-bit mode, use 32-bit moves for integers (zero-extends to RAX)
+                        if reg.startswith('R'):
+                            # R8-R15 use R8D-R15D, not E8-E15
+                            if reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
+                                reg_32 = reg + 'D'
+                            else:
+                                reg_32 = reg.replace('R', 'E')
+                            # Use EAX (32-bit) which zero-extends to RAX
+                            self.output.append(f"    MOV EAX, {reg_32}  ; Load {var_name} from register {reg} (32-bit)")
+                        else:
+                            self.output.append(f"    MOV {self.reg_rax}, {reg}  ; Load {var_name} from register {reg}")
+                # Variable already in RAX
+                return
+        
+        # Check if variable is currently in a register (from our tracking)
+        if var_name in self.variable_registers:
+            reg = self.variable_registers[var_name]
+            if reg != self.reg_rax:
+                if self.use_32bit:
+                    reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
+                    self.output.append(f"    MOV {self.reg_rax}, {reg_32}  ; Load {var_name} from register {reg}")
+                else:
+                    reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
+                    self.output.append(f"    MOV {self.reg_rax}, {reg_32}  ; Load {var_name} from register {reg}")
+            return
+        
         if var_name not in self.current_function_stack:
             # Check if it's a function parameter
             if var_name in self.function_parameters:
@@ -722,11 +760,35 @@ class CodeGenerator:
             self.output.append(f"    MOV EAX, DWORD [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (32-bit)")
     
     def _generate_local_var_store(self, var_name):
-        """Generate code to store a local variable using optimized stack addressing.
+        """Generate code to store a local variable using optimized register or stack addressing.
         
-        Uses standard [RBP - offset] addressing for better performance (GCC style).
-        Slot tracking is maintained for pointer compression purposes.
+        First checks if variable should be in a register (from register allocator), otherwise uses stack.
         """
+        # Check if variable should be in a register (from register allocator)
+        if self.register_allocator and self._current_function_name:
+            reg = self.register_allocator.get_register(self._current_function_name, var_name)
+            if reg:
+                # Variable should be in a register - move RAX to that register
+                if reg != self.reg_rax:
+                    if self.use_32bit:
+                        reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
+                        self.output.append(f"    MOV {reg_32}, {self.reg_rax}  ; Store {var_name} to register {reg}")
+                    else:
+                        # In 64-bit mode, use 32-bit moves for integers
+                        if reg.startswith('R'):
+                            # R8-R15 use R8D-R15D, not E8-E15
+                            if reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
+                                reg_32 = reg + 'D'
+                            else:
+                                reg_32 = reg.replace('R', 'E')
+                            self.output.append(f"    MOV {reg_32}, EAX  ; Store {var_name} to register {reg} (32-bit)")
+                        else:
+                            self.output.append(f"    MOV {reg}, {self.reg_rax}  ; Store {var_name} to register {reg}")
+                # Track that this variable is now in a register
+                self.variable_registers[var_name] = reg
+                return
+        
+        # Variable should be on stack
         if var_name not in self.current_function_stack:
             # Variable not found - allocate it now
             slot_index = self.current_stack_slots
@@ -748,6 +810,10 @@ class CodeGenerator:
             self.output.append(f"    MOV [{self.reg_rbp} - {stack_offset}], {self.reg_rax}  ; Store {var_name}")
         else:
             self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {var_name} (32-bit)")
+        
+        # Remove from register tracking if it was there
+        if var_name in self.variable_registers:
+            del self.variable_registers[var_name]
     
     def _generate_compressed_pointer(self, slot_index1, slot_index2=None):
         """Generate code to create a compressed pointer (two 32-bit indices in one 64-bit register).
@@ -796,6 +862,7 @@ class CodeGenerator:
         self.current_function_stack = {}
         self.current_stack_slots = 0
         self.current_stack_offset = 0  # Track cumulative byte offset from RBP
+        self.variable_registers = {}  # Reset register tracking for this function
         # Reset function pointer tracking
         self.saved_fp_in_rbx = False
         self.fp_in_rax = False
@@ -1553,10 +1620,33 @@ class CodeGenerator:
                 pass  # Fall through to general case
         
         # General case: evaluate both operands
-        self._generate_expression(op.left)
-        self.output.append(f"    PUSH {self.reg_rax}")
+        # Optimize: if left operand is a variable in a register, use it directly
+        left_in_reg = None
+        if isinstance(op.left, c_ast.ID):
+            var_name = op.left.name
+            if self.register_allocator and self._current_function_name:
+                reg = self.register_allocator.get_register(self._current_function_name, var_name)
+                if reg:
+                    left_in_reg = reg
+            elif var_name in self.variable_registers:
+                left_in_reg = self.variable_registers[var_name]
+        
+        if left_in_reg and left_in_reg != self.reg_rax:
+            # Left operand is in a register - use it directly
+            if self.use_32bit:
+                reg_32 = left_in_reg.replace('R', 'E') if left_in_reg.startswith('R') else left_in_reg
+                self.output.append(f"    MOV {self.reg_rbx}, {reg_32}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+            else:
+                # In 64-bit mode, use the full 64-bit register (zero-extends automatically)
+                # For integer operations, we can use the 64-bit register directly
+                self.output.append(f"    MOV {self.reg_rbx}, {left_in_reg}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+        else:
+            # Evaluate left operand normally
+            self._generate_expression(op.left)
+            self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Save left operand")
+        
+        # Evaluate right operand
         self._generate_expression(op.right)
-        self.output.append(f"    POP {self.reg_rbx}")
         
         if op.op == '+':
             self.output.append(f"    ADD {self.reg_rax}, {self.reg_rbx}")
@@ -1577,6 +1667,8 @@ class CodeGenerator:
             self.output.append("    SETE AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '<':
+            # Optimize: if right operand is a variable in a register, use direct comparison
+            # Otherwise, compare RBX (left) with RAX (right)
             self.output.append(f"    CMP {self.reg_rbx}, {self.reg_rax}")
             self.output.append("    SETL AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
@@ -1810,10 +1902,15 @@ class CodeGenerator:
                             self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
     
     def _generate_array_ref(self, arr_ref):
-        """Generate code for array indexing: arr[index]"""
+        """Generate code for array indexing: arr[index] using efficient LEA addressing."""
         # Generate index first (we'll need it)
         self._generate_expression(arr_ref.subscript)
-        self.output.append(f"    PUSH {self.reg_rax}  ; Save index")
+        # Save index to a register (prefer RCX for index)
+        index_reg = self.reg_rcx
+        if self.use_32bit:
+            self.output.append(f"    MOV ECX, EAX  ; Save index")
+        else:
+            self.output.append(f"    MOV RCX, RAX  ; Save index")
         
         # Generate base address (array name or pointer)
         if isinstance(arr_ref.name, c_ast.ID):
@@ -1822,30 +1919,40 @@ class CodeGenerator:
             # Check if it's a global variable
             globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
             if name in globals:
-                # Global array
-                self.output.append(f"    MOV RBX, GLOBAL_{name}  ; Base address of array")
+                # Global array - use LEA with scaled index (GCC style)
+                if self.use_32bit:
+                    self.output.append(f"    LEA EAX, [GLOBAL_{name} + ECX*4]  ; Base + index*4 (int is 4 bytes)")
+                else:
+                    self.output.append(f"    LEA RAX, [rel GLOBAL_{name} + RCX*4]  ; Base + index*4 (int is 4 bytes, PIC)")
             else:
-                # Local array - treat as pointer (for now, assume it's a local variable that holds an address)
-                self._generate_local_var_load(name)
-                self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Base address")
+                # Local array - get base address
+                if name in self.current_function_stack:
+                    slot_index, offset = self.current_function_stack[name]
+                    stack_offset = (slot_index + 1) * 8 + offset
+                    if self.use_32bit:
+                        self.output.append(f"    LEA EAX, [{self.reg_rbp} - {stack_offset} + ECX*4]  ; Base + index*4")
+                    else:
+                        self.output.append(f"    LEA RAX, [{self.reg_rbp} - {stack_offset} + RCX*4]  ; Base + index*4")
+                else:
+                    # Parameter or complex - load base first
+                    self._generate_expression(arr_ref.name)
+                    if self.use_32bit:
+                        self.output.append(f"    LEA EAX, [EAX + ECX*4]  ; Base + index*4")
+                    else:
+                        self.output.append(f"    LEA RAX, [RAX + RCX*4]  ; Base + index*4")
         else:
-            # Complex expression for base
+            # Complex expression for base - evaluate it
             self._generate_expression(arr_ref.name)
-            self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Base address")
-        
-        # Get index from stack
-        self.output.append(f"    POP {self.reg_rax}  ; Get index")
-        
-        # Calculate address: base + index * sizeof(int)
-        # Assuming int is 4 bytes (32 bits)
-        self.output.append("    ; Array indexing: base + index * 4")
-        self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save index")
-        self.output.append(f"    MOV {self.reg_rax}, 4  ; Size of int")
-        self.output.append(f"    MUL {self.reg_rcx}  ; {self.reg_rax} = index * 4")
-        self.output.append(f"    ADD {self.reg_rax}, {self.reg_rbx}  ; {self.reg_rax} = base + offset")
+            if self.use_32bit:
+                self.output.append(f"    LEA EAX, [EAX + ECX*4]  ; Base + index*4")
+            else:
+                self.output.append(f"    LEA RAX, [RAX + RCX*4]  ; Base + index*4")
         
         # Load value from memory
-        self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax}]  ; Load array element")
+        if self.use_32bit:
+            self.output.append(f"    MOV EAX, DWORD [EAX]  ; Load array element")
+        else:
+            self.output.append(f"    MOV EAX, DWORD [RAX]  ; Load array element (32-bit)")
     
     def _compute_nested_struct_offset(self, struct_ref):
         """Compute cumulative offset for nested struct access like container.outer.inner.callback.
@@ -2476,7 +2583,7 @@ class CodeGenerator:
         self.output.append(f"{end_label}:")
     
     def _generate_for(self, for_stmt, func_name, info):
-        """Generate code for for loop."""
+        """Generate code for for loop with optimized register usage."""
         loop_label = f"FOR_{len(self.output)}"
         end_label = f"END_FOR_{len(self.output)}"
         
@@ -2494,6 +2601,8 @@ class CodeGenerator:
         self.output.append(f"{loop_label}:")
         
         if for_stmt.cond:
+            # Optimize condition evaluation: if comparing a variable in a register with a constant,
+            # use direct comparison instead of loading to RAX first
             self._generate_expression(for_stmt.cond)
             self.output.append(f"    TEST {self.reg_rax}, {self.reg_rax}")
             self.output.append(f"    JZ {end_label}")
@@ -2581,11 +2690,59 @@ class CodeGenerator:
         # Allocate appropriate stack space for this variable
         self.output.append(f"    SUB {self.reg_rsp}, {var_size}  ; Allocate stack space for {name}")
         
+        # Check if variable should be in a register
+        should_be_in_register = False
+        allocated_reg = None
+        if self.register_allocator and self._current_function_name:
+            allocated_reg = self.register_allocator.get_register(self._current_function_name, name)
+            if allocated_reg:
+                should_be_in_register = True
+        
         if decl.init:
             self._generate_expression(decl.init)
-            # Store value using indexed addressing
-            self._generate_local_var_store(name)
+            if should_be_in_register:
+                # Variable should be in a register - move RAX to allocated register
+                if allocated_reg != self.reg_rax:
+                    if self.use_32bit:
+                        reg_32 = allocated_reg.replace('R', 'E') if allocated_reg.startswith('R') else allocated_reg
+                        self.output.append(f"    MOV {reg_32}, {self.reg_rax}  ; Initialize {name} in register {allocated_reg}")
+                    else:
+                        # In 64-bit mode, use 32-bit moves for integers
+                        if allocated_reg.startswith('R'):
+                            # R8-R15 use R8D-R15D, not E8-E15
+                            if allocated_reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
+                                reg_32 = allocated_reg + 'D'
+                            else:
+                                reg_32 = allocated_reg.replace('R', 'E')
+                            self.output.append(f"    MOV {reg_32}, EAX  ; Initialize {name} in register {allocated_reg} (32-bit)")
+                        else:
+                            self.output.append(f"    MOV {allocated_reg}, {self.reg_rax}  ; Initialize {name} in register {allocated_reg}")
+                # Track that this variable is in a register
+                self.variable_registers[name] = allocated_reg
+            else:
+                # Store value using stack addressing
+                self._generate_local_var_store(name)
         else:
             # Initialize to 0
-            self.output.append(f"    XOR {self.reg_rax}, {self.reg_rax}  ; Initialize {name} to 0")
-            self._generate_local_var_store(name)
+            if should_be_in_register:
+                # Initialize register to 0
+                if self.use_32bit:
+                    reg_32 = allocated_reg.replace('R', 'E') if allocated_reg.startswith('R') else allocated_reg
+                    self.output.append(f"    XOR {reg_32}, {reg_32}  ; Initialize {name} to 0 in register {allocated_reg}")
+                else:
+                    # In 64-bit mode, use 32-bit XOR for integers (clears upper 32 bits too)
+                    if allocated_reg.startswith('R'):
+                        # R8-R15 use R8D-R15D, not E8-E15
+                        if allocated_reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
+                            reg_32 = allocated_reg + 'D'
+                        else:
+                            reg_32 = allocated_reg.replace('R', 'E')
+                        self.output.append(f"    XOR {reg_32}, {reg_32}  ; Initialize {name} to 0 in register {allocated_reg} (32-bit)")
+                    else:
+                        self.output.append(f"    XOR {allocated_reg}, {allocated_reg}  ; Initialize {name} to 0 in register {allocated_reg}")
+                # Track that this variable is in a register
+                self.variable_registers[name] = allocated_reg
+            else:
+                # Initialize on stack
+                self.output.append(f"    XOR {self.reg_rax}, {self.reg_rax}  ; Initialize {name} to 0")
+                self._generate_local_var_store(name)

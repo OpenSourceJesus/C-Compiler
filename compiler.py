@@ -12,6 +12,7 @@ from analyzer import analyze_all_functions, analyze_global_variables
 from codegen import CodeGenerator
 from asm_parser import parse_asm_files, find_asm_files
 from symbol_collector import collect_symbols
+from register_allocator import analyze_all_functions_for_registers
 
 
 def find_assembler(use_32bit=False):
@@ -471,9 +472,19 @@ def main():
 				print(f"Warning: Failed to parse assembly files: {e}", file=sys.stderr)
 				asm_parser = None
 	
+	# Analyze functions for register allocation
+	register_allocator = None
+	try:
+		register_allocator = analyze_all_functions_for_registers(c_parser, args.use_32bit)
+		if args.verbose:
+			print("Register allocation analysis completed", file=sys.stderr)
+	except Exception as e:
+		print(f"Warning: Register allocation analysis failed: {e}", file=sys.stderr)
+		register_allocator = None
+	
 	# Generate code
 	try:
-		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, args.enable_metamorphic_return_sites)
+		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, args.enable_metamorphic_return_sites, register_allocator)
 		output_code = codegen.generate(c_parser)
 		
 		# Write output

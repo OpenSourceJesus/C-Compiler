@@ -416,6 +416,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         gcc_cmd.extend(asm_files)
         gcc_cmd.extend(['-o', str(gcc_output)])
         
+        print(f"GCC compilation command: {' '.join(gcc_cmd)}")
+        
         result = subprocess.run(
             gcc_cmd,
             check=True,
@@ -535,6 +537,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 gcc_cmd.extend(asm_files)
                 gcc_cmd.extend(['-o', str(gcc_output)])
                 
+                print(f"GCC compilation command (32-bit retry): {' '.join(gcc_cmd)}")
+                
                 result = subprocess.run(
                     gcc_cmd,
                     check=True,
@@ -610,6 +614,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     for include_path in include_paths:
         compiler_cmd.extend(['-I', include_path])
     
+    print(f"Custom compiler command: {' '.join(compiler_cmd)}")
+    
     try:
         result = subprocess.run(
             compiler_cmd,
@@ -644,9 +650,12 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     custom_obj_file = custom_output_dir / f'{custom_output_name}.o'
     
+    assembler_cmd = [assembler, '-f', format_type, str(asm_file), '-o', str(custom_obj_file)]
+    print(f"Assembler command: {' '.join(assembler_cmd)}")
+    
     try:
         result = subprocess.run(
-            [assembler, '-f', format_type, str(asm_file), '-o', str(custom_obj_file)],
+            assembler_cmd,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -704,6 +713,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 gcc_asm_cmd = ['gcc', '-c', asm_file, '-o', str(asm_obj)]
                 if use_32bit:
                     gcc_asm_cmd.insert(1, '-m32')
+                print(f"GCC assembly command (for .S files): {' '.join(gcc_asm_cmd)}")
                 result = subprocess.run(
                     gcc_asm_cmd,
                     check=True,
@@ -729,6 +739,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     # Add linker script if found (use the first one if multiple)
     if linker_scripts:
         link_cmd.extend(['-T', linker_scripts[0]])
+    
+    print(f"Linker command: {' '.join(link_cmd)}")
     
     try:
         result = subprocess.run(
@@ -798,6 +810,50 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     os.chmod(custom_executable, 0o755)
     
     custom_size = get_file_size(custom_executable)
+    
+    # Verify that both executables have the same bitness
+    try:
+        # Check GCC executable bitness
+        gcc_file_result = subprocess.run(
+            ['file', str(gcc_executable)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=script_dir
+        )
+        gcc_is_32bit = '32-bit' in gcc_file_result.stdout
+        
+        # Check custom executable bitness
+        custom_file_result = subprocess.run(
+            ['file', str(custom_executable)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=script_dir
+        )
+        custom_is_32bit = '32-bit' in custom_file_result.stdout
+        
+        # If bitness doesn't match, retry with the correct mode
+        if gcc_is_32bit != custom_is_32bit:
+            expected_32bit = gcc_is_32bit  # Use GCC's bitness as the reference
+            if use_32bit != expected_32bit:
+                print(f"Warning: Bitness mismatch detected!")
+                print(f"  GCC executable: {'32-bit' if gcc_is_32bit else '64-bit'}")
+                print(f"  Custom executable: {'32-bit' if custom_is_32bit else '64-bit'}")
+                print(f"  Retrying with {'32-bit' if expected_32bit else '64-bit'} mode to match GCC...")
+                # Clean up mismatched files
+                for ext in ['', '.o', '.asm']:
+                    for output in [gcc_output, custom_output]:
+                        path = Path(f"{output}{ext}")
+                        if path.exists():
+                            path.unlink()
+                # Recursively retry with the correct bitness
+                return compile_and_benchmark(test_path, output_base_name, exclude_patterns, expected_32bit, opt_level, iterations, enable_metamorphic_return_sites, include_paths)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # If 'file' command is not available, skip the check
+        pass
     
     # Run benchmarks
     gcc_avg = run_benchmark(str(gcc_executable), f"GCC {opt_level}", iterations, verbose=False)
