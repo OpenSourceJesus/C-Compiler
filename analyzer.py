@@ -34,13 +34,20 @@ class FunctionAnalyzer(c_ast.NodeVisitor):
         num_returns = len(self.return_sites)
         has_single_return = (num_returns == 0) or (num_returns == 1)
         
+        # Track function calls
+        calls = getattr(self, 'calls', [])
+        
         self.function_info[func_name] = {
             'size': estimated_size,
             'return_sites': num_returns,
             'is_small': estimated_size < 1024,
             'has_single_return': has_single_return,
+            'calls': calls,  # Functions this function calls
             'node': func_def
         }
+        
+        # Reset calls for next function
+        self.calls = []
         
         return self.function_info[func_name]
     
@@ -83,6 +90,14 @@ class FunctionAnalyzer(c_ast.NodeVisitor):
     def visit_FuncCall(self, node):
         """Count function call overhead."""
         self.instruction_count += 3  # call setup
+        # Track function calls for call graph
+        if not hasattr(self, 'calls'):
+            self.calls = []
+        func_name = None
+        if isinstance(node.name, c_ast.ID):
+            func_name = node.name.name
+        if func_name:
+            self.calls.append(func_name)
         self.generic_visit(node)
     
     def visit_Decl(self, node):

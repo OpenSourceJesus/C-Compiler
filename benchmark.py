@@ -274,7 +274,7 @@ def find_linker_scripts(directory):
     
     return linker_scripts
 
-def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O3', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True):
+def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O3', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, include_paths=None):
     """Compile a single file or folder and run benchmarks.
     
     Args:
@@ -291,6 +291,9 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     if exclude_patterns is None:
         exclude_patterns = []
+    
+    if include_paths is None:
+        include_paths = []
     
     # Create separate output directories
     gcc_output_dir = script_dir / 'gcc_output'
@@ -404,6 +407,11 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         # Use -nostdlib if custom startup is detected to avoid _start conflict
         if has_custom_startup:
             gcc_cmd.append('-nostdlib')
+        # Add include paths
+        for include_path in include_paths:
+            # Resolve to absolute path for GCC
+            abs_include_path = Path(include_path).resolve()
+            gcc_cmd.extend(['-I', str(abs_include_path)])
         gcc_cmd.extend(c_files)
         gcc_cmd.extend(asm_files)
         gcc_cmd.extend(['-o', str(gcc_output)])
@@ -518,6 +526,11 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 # Use -nostdlib if custom startup is detected to avoid _start conflict
                 if has_custom_startup:
                     gcc_cmd.append('-nostdlib')
+                # Add include paths
+                for include_path in include_paths:
+                    # Resolve to absolute path for GCC
+                    abs_include_path = Path(include_path).resolve()
+                    gcc_cmd.extend(['-I', str(abs_include_path)])
                 gcc_cmd.extend(c_files)
                 gcc_cmd.extend(asm_files)
                 gcc_cmd.extend(['-o', str(gcc_output)])
@@ -593,6 +606,9 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         compiler_cmd.append('--32-bit')
     if not enable_metamorphic_return_sites:
         compiler_cmd.append('--no-metamorphic-return-sites')
+    # Add include paths
+    for include_path in include_paths:
+        compiler_cmd.extend(['-I', include_path])
     
     try:
         result = subprocess.run(
@@ -854,8 +870,9 @@ def main():
     # Parse command-line arguments
     exclude_patterns = []
     use_32bit = False
-    opt_level = '-O3'  # Default optimization level
+    opt_level = '-O0'  # Default optimization level
     iterations = DEFAULT_ITERATIONS
+    include_paths = []
     
     args = sys.argv[1:]
     if not args:
@@ -865,7 +882,7 @@ def main():
             test_path = default_test
             output_base = "benchmark"
         else:
-            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N]")
+            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N] [-I DIR]...")
             print()
             print("Examples:")
             print("  benchmark.py test.c")
@@ -877,6 +894,7 @@ def main():
             print("  benchmark.py test.c --opt-level O3")
             print("  benchmark.py test.c --opt-level Os")
             print("  benchmark.py test.c --runs 10")
+            print("  benchmark.py test.c -I include -I lib")
             sys.exit(1)
         args = []
     else:
@@ -891,7 +909,7 @@ def main():
             i = 1
         
         # Second argument might be output base name (if not a flag)
-        if i < len(args) and not args[i].startswith('--'):
+        if i < len(args) and not args[i].startswith('-'):
             output_base = args[i]
             i += 1
         
@@ -923,12 +941,20 @@ def main():
                     print(f"Error: Invalid number of runs: {args[i + 1]}")
                     sys.exit(1)
                 i += 2
+            elif args[i] == '-I':
+                if i + 1 < len(args):
+                    include_paths.append(args[i + 1])
+                    i += 2
+                else:
+                    print(f"Error: -I flag requires a directory path", file=sys.stderr)
+                    sys.exit(1)
             else:
+                # Unknown flag, skip it
                 i += 1
         
         if test_path is None:
             print("Error: No test path specified")
-            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N]")
+            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N] [-I DIR]...")
             sys.exit(1)
     
     # Print configuration info (but keep it minimal)
@@ -936,13 +962,15 @@ def main():
         print(f"Excluding files matching: {', '.join(exclude_patterns)}")
     if use_32bit:
         print("Compilation mode: 32-bit")
+    if include_paths:
+        print(f"Include paths: {', '.join(include_paths)}")
     print()
     
     # Run benchmark with metamorphic return sites enabled
     print("=" * 70)
     print("Running benchmark WITH metamorphic return sites")
     print("=" * 70)
-    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True)
+    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, include_paths=include_paths)
     
     if not result_with or not result_with.get('success', False):
         print("Error: Benchmark with metamorphic return sites failed")
@@ -952,7 +980,7 @@ def main():
     print("=" * 70)
     print("Running benchmark WITHOUT metamorphic return sites")
     print("=" * 70)
-    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False)
+    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False, include_paths=include_paths)
     
     if not result_without or not result_without.get('success', False):
         print("Error: Benchmark without metamorphic return sites failed")

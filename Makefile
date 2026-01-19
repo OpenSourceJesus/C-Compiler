@@ -6,6 +6,10 @@ OPT_LEVEL ?= O3
 # Default number of benchmark runs (can be overridden: make tests RUNS=10)
 RUNS ?=
 
+# Include paths (can be overridden: make tests INCLUDE_PATHS="include lib")
+# Multiple paths should be space-separated, e.g., INCLUDE_PATHS="include lib"
+INCLUDE_PATHS ?=
+
 tests:
 	@echo "=========================================="
 	@echo "Running benchmarks for all tests"
@@ -13,6 +17,9 @@ tests:
 	@echo "Optimization level: $(OPT_LEVEL)"
 	@if [ -n "$(RUNS)" ]; then \
 		echo "Number of runs: $(RUNS)"; \
+	fi
+	@if [ -n "$(INCLUDE_PATHS)" ]; then \
+		echo "Include paths: $(INCLUDE_PATHS)"; \
 	fi
 	@echo ""
 	@test_count=0; \
@@ -26,13 +33,19 @@ tests:
 	if [ -n "$(RUNS)" ]; then \
 		runs_flag="--runs $(RUNS)"; \
 	fi; \
+	include_flags=""; \
+	if [ -n "$(INCLUDE_PATHS)" ]; then \
+		for include_path in $(INCLUDE_PATHS); do \
+			include_flags="$$include_flags -I $$include_path"; \
+		done; \
+	fi; \
 	for test_file in Tests/*.c; do \
 		if [ -f "$$test_file" ]; then \
 			test_count=$$((test_count + 1)); \
 			echo "=========================================="; \
 			echo "Test $$test_count: $$test_file"; \
 			echo "=========================================="; \
-			if /usr/bin/python3 benchmark.py "$$test_file" $$opt_level_flag $$runs_flag; then \
+			if /usr/bin/python3 benchmark.py "$$test_file" $$opt_level_flag $$runs_flag $$include_flags; then \
 				success_count=$$((success_count + 1)); \
 				echo ""; \
 				echo "✓ Test $$test_count ($$test_file) PASSED"; \
@@ -50,7 +63,7 @@ tests:
 			echo "=========================================="; \
 			echo "Test $$test_count: $$test_dir"; \
 			echo "=========================================="; \
-			if /usr/bin/python3 benchmark.py "$$test_dir" $$opt_level_flag $$runs_flag; then \
+			if /usr/bin/python3 benchmark.py "$$test_dir" $$opt_level_flag $$runs_flag $$include_flags; then \
 				success_count=$$((success_count + 1)); \
 				echo ""; \
 				echo "✓ Test $$test_count ($$test_dir) PASSED"; \
