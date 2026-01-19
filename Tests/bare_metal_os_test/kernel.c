@@ -81,8 +81,8 @@ int main(void) {
     switch_task(task2);
     switch_task(task3);
     
-    /* Simulate some kernel operations */
-    for (int i = 0; i < 10; i++) {
+    /* Simulate a million kernel operations */
+    for (int i = 0; i < 1000000; i++) {
         kernel_tick();
     }
     

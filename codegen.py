@@ -811,9 +811,24 @@ class CodeGenerator:
         else:
             self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {var_name} (32-bit)")
         
-        # Remove from register tracking if it was there
+        # Update register if variable is in a register
         if var_name in self.variable_registers:
-            del self.variable_registers[var_name]
+            reg = self.variable_registers[var_name]
+            # Update the register with the new value (which is in RAX/EAX)
+            if self.use_32bit:
+                reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
+                self.output.append(f"    MOV {reg_32}, EAX  ; Update {var_name} in register {reg}")
+            else:
+                # In 64-bit mode, use 32-bit moves for integers
+                if reg.startswith('R'):
+                    # R8-R15 use R8D-R15D, not E8-E15
+                    if reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
+                        reg_32 = reg + 'D'
+                    else:
+                        reg_32 = reg.replace('R', 'E')
+                    self.output.append(f"    MOV {reg_32}, EAX  ; Update {var_name} in register {reg} (32-bit)")
+                else:
+                    self.output.append(f"    MOV {reg}, EAX  ; Update {var_name} in register {reg}")
     
     def _generate_compressed_pointer(self, slot_index1, slot_index2=None):
         """Generate code to create a compressed pointer (two 32-bit indices in one 64-bit register).
@@ -907,9 +922,15 @@ class CodeGenerator:
             # Mark that this function needs stack frame
             if not self.function_needs_indexed_stack:
                 self.function_needs_indexed_stack = True
-                # Generate standard prologue
+                # Generate indexed stack prologue (with R12/R13 for indexed stack system)
                 self.output.append(f"    PUSH {self.reg_rbp}  ; Save old frame pointer")
+                if not self.use_32bit:
+                    self.output.append(f"    PUSH {self.stack_base_register}  ; Preserve stack base register")
+                    self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
                 self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
+                if not self.use_32bit:
+                    self.output.append(f"    MOV {self.stack_base_register}, [rel STACK_BASE]  ; Load stack base")
+                    self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
             # Allocate 8 bytes for SIMD register preservation if needed
             self.current_stack_slots = 1
             self.output.append(f"    SUB {self.reg_rsp}, 8  ; Allocate stack space for SIMD register")
@@ -1633,17 +1654,53 @@ class CodeGenerator:
         
         if left_in_reg and left_in_reg != self.reg_rax:
             # Left operand is in a register - use it directly
-            if self.use_32bit:
-                reg_32 = left_in_reg.replace('R', 'E') if left_in_reg.startswith('R') else left_in_reg
-                self.output.append(f"    MOV {self.reg_rbx}, {reg_32}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+            # Check if RBX is already in use by another variable
+            rbx_in_use = False
+            rbx_var = None
+            for var_name, reg in self.variable_registers.items():
+                if reg == self.reg_rbx:
+                    rbx_in_use = True
+                    rbx_var = var_name
+                    break
+            
+            if rbx_in_use and left_in_reg != self.reg_rbx:
+                # RBX is in use, save it first
+                self.output.append(f"    PUSH {self.reg_rbx}  ; Save {rbx_var} in RBX")
+                if self.use_32bit:
+                    reg_32 = left_in_reg.replace('R', 'E') if left_in_reg.startswith('R') else left_in_reg
+                    self.output.append(f"    MOV {self.reg_rbx}, {reg_32}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                else:
+                    self.output.append(f"    MOV {self.reg_rbx}, {left_in_reg}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                # Mark that we need to restore RBX later
+                self._rbx_saved = True
             else:
-                # In 64-bit mode, use the full 64-bit register (zero-extends automatically)
-                # For integer operations, we can use the 64-bit register directly
-                self.output.append(f"    MOV {self.reg_rbx}, {left_in_reg}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                # RBX is free, use it directly
+                if self.use_32bit:
+                    reg_32 = left_in_reg.replace('R', 'E') if left_in_reg.startswith('R') else left_in_reg
+                    self.output.append(f"    MOV {self.reg_rbx}, {reg_32}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                else:
+                    self.output.append(f"    MOV {self.reg_rbx}, {left_in_reg}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                self._rbx_saved = False
         else:
             # Evaluate left operand normally
             self._generate_expression(op.left)
-            self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Save left operand")
+            # Check if RBX is already in use
+            rbx_in_use = False
+            rbx_var = None
+            for var_name, reg in self.variable_registers.items():
+                if reg == self.reg_rbx:
+                    rbx_in_use = True
+                    rbx_var = var_name
+                    break
+            
+            if rbx_in_use:
+                # RBX is in use, save it first
+                self.output.append(f"    PUSH {self.reg_rbx}  ; Save {rbx_var} in RBX")
+                self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Save left operand")
+                self._rbx_saved = True
+            else:
+                self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Save left operand")
+                self._rbx_saved = False
         
         # Evaluate right operand
         self._generate_expression(op.right)
@@ -1753,6 +1810,11 @@ class CodeGenerator:
             # Bitwise XOR: RBX ^ RAX
             self.output.append(f"    ; Bitwise XOR: {self.reg_rbx} ^ {self.reg_rax}")
             self.output.append(f"    XOR {self.reg_rax}, {self.reg_rbx}")
+        
+        # Restore RBX if it was saved
+        if hasattr(self, '_rbx_saved') and self._rbx_saved:
+            self.output.append(f"    POP {self.reg_rbx}  ; Restore RBX")
+            self._rbx_saved = False
     
     def _generate_unary_op(self, op):
         """Generate code for unary operation."""
@@ -1823,6 +1885,21 @@ class CodeGenerator:
                             slot_index, offset = self.current_function_stack[name]
                             stack_offset = (slot_index + 1) * 8 + offset
                             self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
+                            # Update register if variable is in a register
+                            if name in self.variable_registers:
+                                reg = self.variable_registers[name]
+                                if self.use_32bit:
+                                    reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
+                                    self.output.append(f"    MOV {reg_32}, EAX  ; Update {name} in register {reg}")
+                                else:
+                                    if reg.startswith('R'):
+                                        if reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
+                                            reg_32 = reg + 'D'
+                                        else:
+                                            reg_32 = reg.replace('R', 'E')
+                                        self.output.append(f"    MOV {reg_32}, EAX  ; Update {name} in register {reg} (32-bit)")
+                                    else:
+                                        self.output.append(f"    MOV {reg}, EAX  ; Update {name} in register {reg}")
                 self.output.append(f"    POP {self.reg_rax}  ; Return original value")
         elif op.op == 'p--':
             # Post-decrement: var--
@@ -1853,6 +1930,21 @@ class CodeGenerator:
                             slot_index, offset = self.current_function_stack[name]
                             stack_offset = (slot_index + 1) * 8 + offset
                             self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
+                            # Update register if variable is in a register
+                            if name in self.variable_registers:
+                                reg = self.variable_registers[name]
+                                if self.use_32bit:
+                                    reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
+                                    self.output.append(f"    MOV {reg_32}, EAX  ; Update {name} in register {reg}")
+                                else:
+                                    if reg.startswith('R'):
+                                        if reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
+                                            reg_32 = reg + 'D'
+                                        else:
+                                            reg_32 = reg.replace('R', 'E')
+                                        self.output.append(f"    MOV {reg_32}, EAX  ; Update {name} in register {reg} (32-bit)")
+                                    else:
+                                        self.output.append(f"    MOV {reg}, EAX  ; Update {name} in register {reg}")
                 self.output.append(f"    POP {self.reg_rax}  ; Return original value")
         elif op.op == '++':
             # Pre-increment: ++var
@@ -2683,9 +2775,15 @@ class CodeGenerator:
         # Mark that this function needs stack frame
         if not self.function_needs_indexed_stack:
             self.function_needs_indexed_stack = True
-            # Generate standard prologue (GCC style for performance)
+            # Generate indexed stack prologue (with R12/R13 for indexed stack system)
             self.output.append(f"    PUSH {self.reg_rbp}  ; Save old frame pointer")
+            if not self.use_32bit:
+                self.output.append(f"    PUSH {self.stack_base_register}  ; Preserve stack base register")
+                self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
             self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
+            if not self.use_32bit:
+                self.output.append(f"    MOV {self.stack_base_register}, [rel STACK_BASE]  ; Load stack base")
+                self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
         
         # Allocate appropriate stack space for this variable
         self.output.append(f"    SUB {self.reg_rsp}, {var_size}  ; Allocate stack space for {name}")

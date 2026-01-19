@@ -1,7 +1,7 @@
 .PHONY: tests clean
 
 # Default optimization level (can be overridden: make tests OPT_LEVEL=O0)
-OPT_LEVEL ?= O3
+OPT_LEVEL ?= O0
 
 # Default number of benchmark runs (can be overridden: make tests RUNS=10)
 RUNS ?=

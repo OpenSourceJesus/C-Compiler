@@ -416,8 +416,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         gcc_cmd.extend(asm_files)
         gcc_cmd.extend(['-o', str(gcc_output)])
         
-        print(f"GCC compilation command: {' '.join(gcc_cmd)}")
-        
         result = subprocess.run(
             gcc_cmd,
             check=True,
@@ -537,8 +535,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 gcc_cmd.extend(asm_files)
                 gcc_cmd.extend(['-o', str(gcc_output)])
                 
-                print(f"GCC compilation command (32-bit retry): {' '.join(gcc_cmd)}")
-                
                 result = subprocess.run(
                     gcc_cmd,
                     check=True,
@@ -614,8 +610,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     for include_path in include_paths:
         compiler_cmd.extend(['-I', include_path])
     
-    print(f"Custom compiler command: {' '.join(compiler_cmd)}")
-    
     try:
         result = subprocess.run(
             compiler_cmd,
@@ -651,7 +645,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     custom_obj_file = custom_output_dir / f'{custom_output_name}.o'
     
     assembler_cmd = [assembler, '-f', format_type, str(asm_file), '-o', str(custom_obj_file)]
-    print(f"Assembler command: {' '.join(assembler_cmd)}")
     
     try:
         result = subprocess.run(
@@ -713,7 +706,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 gcc_asm_cmd = ['gcc', '-c', asm_file, '-o', str(asm_obj)]
                 if use_32bit:
                     gcc_asm_cmd.insert(1, '-m32')
-                print(f"GCC assembly command (for .S files): {' '.join(gcc_asm_cmd)}")
                 result = subprocess.run(
                     gcc_asm_cmd,
                     check=True,
@@ -739,8 +731,6 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     # Add linker script if found (use the first one if multiple)
     if linker_scripts:
         link_cmd.extend(['-T', linker_scripts[0]])
-    
-    print(f"Linker command: {' '.join(link_cmd)}")
     
     try:
         result = subprocess.run(
