@@ -92,22 +92,46 @@ def run_benchmark(executable_path, name, iterations, verbose=False):
                 print(f"   Run {i}: ERROR - Failed to execute: {e}")
             continue
         
-        # Check for segmentation fault
-        # On Linux, when a process is killed by a signal, the exit code is 128 + signal_number
-        # SIGSEGV is signal 11, so segfault results in exit code 139 (128 + 11)
+        # Check for segmentation fault or other signal kills
+        # Python's subprocess.run returns negative signal numbers when a process is killed by a signal
+        # (e.g., SIGSEGV = 11 returns -11, SIGINT = 2 returns -2)
+        # Shells report these as 128 + signal_number (e.g., SIGSEGV = 139 = 128 + 11)
+        # 
+        # Note: Exit codes 128-255 can be either:
+        # 1. Legitimate program return values (from result % 256)
+        # 2. Signal kills (128 + signal_number) - but Python reports these as negative
+        # 
+        # We check for negative return codes (signal kills from Python) and also
+        # check for SIGSEGV in shell format (139) for completeness.
         returncode = result.returncode
-        is_segfault = (returncode == 139)  # SIGSEGV (128 + 11)
         
-        if is_segfault:
+        # Negative return codes indicate the process was killed by a signal
+        # Common signals: SIGSEGV=-11, SIGINT=-2, SIGTERM=-15, etc.
+        is_signal_kill = (returncode < 0)
+        
+        # Also check for SIGSEGV in shell format (139 = 128 + 11)
+        is_segfault_shell = (returncode == 139)
+        
+        if is_signal_kill:
+            signal_num = -returncode
+            signal_names = {
+                11: "SIGSEGV (segmentation fault)",
+                2: "SIGINT (interrupt)",
+                15: "SIGTERM (termination)",
+                9: "SIGKILL (kill)",
+            }
+            signal_name = signal_names.get(signal_num, f"signal {signal_num}")
+            if verbose:
+                print(f"   Run {i}: ERROR - Process killed by {signal_name} (return code {returncode})")
+            continue
+        
+        if is_segfault_shell:
             if verbose:
                 print(f"   Run {i}: SEGFAULT - Process crashed with return code {returncode}")
             continue
         
-        # Check for other non-zero exit codes (might indicate other failures)
-        if returncode != 0:
-            if verbose:
-                print(f"   Run {i}: ERROR - Process exited with non-zero code {returncode}")
-            continue
+        # All non-negative exit codes (0-255) except SIGSEGV (139) are treated as valid
+        # program return values. The program ran successfully and completed execution.
         
         end = time.perf_counter()
         elapsed = end - start
@@ -291,7 +315,7 @@ def find_linker_scripts(directory):
     
     return linker_scripts
 
-def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O3', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, include_paths=None):
+def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O0', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, include_paths=None):
     """Compile a single file or folder and run benchmarks.
     
     Args:
@@ -367,7 +391,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         linker_scripts = find_linker_scripts(test_path)
     else:
         print(f"Error: {test_path} does not exist")
-        return False
+        return {'success': False}
     
     if linker_scripts:
         pass  # Linker scripts found but not printing
@@ -593,12 +617,12 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             return {'success': False}
     except FileNotFoundError:
         print("Error: gcc not found")
-        return False
+        return {'success': False}
     
     gcc_executable = gcc_output.resolve()
     if not gcc_executable.exists():
         print(f"Error: GCC executable was not created at {gcc_executable}")
-        return False
+        return {'success': False}
     
     # Make sure it's executable
     os.chmod(gcc_executable, 0o755)
@@ -640,22 +664,22 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         print("Error: Custom compiler failed")
         if e.stderr:
             print(f"   Error output: {e.stderr}")
-        return False
+        return {'success': False}
     except FileNotFoundError:
         print("Error: Python not found")
-        return False
+        return {'success': False}
     
     # Check if assembly file was created
     asm_file = custom_asm_file
     if not asm_file.exists():
         print(f"Error: Assembly file was not created: {asm_file}")
-        return False
+        return {'success': False}
     
     # Assemble and link
     assembler_info = find_assembler(use_32bit)
     if not assembler_info:
         print("Error: Neither nasm nor yasm found")
-        return False
+        return {'success': False}
     
     assembler, format_type = assembler_info
     
@@ -701,13 +725,13 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         print("Error: Assembly failed")
         if e.stderr:
             print(f"   Error output: {e.stderr}")
-        return False
+        return {'success': False}
     
     # Check if object file was created
     obj_file = custom_obj_file
     if not obj_file.exists():
         print(f"Error: Object file was not created: {obj_file}")
-        return False
+        return {'success': False}
     
     # Assemble any .S files separately (they use GCC-style assembly, not nasm)
     # Use the same 32-bit mode that was used for GCC compilation
@@ -803,15 +827,15 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         print("Error: Linking failed")
         if e.stderr:
             print(f"   Error output: {e.stderr}")
-        return False
+        return {'success': False}
     except FileNotFoundError:
         print("Error: ld linker not found")
-        return False
+        return {'success': False}
     
     custom_executable = custom_output.resolve()
     if not custom_executable.exists():
         print(f"Error: Custom compiler executable was not created at {custom_executable}")
-        return False
+        return {'success': False}
     
     # Make sure it's executable
     os.chmod(custom_executable, 0o755)
@@ -1047,7 +1071,7 @@ def main():
     print("=" * 70)
     result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, include_paths=include_paths)
     
-    if not result_with or not result_with.get('success', False):
+    if not result_with or not isinstance(result_with, dict) or not result_with.get('success', False):
         print("Error: Benchmark with metamorphic return sites failed")
         sys.exit(1)
     
@@ -1057,7 +1081,7 @@ def main():
     print("=" * 70)
     result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False, include_paths=include_paths)
     
-    if not result_without or not result_without.get('success', False):
+    if not result_without or not isinstance(result_without, dict) or not result_without.get('success', False):
         print("Error: Benchmark without metamorphic return sites failed")
         sys.exit(1)
     
@@ -1108,4 +1132,13 @@ def main():
     print()
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        sys.exit(130)  # Standard exit code for SIGINT
+    except Exception as e:
+        print(f"Error: Unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

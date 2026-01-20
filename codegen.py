@@ -753,8 +753,10 @@ class CodeGenerator:
         
         # Calculate offset from RBP (standard GCC-style addressing for performance)
         # Variables are allocated at RBP - 8, RBP - 16, RBP - 24, etc. (8-byte alignment)
-        # Offset calculation: saved RBP is at [RBP], first variable at [RBP - 8], etc.
-        stack_offset = (slot_index + 1) * 8 + offset  # +1 for saved RBP
+        # Note: RBP points to RSP after alignment adjustment (8 bytes below where R13 was pushed)
+        # Stack layout (64-bit): [RBP+24]=saved RBP, [RBP+16]=saved R12, [RBP+8]=saved R13, [RBP]=alignment space, [RBP-8]=first var
+        # Stack layout (32-bit): [RBP+8]=saved RBP, [RBP]=saved frame, [RBP-8]=first var
+        stack_offset = (slot_index + 1) * 8 + offset  # +1 for alignment space/saved frame
         
         # Use standard [RBP - offset] addressing (more efficient than [R12 + displacement])
         if self.use_32bit:
@@ -807,7 +809,10 @@ class CodeGenerator:
         
         # Calculate offset from RBP (standard GCC-style addressing for performance)
         # Variables are allocated at RBP - 8, RBP - 16, RBP - 24, etc. (8-byte alignment)
-        stack_offset = (slot_index + 1) * 8 + offset  # +1 for saved RBP
+        # Note: RBP points to RSP after alignment adjustment (8 bytes below where R13 was pushed)
+        # Stack layout (64-bit): [RBP+24]=saved RBP, [RBP+16]=saved R12, [RBP+8]=saved R13, [RBP]=alignment space, [RBP-8]=first var
+        # Stack layout (32-bit): [RBP+8]=saved RBP, [RBP]=saved frame, [RBP-8]=first var
+        stack_offset = (slot_index + 1) * 8 + offset  # +1 for alignment space/saved frame
         
         # Use standard [RBP - offset] addressing (more efficient than [R12 + displacement])
         # Use 32-bit move for integers (more efficient than 64-bit)
@@ -928,10 +933,14 @@ class CodeGenerator:
             if not self.function_needs_indexed_stack:
                 self.function_needs_indexed_stack = True
                 # Generate indexed stack prologue (with R12/R13 for indexed stack system)
+                # Note: After CALL, stack is 8-byte aligned. We push 3 registers (24 bytes),
+                # so we need to adjust RSP by 8 bytes to maintain 16-byte alignment
                 self.output.append(f"    PUSH {self.reg_rbp}  ; Save old frame pointer")
                 if not self.use_32bit:
                     self.output.append(f"    PUSH {self.stack_base_register}  ; Preserve stack base register")
                     self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
+                    # Adjust RSP to maintain 16-byte stack alignment (3 pushes = 24 bytes, need 32)
+                    self.output.append(f"    SUB {self.reg_rsp}, 8  ; Adjust for 16-byte stack alignment")
                 self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
                 if not self.use_32bit:
                     self.output.append(f"    MOV {self.stack_base_register}, 0x7FFF0000  ; Load stack base (immediate)")
@@ -994,6 +1003,7 @@ class CodeGenerator:
                                     self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
                                 self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
                                 if not self.use_32bit:
+                                    self.output.append(f"    ADD {self.reg_rsp}, 8  ; Restore RSP alignment adjustment")
                                     self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
                                     self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
                                 self.output.append(f"    POP {self.reg_rbp}")
@@ -1070,6 +1080,7 @@ class CodeGenerator:
                     self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
                 self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
                 if not self.use_32bit:
+                    self.output.append(f"    ADD {self.reg_rsp}, 8  ; Restore RSP alignment adjustment")
                     self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
                     self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
                 self.output.append(f"    POP {self.reg_rbp}")
@@ -1099,6 +1110,7 @@ class CodeGenerator:
                     self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Reset stack index")
                 self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
                 if not self.use_32bit:
+                    self.output.append(f"    ADD {self.reg_rsp}, 8  ; Restore RSP alignment adjustment")
                     self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
                     self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
                 self.output.append(f"    POP {self.reg_rbp}")
@@ -2789,10 +2801,14 @@ class CodeGenerator:
         if not self.function_needs_indexed_stack:
             self.function_needs_indexed_stack = True
             # Generate indexed stack prologue (with R12/R13 for indexed stack system)
+            # Note: After CALL, stack is 8-byte aligned. We push 3 registers (24 bytes),
+            # so we need to adjust RSP by 8 bytes to maintain 16-byte alignment
             self.output.append(f"    PUSH {self.reg_rbp}  ; Save old frame pointer")
             if not self.use_32bit:
                 self.output.append(f"    PUSH {self.stack_base_register}  ; Preserve stack base register")
                 self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
+                # Adjust RSP to maintain 16-byte stack alignment (3 pushes = 24 bytes, need 32)
+                self.output.append(f"    SUB {self.reg_rsp}, 8  ; Adjust for 16-byte stack alignment")
             self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
             if not self.use_32bit:
                 self.output.append(f"    MOV {self.stack_base_register}, 0x7FFF0000  ; Load stack base (immediate)")
