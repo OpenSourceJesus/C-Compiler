@@ -236,19 +236,30 @@ class CodeGenerator:
             self.output.append("    INT 0x80" if self.use_32bit else "    SYSCALL")
             self.output.append("")
         
-        # Generate small functions with indexed-jump support
+        # Set small-function offsets and emit co-located small function block (dispatch inlined at call sites)
         if small_funcs:
             self._generate_indexed_jump_table(small_funcs)
-            self.output.append("")
+            self.output.append("; Co-located small functions (<1024 bytes) in 1024-byte slots")
+            self.output.append(f"ALIGN {self.SMALL_FUNC_SLOT_SIZE}")
+            self.output.append("SMALL_FUNC_BASE:")
+            for func in small_funcs:
+                func_name = func.decl.name if func.decl else "unknown"
+                self._generate_function(func, in_small_func_block=True)
+                # Pad to 1024-byte slot so address = SMALL_FUNC_BASE + index*1024
+                self.output.append(f"    ; Pad to 1024-byte slot for indexed-jump co-location")
+                self.output.append(f"%if ($ - FUNC_{func_name}) < {self.SMALL_FUNC_SLOT_SIZE}")
+                self.output.append(f"times {self.SMALL_FUNC_SLOT_SIZE} - ($ - FUNC_{func_name}) db 0x90")
+                self.output.append("%endif")
+                self.output.append("")
         
         # Generate SIMD bit-packing init function (after entry point, before other functions)
         if self.global_var_data['packed_vars']:
             self._generate_simd_packing_init()
             self.output.append("")
         
-        # Generate all functions
-        for func in small_funcs + large_funcs:
-            self._generate_function(func)
+        # Generate large functions (small functions already emitted in co-located block)
+        for func in large_funcs:
+            self._generate_function(func, in_small_func_block=False)
             self.output.append("")
         
         # Generate data section for function table and global variables
@@ -277,40 +288,17 @@ class CodeGenerator:
         
         return "\n".join(sanitized_output)
     
+    SMALL_FUNC_SLOT_SIZE = 1024  # Co-locate small functions in 1024-byte slots
+
     def _generate_indexed_jump_table(self, small_funcs):
-        """Generate indexed-jump table for small functions."""
-        self.output.append("; Indexed-jump table for small functions (<1024 bytes)")
-        self.output.append("JUMP_TABLE:")
-        
-        base_addr = 0x1000  # Base address for small functions
+        """Set function_offsets for co-located small functions (<1024 bytes).
+        Dispatch is inlined at each call site (one CALL only); no separate INDEXED_JUMP routine.
+        """
         offset = 0
-        
         for func in small_funcs:
             func_name = func.decl.name if func.decl else "unknown"
             self.function_offsets[func_name] = offset
-            if self.use_32bit:
-                self.output.append(f"    DD FUNC_{func_name}  ; Index {offset}: {func_name} (32-bit)")
-            else:
-                self.output.append(f"    DQ FUNC_{func_name}  ; Index {offset}: {func_name}")
             offset += 1
-        
-        self.output.append("")
-        self.output.append("; Indexed-jump dispatcher")
-        self.output.append("INDEXED_JUMP:")
-        if self.use_32bit:
-            # In 32-bit, RDI contains function index (was saved/restored around call)
-            self.output.append(f"    ; {self.reg_rdi} contains function index")
-            self.output.append(f"    MOV {self.reg_rax}, JUMP_TABLE")
-            self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax} + {self.reg_rdi}*4]")  # 32-bit: 4 bytes per pointer
-        else:
-            # In 64-bit, use R11 (scratch register) for index to preserve RDI
-            index_reg = 'R11'
-            self.output.append(f"    ; {index_reg} contains function index (RDI preserved for arguments)")
-            self.output.append(f"    MOV {self.reg_rax}, JUMP_TABLE")
-            self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax} + {index_reg}*8]")  # 64-bit: 8 bytes per pointer
-        self.output.append(f"    CALL {self.reg_rax}  ; Call function via pointer")
-        self.output.append(f"    RET  ; Return to caller after function returns")
-        self.output.append("")
     
     def _generate_function_table(self, small_funcs):
         """Generate function pointer table."""
@@ -869,8 +857,11 @@ class CodeGenerator:
             self.output.append(f"    ; Extract: low = RAX & 0xFFFFFFFF, high = (RAX >> 32) & 0xFFFFFFFF")
             self.output.append(f"    ; Addresses: [R12 + low*16] and [R12 + high*16]")
     
-    def _generate_function(self, func_def):
-        """Generate code for a single function."""
+    def _generate_function(self, func_def, in_small_func_block=False):
+        """Generate code for a single function.
+        When in_small_func_block is True, the function is co-located in SMALL_FUNC_BASE
+        and must not add alignment (slot is fixed at 1024 bytes).
+        """
         func_name = func_def.decl.name if func_def.decl else "unknown"
         # Skip functions with "unknown" names - they're likely parsing errors
         if func_name == "unknown":
@@ -913,8 +904,9 @@ class CodeGenerator:
                                 param_name = str(param.name)
                             self.function_parameters[param_name] = param_registers[i]
         
-        # Align function start to 16 bytes for quantized call-backs
-        self.output.append(f"ALIGN {self.alignment}")
+        # Align function start to 16 bytes for quantized call-backs (skip when co-located in 1024-byte slot)
+        if not in_small_func_block:
+            self.output.append(f"ALIGN {self.alignment}")
         self.output.append(f"FUNC_{func_name}:")
         
         if is_interrupt:
@@ -973,7 +965,7 @@ class CodeGenerator:
                         self.output.append("    SYSCALL")
                     # No epilogue needed - syscall doesn't modify stack
                     
-                    # Syscall functions are typically small and called via INDEXED_JUMP,
+                    # Syscall functions are typically small and called via inlined indexed dispatch,
                     # so use normal RET instead of metamorphic return for compatibility
                     self.output.append("    RET")
                     return
@@ -987,7 +979,7 @@ class CodeGenerator:
             has_any_return = block_items and any(isinstance(item, c_ast.Return) for item in block_items)
             if not has_any_return:
                 # Generate implicit return (fall-through case)
-                # Small functions (in jump table) use normal RET since they're called via INDEXED_JUMP
+                # Small functions use normal RET since they're called via inlined indexed dispatch
                 # Use metamorphic return site if function has single return (implicit) and is not small
                 if self.enable_metamorphic_return_sites and info.get('has_single_return', False) and not info.get('is_small', False):
                             # Metamorphic return site for implicit return
@@ -1065,7 +1057,7 @@ class CodeGenerator:
     
     def _generate_return(self, ret_stmt, func_name, info):
         """Generate return statement with metamorphic return site optimization."""
-        # Small functions (in jump table) use normal RET since they're called via INDEXED_JUMP
+        # Small functions use normal RET since they're called via inlined indexed dispatch
         if self.enable_metamorphic_return_sites and info.get('has_single_return', False) and not info.get('is_small', False):
             # Metamorphic return site: return address is embedded in instruction bytes
             # Generate a label for the metamorphic return site
@@ -1362,21 +1354,23 @@ class CodeGenerator:
         else:
             # Generate call based on function type
             if callee_info.get('is_small', False):
-                # Indexed-jump call for small functions
+                # One call/jump only: inline dispatch so address = SMALL_FUNC_BASE + index*1024, then single CALL
                 func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
                 if func_idx >= 0:
-                    self.output.append(f"    ; Indexed-jump call to {func_name}")
-                    # In 64-bit mode, use R11 to preserve RDI for function arguments
+                    self.output.append(f"    ; Single call to {func_name} (SMALL_FUNC_BASE + index*1024)")
                     if self.use_32bit:
-                        self.output.append(f"    MOV {self.reg_rdi}, {func_idx}")
+                        # Use EBX as temp so EDI (first arg) is preserved; one CALL
+                        self.output.append(f"    MOV EBX, {func_idx}  ; Function index")
+                        self.output.append(f"    MOV EAX, SMALL_FUNC_BASE")
+                        self.output.append(f"    SHL EBX, 10  ; index * 1024")
+                        self.output.append(f"    ADD EAX, EBX")
+                        self.output.append(f"    CALL EAX  ; One call only")
                     else:
-                        self.output.append(f"    MOV R11, {func_idx}  ; Function index (preserve RDI for arguments)")
-                    
-                    # Don't use metamorphic return for functions called via INDEXED_JUMP
-                    # They should use normal RET to return to INDEXED_JUMP, which will then RET to caller
-                    # Metamorphic return only works for direct calls
-                    
-                    self.output.append("    CALL INDEXED_JUMP")
+                        self.output.append(f"    MOV {self.reg_rax}, SMALL_FUNC_BASE")
+                        self.output.append(f"    MOV R11, {func_idx}  ; Function index")
+                        self.output.append(f"    SHL R11, 10  ; index * 1024")
+                        self.output.append(f"    ADD {self.reg_rax}, R11")
+                        self.output.append(f"    CALL {self.reg_rax}  ; One call only")
                 else:
                     # Fallback to direct call if not in jump table
                     self.output.append(f"    CALL FUNC_{func_name}")

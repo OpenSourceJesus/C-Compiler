@@ -90,21 +90,8 @@ def find_linker_script(input_path):
 			# Also check subdirectories
 			for subdir in ['src', 'kernel', 'src/kernel', 'build']:
 				linker_script = current / subdir / 'linker.ld'
-				if linker_script.exists():
-					return str(linker_script)
-	
-	# Check for minikraft directory structure in common locations
-	minikraft_paths = [
-		Path('/home/gileadcosman/pythonlinux/minikraft/src/kernel/linker.ld'),
-		Path.home() / 'minikraft' / 'src' / 'kernel' / 'linker.ld',
-		Path.home() / 'minikraft' / 'linker.ld',
-		Path('/home/gileadcosman/minikraft/src/kernel/linker.ld'),
-		Path('/home/gileadcosman/minikraft/linker.ld'),
-	]
-	
-	for path in minikraft_paths:
-		if path.exists():
-			return str(path)
+			if linker_script.exists():
+				return str(linker_script)
 	
 	# Check current working directory
 	cwd = Path.cwd()
@@ -172,19 +159,20 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 			print(f"Using linker script: {linker_script}", file=sys.stderr)
 	
 	try:
-		# Build linker command
-		# Use -N to make text and data readable and writable (omagic for both)
-		# This is needed for data access in bare executables
-		link_cmd = ['ld', '-N', obj_file, '-o', output_executable]
+		# Build linker command.
+		# Do not use -N (omagic) by default: it disables page alignment and can cause
+		# segmentation faults when running normal Linux executables. Use -N only when
+		# a linker script is provided (bare-metal / custom layout).
+		link_cmd = ['ld', obj_file, '-o', output_executable]
 		
 		# Add 32-bit emulation if needed
 		if use_32bit:
 			link_cmd.insert(1, '-m')
 			link_cmd.insert(2, 'elf_i386')
 		
-		# Make code section writable for metamorphic return sites
+		# Make code section writable for metamorphic return sites when using a linker script.
 		# If a linker script is provided, modify it to include W (write) in text FLAGS
-		# since PHDRS FLAGS override the -N flag
+		# since PHDRS FLAGS override the -N flag.
 		actual_linker_script = linker_script
 		if linker_script:
 			try:
@@ -234,11 +222,8 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 		# Add linker script if provided
 		if actual_linker_script:
 			link_cmd.extend(['-T', actual_linker_script])
-		
-		# Make code section writable for metamorphic return sites
-		# -N (omagic) makes text section writable and data section executable
-		# This is required for self-modifying code (metamorphic return sites)
-		link_cmd.append('-N')
+			# -N (omagic) for bare-metal: writable text/data, no page alignment (needed for custom layout)
+			link_cmd.append('-N')
 		
 		result = subprocess.run(
 			link_cmd,
