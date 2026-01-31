@@ -92,12 +92,14 @@ FUNC_create_task:
     POP EAX  ; Return original value
     MOV EAX, [GLOBAL_task_count]  ; Load global variable
     SUB EAX, 1
+    POP EBX  ; Restore callee-saved RBX
     RET
     JMP END_IF_79
 ELSE_79:
 END_IF_79:
     MOV EAX, 1
     NEG EAX
+    POP EBX  ; Restore callee-saved RBX
     RET
     ; Pad to 1024-byte slot for indexed-jump co-location
 %if ($ - FUNC_create_task) < 1024
@@ -111,19 +113,19 @@ FUNC_switch_task:
     SETGE AL
     MOVZX EAX, AL
     TEST EAX, EAX
-    JZ ELSE_107
+    JZ ELSE_109
     MOV EBX, EDI  ; Use task_id from register
     MOV EAX, [GLOBAL_task_count]  ; Load global variable
     CMP EBX, EAX
     SETL AL
     MOVZX EAX, AL
     TEST EAX, EAX
-    JZ ELSE_107
+    JZ ELSE_109
     MOV EAX, EDI  ; Load parameter task_id
     MOV [GLOBAL_active_task], EAX
-    JMP END_IF_107
-ELSE_107:
-END_IF_107:
+    JMP END_IF_109
+ELSE_109:
+END_IF_109:
     RET
     ; Pad to 1024-byte slot for indexed-jump co-location
 %if ($ - FUNC_switch_task) < 1024
@@ -161,8 +163,8 @@ FUNC_interrupt_handler:
     ALIGN 16
 RET_SITE_interrupt_handler_1:  ; Quantized call-back (16-byte aligned)
     ; Return site offset: 1 (stored in single byte)
-    MOV ESP, EBP  ; Restore stack pointer
-    POP EBP  ; Restore frame pointer
+    MOV ESP, EBP
+    POP EBP
     RET
     ; Pad to 1024-byte slot for indexed-jump co-location
 %if ($ - FUNC_interrupt_handler) < 1024
@@ -170,15 +172,14 @@ times 1024 - ($ - FUNC_interrupt_handler) db 0x90
 %endif
 
 FUNC_main:
+    PUSH EBX  ; Callee-saved: preserve RBX
     PUSH EBP  ; Save old frame pointer
     MOV EBP, ESP  ; Set new frame pointer
-    SUB ESP, 8  ; Allocate stack space for task1
+    SUB ESP, 40  ; Allocate stack for all locals
     XOR EAX, EAX  ; Initialize task1 to 0
     MOV [EBP - 8], EAX  ; Store task1
-    SUB ESP, 8  ; Allocate stack space for task2
     XOR EAX, EAX  ; Initialize task2 to 0
     MOV [EBP - 16], EAX  ; Store task2
-    SUB ESP, 8  ; Allocate stack space for task3
     XOR EAX, EAX  ; Initialize task3 to 0
     MOV [EBP - 24], EAX  ; Store task3
     ; Single call to kernel_init (SMALL_FUNC_BASE + index*1024)
@@ -253,17 +254,16 @@ RET_SITE_main_5:  ; Quantized call-back (16-byte aligned)
     ALIGN 16
 RET_SITE_main_6:  ; Quantized call-back (16-byte aligned)
     ; Return site offset: 6 (stored in single byte)
-    SUB ESP, 8  ; Allocate stack space for i
     MOV EAX, 0
     MOV EBX, EAX  ; Initialize i in register EBX
-FOR_255:
+FOR_256:
     MOV EBX, EBX  ; Use i from register
     MOV EAX, 1000000
     CMP EBX, EAX
     SETL AL
     MOVZX EAX, AL
     TEST EAX, EAX
-    JZ END_FOR_255
+    JZ END_FOR_256
     ; Single call to kernel_tick (SMALL_FUNC_BASE + index*1024)
     MOV EBX, 2  ; Function index
     MOV EAX, SMALL_FUNC_BASE
@@ -280,12 +280,15 @@ RET_SITE_main_7:  ; Quantized call-back (16-byte aligned)
     MOV DWORD [EBP - 32], EAX  ; Store i
     MOV EBX, EAX  ; Update i in register EBX
     POP EAX  ; Return original value
-    JMP FOR_255
-END_FOR_255:
+    JMP FOR_256
+END_FOR_256:
     MOV EAX, 0
     XOR ECX, ECX  ; Reset stack index
     MOV ESP, EBP
+    POP ECX  ; Restore stack index register
+    POP EBX  ; Restore stack base register
     POP EBP
+    POP EBX  ; Restore callee-saved RBX
     RET
     ; Pad to 1024-byte slot for indexed-jump co-location
 %if ($ - FUNC_main) < 1024

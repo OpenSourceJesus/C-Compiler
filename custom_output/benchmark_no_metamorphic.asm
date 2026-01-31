@@ -21,6 +21,7 @@ _start:
 ALIGN 1024
 SMALL_FUNC_BASE:
 FUNC_main:
+    PUSH RBX  ; Callee-saved: preserve RBX
     PUSH RBP  ; Save old frame pointer
     PUSH R12  ; Preserve stack base register
     PUSH R13  ; Preserve stack index register
@@ -28,20 +29,19 @@ FUNC_main:
     MOV RBP, RSP  ; Set new frame pointer
     MOV R12, 0x7FFF0000  ; Load stack base (immediate)
     XOR R13, R13  ; Initialize slot index to 0
-    SUB RSP, 8  ; Allocate stack space for iterations
+    SUB RSP, 24  ; Allocate stack for all locals
     MOV RAX, 1000000
     MOV R8D, EAX  ; Initialize iterations in register R8 (32-bit)
-    SUB RSP, 8  ; Allocate stack space for i
     MOV RAX, 0
     MOV EBX, EAX  ; Initialize i in register RBX (32-bit)
-FOR_33:
-    MOV RBX, RBX  ; Use i from register
+FOR_34:
+    MOV R10, RBX  ; Use i from register
     MOV EAX, R8D  ; Load iterations from register R8 (32-bit)
-    CMP RBX, RAX
+    CMP R10, RAX
     SETL AL
     MOVZX RAX, AL
     TEST RAX, RAX
-    JZ END_FOR_33
+    JZ END_FOR_34
     MOV RAX, 5000
     MOV BYTE [GLOBAL_a], AL  ; Store to packed variable
     MOV EAX, EBX  ; Load i from register RBX (32-bit)
@@ -51,8 +51,8 @@ FOR_33:
     MOV DWORD [RBP - 16], EAX  ; Store i
     MOV EBX, EAX  ; Update i in register RBX (32-bit)
     POP RAX  ; Return original value
-    JMP FOR_33
-END_FOR_33:
+    JMP FOR_34
+END_FOR_34:
     MOV RAX, 0
     XOR R13, R13  ; Reset stack index
     MOV RSP, RBP
@@ -60,6 +60,7 @@ END_FOR_33:
     POP R13  ; Restore stack index register
     POP R12  ; Restore stack base register
     POP RBP
+    POP RBX  ; Restore callee-saved RBX
     RET
     ; Pad to 1024-byte slot for indexed-jump co-location
 %if ($ - FUNC_main) < 1024

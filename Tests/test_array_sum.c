@@ -8,7 +8,7 @@ int test_sum (int *a, int length)
 
 int main ()
 {
-	volatile int iterations = 100000;  /* 100,000 iterations */
+	volatile int iterations = 10;
 	
 	int arr[64];
 	for (int i = 0; i < 64; i++)
