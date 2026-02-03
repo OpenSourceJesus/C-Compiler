@@ -2586,11 +2586,11 @@ class CodeGenerator:
                     if member_offset > 0:
                         self.output.append(f"    ADD {self.reg_rax}, {member_offset}")
                 
-                # Save member address
-                self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Save member address in RBX")
+                # Save member address (use RSI, not RBX which might be allocated to a variable)
+                self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Save member address in RSI")
                 # Load current value from member
-                self.output.append(f"    MOV EAX, DWORD [{self.reg_rbx}]  ; Load current value from member")
-                self.output.append(f"    PUSH {self.reg_rbx}  ; Save member address for later store")
+                self.output.append(f"    MOV EAX, DWORD [{self.reg_rsi}]  ; Load current value from member")
+                self.output.append(f"    PUSH {self.reg_rsi}  ; Save member address for later store")
             else:
                 # Complex lvalue - generate expression
                 self._generate_expression(assign.lvalue)
@@ -2682,58 +2682,58 @@ class CodeGenerator:
                 
                 if struct_type == '->':
                     # Pointer access: p->x = value
-                    # First, get the pointer value
+                    # First, get the pointer value (use RSI, not RBX which might be allocated to a variable)
                     if isinstance(assign.lvalue.name, c_ast.ID):
                         ptr_name = assign.lvalue.name.name
                         if ptr_name in self.function_parameters:
                             # Parameter - it's in a register
                             param_reg = self.function_parameters[ptr_name]
-                            self.output.append(f"    MOV {self.reg_rbx}, {param_reg}  ; Get struct pointer {ptr_name}")
+                            self.output.append(f"    MOV {self.reg_rsi}, {param_reg}  ; Get struct pointer {ptr_name}")
                         else:
                             # Local variable
                             self._generate_local_var_load(ptr_name)
-                            self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Get struct pointer")
+                            self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Get struct pointer")
                     else:
                         self._generate_expression(assign.lvalue.name)
-                        self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Get struct pointer")
+                        self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Get struct pointer")
                     
                     # Add member offset
                     if member_offset > 0:
-                        self.output.append(f"    ADD {self.reg_rbx}, {member_offset}  ; Add member offset for {member_name}")
+                        self.output.append(f"    ADD {self.reg_rsi}, {member_offset}  ; Add member offset for {member_name}")
                     
                     # Now generate the rvalue
                     self._generate_expression(assign.rvalue)
                     
                     # Store the value
-                    self.output.append(f"    MOV DWORD [{self.reg_rbx}], EAX  ; Store to struct member {member_name}")
+                    self.output.append(f"    MOV DWORD [{self.reg_rsi}], EAX  ; Store to struct member {member_name}")
                 else:
                     # Direct access: s.x = value
-                    # Generate address of struct
+                    # Generate address of struct (use RSI, not RBX which might be allocated to a variable)
                     if isinstance(assign.lvalue.name, c_ast.ID):
                         struct_name = assign.lvalue.name.name
                         globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                         if struct_name in globals:
-                            self.output.append(f"    LEA {self.reg_rbx}, [GLOBAL_{struct_name}]  ; Get struct address")
+                            self.output.append(f"    LEA {self.reg_rsi}, [GLOBAL_{struct_name}]  ; Get struct address")
                         elif struct_name in self.current_function_stack:
                             slot_index, offset = self.current_function_stack[struct_name]
                             stack_offset = (slot_index + 1) * 8 + offset
-                            self.output.append(f"    LEA {self.reg_rbx}, [{self.reg_rbp} - {stack_offset}]  ; Get local struct address")
+                            self.output.append(f"    LEA {self.reg_rsi}, [{self.reg_rbp} - {stack_offset}]  ; Get local struct address")
                         else:
                             self._generate_expression(assign.lvalue.name)
-                            self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}")
+                            self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}")
                     else:
                         self._generate_expression(assign.lvalue.name)
-                        self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}")
+                        self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}")
                     
                     # Add member offset
                     if member_offset > 0:
-                        self.output.append(f"    ADD {self.reg_rbx}, {member_offset}  ; Add member offset for {member_name}")
+                        self.output.append(f"    ADD {self.reg_rsi}, {member_offset}  ; Add member offset for {member_name}")
                     
                     # Now generate the rvalue
                     self._generate_expression(assign.rvalue)
                     
                     # Store the value
-                    self.output.append(f"    MOV DWORD [{self.reg_rbx}], EAX  ; Store to struct member {member_name}")
+                    self.output.append(f"    MOV DWORD [{self.reg_rsi}], EAX  ; Store to struct member {member_name}")
             elif isinstance(assign.lvalue, c_ast.ID):
                 # Generate the rvalue expression first
                 self._generate_expression(assign.rvalue)
@@ -2804,39 +2804,43 @@ class CodeGenerator:
                                         type_node = type_node.type
                                     break
                 
-                # Generate base address
+                # Generate base address - use RDI as temp (safe: parameter register, can be reused)
+                # Avoid RBX since it might be allocated to a loop variable
+                base_reg = self.reg_rdi  # Use RDI as base temp
                 if isinstance(assign.lvalue.name, c_ast.ID):
                     # Array variable name
                     name = assign.lvalue.name.name
-                    # Parameter (pointer): base is in argument register
+                    # Parameter (pointer): base is in argument register - use it directly
                     if name in self.function_parameters:
                         param_reg = self.function_parameters[name]
-                        self.output.append(f"    MOV {self.reg_rbx}, {param_reg}  ; Base from parameter {name}")
+                        if param_reg != base_reg:
+                            self.output.append(f"    MOV {base_reg}, {param_reg}  ; Base from parameter {name}")
+                        # else: already in the right register
                     else:
                         # Check if it's a global variable
                         globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                         if name in globals:
                             # Global array - use position-independent addressing in 64-bit mode
                             if self.use_32bit:
-                                self.output.append(f"    MOV {self.reg_rbx}, GLOBAL_{name}  ; Base address of array")
+                                self.output.append(f"    MOV {base_reg}, GLOBAL_{name}  ; Base address of array")
                             else:
-                                self.output.append(f"    LEA {self.reg_rbx}, [rel GLOBAL_{name}]  ; Base address of array (PIC)")
+                                self.output.append(f"    LEA {base_reg}, [rel GLOBAL_{name}]  ; Base address of array (PIC)")
                         else:
                             # Local array - use address of stack allocation (LEA), not stored value
                             if name in self.current_function_stack:
                                 slot_index, offset = self.current_function_stack[name]
                                 stack_offset = (slot_index + 1) * 8 + offset
                                 if self.use_32bit:
-                                    self.output.append(f"    LEA {self.reg_rbx}, [{self.reg_rbp} - {stack_offset}]  ; Base address of local array")
+                                    self.output.append(f"    LEA {base_reg}, [{self.reg_rbp} - {stack_offset}]  ; Base address of local array")
                                 else:
-                                    self.output.append(f"    LEA {self.reg_rbx}, [{self.reg_rbp} - {stack_offset}]  ; Base address of local array")
+                                    self.output.append(f"    LEA {base_reg}, [{self.reg_rbp} - {stack_offset}]  ; Base address of local array")
                             else:
                                 self._generate_local_var_load(name)
-                                self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Base address")
+                                self.output.append(f"    MOV {base_reg}, {self.reg_rax}  ; Base address")
                 else:
                     # Complex expression for base
                     self._generate_expression(assign.lvalue.name)
-                    self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rax}  ; Base address")
+                    self.output.append(f"    MOV {base_reg}, {self.reg_rax}  ; Base address")
                 
                 # Get index from stack
                 self.output.append(f"    POP {self.reg_rax}  ; Get index")
@@ -2846,24 +2850,23 @@ class CodeGenerator:
                 # Use LEA with scaled addressing for small element sizes (more efficient, doesn't corrupt RDX)
                 if element_size == 1:
                     # char: base + index * 1
-                    self.output.append(f"    LEA {self.reg_rax}, [{self.reg_rbx} + {self.reg_rax}*1]  ; base + index")
+                    self.output.append(f"    LEA {self.reg_rax}, [{base_reg} + {self.reg_rax}*1]  ; base + index")
                 elif element_size == 2:
                     # short: base + index * 2
-                    self.output.append(f"    LEA {self.reg_rax}, [{self.reg_rbx} + {self.reg_rax}*2]  ; base + index*2")
+                    self.output.append(f"    LEA {self.reg_rax}, [{base_reg} + {self.reg_rax}*2]  ; base + index*2")
                 elif element_size == 4:
                     # int: base + index * 4
-                    self.output.append(f"    LEA {self.reg_rax}, [{self.reg_rbx} + {self.reg_rax}*4]  ; base + index*4")
+                    self.output.append(f"    LEA {self.reg_rax}, [{base_reg} + {self.reg_rax}*4]  ; base + index*4")
                 elif element_size == 8:
                     # long/pointer: base + index * 8
-                    self.output.append(f"    LEA {self.reg_rax}, [{self.reg_rbx} + {self.reg_rax}*8]  ; base + index*8")
-                # Note: RBX is used for base address, but we need to preserve it if it's callee-saved
-                # For now, we'll use it as a temporary since array assignments are typically in leaf functions
+                    self.output.append(f"    LEA {self.reg_rax}, [{base_reg} + {self.reg_rax}*8]  ; base + index*8")
+                # Note: Using RDI as base temp instead of RBX to avoid conflicts with register-allocated variables
                 else:
                     # For other sizes, use MUL (but this corrupts RDX, so be careful)
                     self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save index")
                     self.output.append(f"    MOV {self.reg_rax}, {element_size}  ; Size of {element_type}")
                     self.output.append(f"    MUL {self.reg_rcx}  ; {self.reg_rax} = index * {element_size}")
-                    self.output.append(f"    ADD {self.reg_rax}, {self.reg_rbx}  ; {self.reg_rax} = base + offset")
+                    self.output.append(f"    ADD {self.reg_rax}, {base_reg}  ; {self.reg_rax} = base + offset")
                 
                 # Store value to memory (value was pushed before index; we popped index, so pop value now)
                 self.output.append(f"    POP {self.reg_rcx}  ; Get value to assign")
@@ -3049,7 +3052,8 @@ class CodeGenerator:
         if node is None:
             return 0
         if isinstance(node, c_ast.Decl) and getattr(node, 'name', None):
-            total += self._compute_decl_size(node)
+            if not (getattr(node, 'storage', None) and 'extern' in node.storage):
+                total += self._compute_decl_size(node)
         if isinstance(node, c_ast.Compound) and getattr(node, 'block_items', None):
             for item in node.block_items:
                 total += self._compute_function_local_stack_size(item)
@@ -3072,6 +3076,9 @@ class CodeGenerator:
     
     def _generate_decl(self, decl):
         """Generate code for variable declaration with indexed stack pointer."""
+        # extern declarations: variable defined elsewhere, do not allocate local storage
+        if getattr(decl, 'storage', None) and 'extern' in decl.storage:
+            return
         # Extract variable name - decl.name might be a string or an ID node
         if decl.name is None:
             # No name - skip this declaration
