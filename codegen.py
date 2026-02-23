@@ -1550,23 +1550,23 @@ class CodeGenerator:
         else:
             # Generate call based on function type
             if callee_info.get('is_small', False):
-                # One call/jump only: inline dispatch so address = SMALL_FUNC_BASE + index*1024, then single CALL
+                # One call/jump only: inline dispatch so address = SMALL_FUNC_BASE + index*1024, then single JMP
                 func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
                 if func_idx >= 0:
-                    self.output.append(f"    ; Single call to {func_name} (SMALL_FUNC_BASE + index*1024)")
+                    offset = func_idx * 1024
+                    self.output.append(f"    ; Single jump to {func_name} (SMALL_FUNC_BASE + {offset})")
                     if self.use_32bit:
-                        # Use EBX as temp so EDI (first arg) is preserved; one CALL
-                        self.output.append(f"    MOV EBX, {func_idx}  ; Function index")
+                        # Use EBX as temp so EDI (first arg) is preserved; one JMP
                         self.output.append(f"    MOV EAX, SMALL_FUNC_BASE")
-                        self.output.append(f"    SHL EBX, 10  ; index * 1024")
+                        self.output.append(f"    MOV EBX, {offset}  ; offset for {func_name}")
                         self.output.append(f"    ADD EAX, EBX")
-                        self.output.append(f"    CALL EAX  ; One call only")
+                        self.output.append(f"    JMP EAX  ; One jump only")
                     else:
-                        self.output.append(f"    MOV {self.reg_rax}, SMALL_FUNC_BASE")
-                        self.output.append(f"    MOV R11, {func_idx}  ; Function index")
-                        self.output.append(f"    SHL R11, 10  ; index * 1024")
-                        self.output.append(f"    ADD {self.reg_rax}, R11")
-                        self.output.append(f"    CALL {self.reg_rax}  ; One call only")
+                        # Use MOV for offset (no SHL), then JMP
+                        self.output.append(f"    MOV {self.reg_rbx}, SMALL_FUNC_BASE")
+                        self.output.append(f"    MOV EAX, {offset}  ; offset for {func_name}")
+                        self.output.append(f"    ADD {self.reg_rbx}, EAX")
+                        self.output.append(f"    JMP {self.reg_rbx}  ; One jump only")
                 else:
                     # Fallback to direct call if not in jump table
                     self.output.append(f"    CALL FUNC_{func_name}")
