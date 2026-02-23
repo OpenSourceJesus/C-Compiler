@@ -49,6 +49,7 @@ class CodeGenerator:
         self.simd_register = 'xmm15'  # Last SIMD register for bit-packing
         self.referenced_asm_symbols = set()  # Track which assembly symbols we've included
         self.variable_registers = {}  # Track which variables are currently in registers: {var_name: register}
+        self._loop_hoisted_small_funcs = None  # When in a loop: {func_name: reg} for precomputed jump addresses
         
         # Register names based on bit mode
         if use_32bit:
@@ -1551,25 +1552,31 @@ class CodeGenerator:
             # Generate call based on function type
             if callee_info.get('is_small', False):
                 # One call/jump only: inline dispatch so address = SMALL_FUNC_BASE + index*1024, then single JMP
-                func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
-                if func_idx >= 0:
-                    offset = func_idx * 1024
-                    self.output.append(f"    ; Single jump to {func_name} (SMALL_FUNC_BASE + {offset})")
-                    if self.use_32bit:
-                        # Use EBX as temp so EDI (first arg) is preserved; one JMP
-                        self.output.append(f"    MOV EAX, SMALL_FUNC_BASE")
-                        self.output.append(f"    MOV EBX, {offset}  ; offset for {func_name}")
-                        self.output.append(f"    ADD EAX, EBX")
-                        self.output.append(f"    JMP EAX  ; One jump only")
-                    else:
-                        # Use MOV for offset (no SHL), then JMP
-                        self.output.append(f"    MOV {self.reg_rbx}, SMALL_FUNC_BASE")
-                        self.output.append(f"    MOV EAX, {offset}  ; offset for {func_name}")
-                        self.output.append(f"    ADD {self.reg_rbx}, EAX")
-                        self.output.append(f"    JMP {self.reg_rbx}  ; One jump only")
+                # If we're inside a loop that hoisted this function's address, just JMP to that register
+                hoisted_reg = self._loop_hoisted_small_funcs.get(func_name) if self._loop_hoisted_small_funcs else None
+                if hoisted_reg:
+                    self.output.append(f"    ; Jump to {func_name} (address hoisted before loop)")
+                    self.output.append(f"    JMP {hoisted_reg}")
                 else:
-                    # Fallback to direct call if not in jump table
-                    self.output.append(f"    CALL FUNC_{func_name}")
+                    func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
+                    if func_idx >= 0:
+                        offset = func_idx * 1024
+                        self.output.append(f"    ; Single jump to {func_name} (SMALL_FUNC_BASE + {offset})")
+                        if self.use_32bit:
+                            # Use EBX as temp so EDI (first arg) is preserved; one JMP
+                            self.output.append(f"    MOV EAX, SMALL_FUNC_BASE")
+                            self.output.append(f"    MOV EBX, {offset}  ; offset for {func_name}")
+                            self.output.append(f"    ADD EAX, EBX")
+                            self.output.append(f"    JMP EAX  ; One jump only")
+                        else:
+                            # Use MOV for offset (no SHL), then JMP; use 64-bit RAX so ADD RBX, RAX is valid
+                            self.output.append(f"    MOV {self.reg_rbx}, SMALL_FUNC_BASE")
+                            self.output.append(f"    MOV {self.reg_rax}, {offset}  ; offset for {func_name}")
+                            self.output.append(f"    ADD {self.reg_rbx}, {self.reg_rax}")
+                            self.output.append(f"    JMP {self.reg_rbx}  ; One jump only")
+                    else:
+                        # Fallback to direct call if not in jump table
+                        self.output.append(f"    CALL FUNC_{func_name}")
             else:
                 # Standard call or call with metamorphic return
                 if self.enable_metamorphic_return_sites and callee_info.get('has_single_return', False) and return_site_label:
@@ -2963,10 +2970,40 @@ class CodeGenerator:
         
         self.output.append(f"{end_label}:")
     
+    def _emit_hoisted_small_func_address(self, func_name, reg):
+        """Emit code to compute SMALL_FUNC_BASE + offset for func_name into reg (before loop)."""
+        func_idx = list(self.function_offsets.keys()).index(func_name) if func_name in self.function_offsets else -1
+        if func_idx < 0:
+            return
+        offset = func_idx * 1024
+        if self.use_32bit:
+            self.output.append(f"    MOV EAX, SMALL_FUNC_BASE")
+            self.output.append(f"    MOV {reg}, {offset}  ; offset for {func_name}")
+            self.output.append(f"    ADD EAX, {reg}")
+            self.output.append(f"    MOV {reg}, EAX  ; hoisted jump address for {func_name}")
+        else:
+            self.output.append(f"    MOV {reg}, SMALL_FUNC_BASE")
+            self.output.append(f"    MOV {self.reg_rax}, {offset}  ; offset for {func_name}")
+            self.output.append(f"    ADD {reg}, {self.reg_rax}  ; hoisted jump address for {func_name}")
+    
     def _generate_while(self, while_stmt, func_name, info):
         """Generate code for while loop."""
         loop_label = f"WHILE_{len(self.output)}"
         end_label = f"END_WHILE_{len(self.output)}"
+        
+        small_funcs = self._collect_small_func_calls_in_stmt(while_stmt.stmt)
+        hoist_regs_64 = [self.reg_rbx, 'R12']
+        hoist_regs_32 = [self.reg_rbx, self.reg_rsi]
+        hoist_regs = hoist_regs_32 if self.use_32bit else hoist_regs_64
+        prev_hoisted = self._loop_hoisted_small_funcs
+        if small_funcs:
+            ordered = sorted(small_funcs)
+            self._loop_hoisted_small_funcs = {}
+            for i, f in enumerate(ordered):
+                if i < len(hoist_regs):
+                    reg = hoist_regs[i]
+                    self._emit_hoisted_small_func_address(f, reg)
+                    self._loop_hoisted_small_funcs[f] = reg
         
         self.output.append(f"{loop_label}:")
         self._generate_expression(while_stmt.cond)
@@ -2976,11 +3013,27 @@ class CodeGenerator:
         self._generate_statement(while_stmt.stmt, func_name, info)
         self.output.append(f"    JMP {loop_label}")
         self.output.append(f"{end_label}:")
+        
+        if small_funcs:
+            self._loop_hoisted_small_funcs = prev_hoisted
     
     def _generate_for(self, for_stmt, func_name, info):
         """Generate code for for loop with optimized register usage."""
         loop_label = f"FOR_{len(self.output)}"
         end_label = f"END_FOR_{len(self.output)}"
+        
+        small_funcs = set()
+        if for_stmt.init:
+            small_funcs |= self._collect_small_func_calls_in_stmt(for_stmt.init)
+        if for_stmt.stmt:
+            small_funcs |= self._collect_small_func_calls_in_stmt(for_stmt.stmt)
+        if for_stmt.next:
+            small_funcs |= self._collect_small_func_calls_in_stmt(for_stmt.next)
+        if for_stmt.cond:
+            self._collect_small_func_calls_in_expr(for_stmt.cond, small_funcs)
+        hoist_regs_64 = [self.reg_rbx, 'R12']
+        hoist_regs_32 = [self.reg_rbx, self.reg_rsi]
+        hoist_regs = hoist_regs_32 if self.use_32bit else hoist_regs_64
         
         if for_stmt.init:
             # For loop init can be a Decl (variable declaration) or DeclList
@@ -2992,6 +3045,16 @@ class CodeGenerator:
             else:
                 # Single statement (usually Decl for "int i = 0")
                 self._generate_statement(for_stmt.init, func_name, info)
+        
+        prev_hoisted = self._loop_hoisted_small_funcs
+        if small_funcs:
+            ordered = sorted(small_funcs)
+            self._loop_hoisted_small_funcs = {}
+            for i, f in enumerate(ordered):
+                if i < len(hoist_regs):
+                    reg = hoist_regs[i]
+                    self._emit_hoisted_small_func_address(f, reg)
+                    self._loop_hoisted_small_funcs[f] = reg
         
         self.output.append(f"{loop_label}:")
         
@@ -3009,6 +3072,9 @@ class CodeGenerator:
         
         self.output.append(f"    JMP {loop_label}")
         self.output.append(f"{end_label}:")
+        
+        if small_funcs:
+            self._loop_hoisted_small_funcs = prev_hoisted
     
     def _compute_decl_size(self, decl):
         """Return stack size in bytes for a single Decl (same logic as _generate_decl type/size)."""
@@ -3073,6 +3139,82 @@ class CodeGenerator:
             for d in node.decls:
                 total += self._compute_function_local_stack_size(d)
         return total
+    
+    def _extract_direct_func_name(self, call):
+        """Extract direct function name from a FuncCall node, or None if indirect/pointer."""
+        if not isinstance(call, c_ast.FuncCall):
+            return None
+        name = call.name
+        if isinstance(name, c_ast.ID):
+            return name.name
+        if isinstance(name, c_ast.UnaryOp) and isinstance(getattr(name, 'expr', None), c_ast.ID):
+            return name.expr.name
+        if hasattr(name, 'name'):
+            na = name.name
+            if isinstance(na, str):
+                return na
+            if isinstance(na, c_ast.ID):
+                return na.name
+        return None
+    
+    def _collect_small_func_calls_in_expr(self, expr, out):
+        """Recursively add direct small-function names from expression to set out."""
+        if expr is None:
+            return
+        if isinstance(expr, c_ast.FuncCall):
+            func_name = self._extract_direct_func_name(expr)
+            if func_name and self.function_data.get(func_name, {}).get('is_small') and func_name in self.function_offsets:
+                out.add(func_name)
+            if getattr(expr, 'args', None) and expr.args.exprs:
+                for a in expr.args.exprs:
+                    self._collect_small_func_calls_in_expr(a, out)
+            return
+        for attr in ('left', 'right', 'expr', 'cond', 'iftrue', 'iffalse', 'subscript', 'name'):
+            child = getattr(expr, attr, None)
+            if child is not None:
+                if isinstance(child, list):
+                    for c in child:
+                        self._collect_small_func_calls_in_expr(c, out)
+                else:
+                    self._collect_small_func_calls_in_expr(child, out)
+    
+    def _collect_small_func_calls_in_stmt(self, stmt):
+        """Return set of direct small-function names called inside stmt (e.g. loop body)."""
+        out = set()
+        if stmt is None:
+            return out
+        if isinstance(stmt, c_ast.Compound) and getattr(stmt, 'block_items', None):
+            for item in stmt.block_items:
+                out |= self._collect_small_func_calls_in_stmt(item)
+        elif isinstance(stmt, c_ast.While) and stmt.stmt:
+            out |= self._collect_small_func_calls_in_stmt(stmt.stmt)
+        elif isinstance(stmt, c_ast.For):
+            if stmt.init:
+                out |= self._collect_small_func_calls_in_stmt(stmt.init)
+            if stmt.cond:
+                self._collect_small_func_calls_in_expr(stmt.cond, out)
+            if stmt.stmt:
+                out |= self._collect_small_func_calls_in_stmt(stmt.stmt)
+            if stmt.next:
+                out |= self._collect_small_func_calls_in_stmt(stmt.next)
+        elif isinstance(stmt, c_ast.If):
+            if stmt.iftrue:
+                out |= self._collect_small_func_calls_in_stmt(stmt.iftrue)
+            if stmt.iffalse:
+                out |= self._collect_small_func_calls_in_stmt(stmt.iffalse)
+        elif isinstance(stmt, c_ast.FuncCall):
+            func_name = self._extract_direct_func_name(stmt)
+            if func_name and self.function_data.get(func_name, {}).get('is_small') and func_name in self.function_offsets:
+                out.add(func_name)
+        elif isinstance(stmt, (c_ast.UnaryOp, c_ast.BinaryOp, c_ast.ID, c_ast.ArrayRef, c_ast.StructRef)):
+            self._collect_small_func_calls_in_expr(stmt, out)
+        elif isinstance(stmt, c_ast.Assignment):
+            self._collect_small_func_calls_in_expr(stmt.lvalue, out)
+            self._collect_small_func_calls_in_expr(stmt.rvalue, out)
+        elif isinstance(stmt, c_ast.DeclList) and getattr(stmt, 'decls', None):
+            for d in stmt.decls:
+                out |= self._collect_small_func_calls_in_stmt(d)
+        return out
     
     def _generate_decl(self, decl):
         """Generate code for variable declaration with indexed stack pointer."""
