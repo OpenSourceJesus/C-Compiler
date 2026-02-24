@@ -31,12 +31,13 @@ def safe_str(obj):
 class CodeGenerator:
     """Code generator with indexed-jump, metamorphic return sites, quantized call-backs, and SIMD bit-packing."""
     
-    def __init__(self, function_data, global_var_data=None, asm_parser=None, use_32bit=False, enable_metamorphic_return_sites=True, register_allocator=None):
+    def __init__(self, function_data, global_var_data=None, asm_parser=None, use_32bit=False, enable_metamorphic_return_sites=True, register_allocator=None, enable_indexed_function_calls=True):
         self.function_data = function_data
         self.global_var_data = global_var_data or {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
         self.asm_parser = asm_parser  # Assembly parser for external symbols
         self.use_32bit = use_32bit  # 32-bit mode flag
         self.enable_metamorphic_return_sites = enable_metamorphic_return_sites  # Enable/disable metamorphic return sites
+        self.enable_indexed_function_calls = enable_indexed_function_calls  # Use indexed jump for small functions (JMP base+offset vs CALL)
         self.register_allocator = register_allocator  # Register allocator for efficient register usage
         self.output = []
         self.small_functions = []
@@ -282,7 +283,7 @@ class CodeGenerator:
             # Skip functions with "unknown" names
             if func_name == "unknown":
                 continue
-            if func_name in self.function_data and self.function_data[func_name]['is_small']:
+            if self.enable_indexed_function_calls and func_name in self.function_data and self.function_data[func_name]['is_small']:
                 small_funcs.append(func)
             else:
                 large_funcs.append(func)

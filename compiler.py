@@ -331,6 +331,8 @@ def main():
 	parser.add_argument('--32-bit', dest='use_32bit', action='store_true', help='Generate 32-bit code (elf32 format)')
 	parser.add_argument('--metamorphic-return-sites', dest='enable_metamorphic_return_sites', action='store_true', default=True, help='Enable metamorphic return sites optimization (default: enabled)')
 	parser.add_argument('--no-metamorphic-return-sites', dest='enable_metamorphic_return_sites', action='store_false', help='Disable metamorphic return sites optimization')
+	parser.add_argument('--indexed-function-calls', dest='enable_indexed_function_calls', action='store_true', default=True, help='Use indexed jump table for small function calls (default: enabled)')
+	parser.add_argument('--no-indexed-function-calls', dest='enable_indexed_function_calls', action='store_false', help='Disable indexed function calls; use normal CALL for all functions')
 	parser.add_argument('-I', action='append', dest='include_paths', default=[], metavar='DIR',
 	                    help='Add directory to include search path (can be specified multiple times)')
 	
@@ -469,7 +471,7 @@ def main():
 	
 	# Generate code
 	try:
-		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, args.enable_metamorphic_return_sites, register_allocator)
+		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, args.enable_metamorphic_return_sites, register_allocator, args.enable_indexed_function_calls)
 		output_code = codegen.generate(c_parser)
 		
 		# Write output

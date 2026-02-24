@@ -315,7 +315,7 @@ def find_linker_scripts(directory):
     
     return linker_scripts
 
-def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O0', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, include_paths=None):
+def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O0', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=None):
     """Compile a single file or folder and run benchmarks.
     
     Args:
@@ -326,6 +326,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         opt_level: GCC optimization level (e.g., '-O2', '-O3', '-Os')
         iterations: Number of benchmark iterations to run
         enable_metamorphic_return_sites: If True, enable metamorphic return sites optimization
+        enable_indexed_function_calls: If True, use indexed jump table for small function calls
     """
     test_path = Path(test_path).resolve()
     script_dir = Path(__file__).parent.absolute()
@@ -647,6 +648,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         compiler_cmd.append('--32-bit')
     if not enable_metamorphic_return_sites:
         compiler_cmd.append('--no-metamorphic-return-sites')
+    if not enable_indexed_function_calls:
+        compiler_cmd.append('--no-indexed-function-calls')
     # Add include paths
     for include_path in include_paths:
         compiler_cmd.extend(['-I', include_path])
@@ -674,6 +677,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     if not asm_file.exists():
         print(f"Error: Assembly file was not created: {asm_file}")
         return {'success': False}
+    
+    custom_asm_size = get_file_size(asm_file)
     
     # Assemble and link
     assembler_info = find_assembler(use_32bit)
@@ -898,12 +903,13 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         print("  Average time: ERROR - Could not measure")
     print(f"  Executable size: {gcc_size} bytes")
     print()
-    print(f"Custom Compiler (metamorphic return sites: {'enabled' if enable_metamorphic_return_sites else 'disabled'}):")
+    print(f"Custom Compiler (metamorphic: {'on' if enable_metamorphic_return_sites else 'off'}, indexed calls: {'on' if enable_indexed_function_calls else 'off'}):")
     if custom_avg is not None:
         print(f"  Average time:  {custom_avg['avg']:18.15f} seconds")
     else:
         print("  Average time: ERROR - Could not measure")
     print(f"  Executable size: {custom_size} bytes")
+    print(f"  Assembly size:   {custom_asm_size} bytes")
     print()
     
     # Calculate comparisons
@@ -948,7 +954,9 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             'custom_avg': custom_avg,
             'gcc_size': gcc_size,
             'custom_size': custom_size,
-            'metamorphic_enabled': enable_metamorphic_return_sites
+            'custom_asm_size': custom_asm_size,
+            'metamorphic_enabled': enable_metamorphic_return_sites,
+            'indexed_calls_enabled': enable_indexed_function_calls
         }
     
     # Return results for comparison
@@ -958,7 +966,9 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         'custom_avg': custom_avg,
         'gcc_size': gcc_size,
         'custom_size': custom_size,
-        'metamorphic_enabled': enable_metamorphic_return_sites
+        'custom_asm_size': custom_asm_size,
+        'metamorphic_enabled': enable_metamorphic_return_sites,
+        'indexed_calls_enabled': enable_indexed_function_calls
     }
 
 def main():
@@ -1069,7 +1079,7 @@ def main():
     print("=" * 70)
     print("Running benchmark WITH metamorphic return sites")
     print("=" * 70)
-    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, include_paths=include_paths)
+    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths)
     
     if not result_with or not isinstance(result_with, dict) or not result_with.get('success', False):
         print("Error: Benchmark with metamorphic return sites failed")
@@ -1079,7 +1089,7 @@ def main():
     print("=" * 70)
     print("Running benchmark WITHOUT metamorphic return sites")
     print("=" * 70)
-    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False, include_paths=include_paths)
+    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False, enable_indexed_function_calls=True, include_paths=include_paths)
     
     if not result_without or not isinstance(result_without, dict) or not result_without.get('success', False):
         print("Error: Benchmark without metamorphic return sites failed")
@@ -1128,6 +1138,78 @@ def main():
                 print(f"  -> Metamorphic return sites make code {abs(percent_size_change):.2f}% SMALLER")
             else:
                 print(f"  -> Metamorphic return sites make code {abs(percent_size_change):.2f}% LARGER")
+    
+    # Compare indexed function calls ON vs OFF (speed and size)
+    print()
+    print("=" * 70)
+    print("Running benchmark WITH indexed function calls")
+    print("=" * 70)
+    result_indexed = compile_and_benchmark(test_path, output_base + "_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths)
+    
+    if not result_indexed or not isinstance(result_indexed, dict) or not result_indexed.get('success', False):
+        print("Error: Benchmark with indexed function calls failed")
+    else:
+        print()
+        print("=" * 70)
+        print("Running benchmark WITHOUT indexed function calls")
+        print("=" * 70)
+        result_no_indexed = compile_and_benchmark(test_path, output_base + "_no_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=False, include_paths=include_paths)
+        
+        if not result_no_indexed or not isinstance(result_no_indexed, dict) or not result_no_indexed.get('success', False):
+            print("Error: Benchmark without indexed function calls failed")
+        else:
+            print()
+            print("=" * 70)
+            print("Comparison: Indexed function calls ON vs OFF")
+            print("=" * 70)
+            
+            idx_avg = result_indexed.get('custom_avg')
+            noidx_avg = result_no_indexed.get('custom_avg')
+            idx_size = result_indexed.get('custom_size', 0)
+            noidx_size = result_no_indexed.get('custom_size', 0)
+            idx_asm = result_indexed.get('custom_asm_size', 0)
+            noidx_asm = result_no_indexed.get('custom_asm_size', 0)
+            
+            if idx_avg and noidx_avg and idx_avg.get('avg') and noidx_avg.get('avg'):
+                with_avg = idx_avg['avg']
+                without_avg = noidx_avg['avg']
+                if without_avg > 0:
+                    speed_ratio = with_avg / without_avg
+                    time_diff = with_avg - without_avg
+                    pct = ((with_avg - without_avg) / without_avg) * 100
+                    print(f"With indexed function calls:    {with_avg:18.15f} seconds")
+                    print(f"Without indexed function calls: {without_avg:18.15f} seconds")
+                    print(f"Speed ratio (indexed / no-indexed): {speed_ratio:.15f}x")
+                    print(f"Time difference:                  {time_diff:+.15f} seconds")
+                    if with_avg < without_avg:
+                        print(f"  -> Indexed function calls are {abs(pct):.2f}% FASTER")
+                    else:
+                        print(f"  -> Indexed function calls are {abs(pct):.2f}% SLOWER")
+            
+            if idx_size > 0 and noidx_size > 0:
+                size_diff = idx_size - noidx_size
+                size_ratio = idx_size / noidx_size
+                pct = ((idx_size - noidx_size) / noidx_size) * 100
+                print()
+                print(f"Executable size with indexed:    {idx_size} bytes")
+                print(f"Executable size without indexed: {noidx_size} bytes")
+                print(f"Size difference:                 {size_diff:+d} bytes")
+                if idx_size < noidx_size:
+                    print(f"  -> Indexed function calls produce {abs(pct):.2f}% SMALLER executable")
+                else:
+                    print(f"  -> Indexed function calls produce {abs(pct):.2f}% LARGER executable")
+            
+            if idx_asm > 0 and noidx_asm > 0:
+                asm_diff = idx_asm - noidx_asm
+                pct = ((idx_asm - noidx_asm) / noidx_asm) * 100
+                print()
+                print(f"Assembly size with indexed:    {idx_asm} bytes")
+                print(f"Assembly size without indexed: {noidx_asm} bytes")
+                print(f"Assembly size difference:     {asm_diff:+d} bytes")
+                if idx_asm < noidx_asm:
+                    print(f"  -> Indexed function calls produce {abs(pct):.2f}% SMALLER assembly")
+                else:
+                    print(f"  -> Indexed function calls produce {abs(pct):.2f}% LARGER assembly")
     
     print()
 
