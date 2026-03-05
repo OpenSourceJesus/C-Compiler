@@ -45,7 +45,7 @@ tests:
 			echo "=========================================="; \
 			echo "Test $$test_count: $$test_file"; \
 			echo "=========================================="; \
-			if /usr/bin/python3 benchmark.py "$$test_file" $$opt_level_flag $$runs_flag $$include_flags; then \
+			if python3 benchmark.py "$$test_file" $$opt_level_flag $$runs_flag $$include_flags; then \
 				success_count=$$((success_count + 1)); \
 				echo ""; \
 				echo "✓ Test $$test_count ($$test_file) PASSED"; \
@@ -63,7 +63,7 @@ tests:
 			echo "=========================================="; \
 			echo "Test $$test_count: $$test_dir"; \
 			echo "=========================================="; \
-			if /usr/bin/python3 benchmark.py "$$test_dir" $$opt_level_flag $$runs_flag $$include_flags; then \
+			if python3 benchmark.py "$$test_dir" $$opt_level_flag $$runs_flag $$include_flags; then \
 				success_count=$$((success_count + 1)); \
 				echo ""; \
 				echo "✓ Test $$test_count ($$test_dir) PASSED"; \

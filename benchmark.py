@@ -631,7 +631,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     gcc_size = get_file_size(gcc_executable)
     
     # Compile with custom compiler
-    python_cmd = '/usr/bin/python3'
+    python_cmd = 'python3'
     
     # Pass the directory or file path to the compiler
     # The compiler already handles directories and recursively finds files

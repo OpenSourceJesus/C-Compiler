@@ -1552,6 +1552,17 @@ class CodeGenerator:
         else:
             # Generate call based on function type
             if callee_info.get('is_small', False):
+                # Small functions use JMP (not CALL), so we must push return address for callee's RET.
+                if return_site_label is None:
+                    return_site_label = f"RET_SITE_{caller_func_name}_{self.return_site_index}"
+                    self.return_site_index += 1
+                    self.return_sites.append(return_site_label)
+                # Push return address so callee's RET jumps back here
+                if self.use_32bit:
+                    self.output.append(f"    LEA EAX, [{return_site_label}]  ; Return address for small func RET")
+                else:
+                    self.output.append(f"    LEA {self.reg_rax}, [rel {return_site_label}]  ; Return address for small func RET")
+                self.output.append(f"    PUSH {self.reg_rax}")
                 # One call/jump only: inline dispatch so address = SMALL_FUNC_BASE + index*1024, then single JMP
                 # If we're inside a loop that hoisted this function's address, just JMP to that register
                 hoisted_reg = self._loop_hoisted_small_funcs.get(func_name) if self._loop_hoisted_small_funcs else None
