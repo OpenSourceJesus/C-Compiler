@@ -327,6 +327,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         iterations: Number of benchmark iterations to run
         enable_metamorphic_return_sites: If True, enable metamorphic return sites optimization
         enable_indexed_function_calls: If True, use indexed jump table for small function calls
+        include_paths: Extra directories passed to the compilers as -I (header search path)
     """
     test_path = Path(test_path).resolve()
     script_dir = Path(__file__).parent.absolute()
@@ -991,7 +992,7 @@ def main():
             test_path = default_test
             output_base = "benchmark"
         else:
-            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N] [-I DIR]...")
+            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N] [--include-path DIR | --include-paths LIST] [-I DIR]...")
             print()
             print("Examples:")
             print("  benchmark.py test.c")
@@ -1004,6 +1005,8 @@ def main():
             print("  benchmark.py test.c --opt-level Os")
             print("  benchmark.py test.c --runs 10")
             print("  benchmark.py test.c -I include -I lib")
+            print("  benchmark.py test.c --include-path Tests/include_test/lib")
+            print("  benchmark.py test.c --include-paths \"include,lib\"")
             sys.exit(1)
         args = []
     else:
@@ -1050,6 +1053,23 @@ def main():
                     print(f"Error: Invalid number of runs: {args[i + 1]}")
                     sys.exit(1)
                 i += 2
+            elif args[i] in ('--include-path', '--include-dir'):
+                if i + 1 < len(args):
+                    include_paths.append(args[i + 1])
+                    i += 2
+                else:
+                    print("Error: --include-path requires a directory path", file=sys.stderr)
+                    sys.exit(1)
+            elif args[i] == '--include-paths':
+                if i + 1 < len(args):
+                    for part in args[i + 1].split(','):
+                        part = part.strip()
+                        if part:
+                            include_paths.append(part)
+                    i += 2
+                else:
+                    print("Error: --include-paths requires a comma-separated list of directories", file=sys.stderr)
+                    sys.exit(1)
             elif args[i] == '-I':
                 if i + 1 < len(args):
                     include_paths.append(args[i + 1])
@@ -1063,7 +1083,7 @@ def main():
         
         if test_path is None:
             print("Error: No test path specified")
-            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N] [-I DIR]...")
+            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N] [--include-path DIR | --include-paths LIST] [-I DIR]...")
             sys.exit(1)
     
     # Print configuration info (but keep it minimal)

@@ -51,6 +51,7 @@ class CodeGenerator:
         self.referenced_asm_symbols = set()  # Track which assembly symbols we've included
         self.variable_registers = {}  # Track which variables are currently in registers: {var_name: register}
         self._loop_hoisted_small_funcs = None  # When in a loop: {func_name: reg} for precomputed jump addresses
+        self.needs_print_int_buffer = False  # Emit shared decimal buffer only when print("%d", ...) is used
         
         # Register names based on bit mode
         if use_32bit:
@@ -260,6 +261,7 @@ class CodeGenerator:
     def generate(self, parser):
         """Generate optimized code for all functions."""
         self.output = []
+        self.needs_print_int_buffer = False
         self._current_parser = parser  # Store parser reference for variable lookup
         self._collect_struct_sizes(parser)  # Auto-detect struct sizes from AST
         
@@ -466,6 +468,12 @@ class CodeGenerator:
         else:
             self.output.append("    DQ 0x7FFF0000  ; Stack base address")
         self.output.append("")
+
+        # Shared scratch buffer used by print("%d", value) formatting.
+        if self.needs_print_int_buffer:
+            self.output.append("GLOBAL___print_int_buf:")
+            self.output.append("    TIMES 32 DB 0")
+            self.output.append("")
         
         globals = parser.get_global_variables()
         
@@ -1447,41 +1455,104 @@ class CodeGenerator:
             # Set up syscall arguments: RDI=1 (stdout), RSI=buffer, RDX=length
             if call.args and len(call.args.exprs) >= 2:
                 format_is_percent_s = False
+                format_is_percent_d = False
                 fmt_arg = call.args.exprs[0]
                 if isinstance(fmt_arg, c_ast.Constant) and isinstance(fmt_arg.value, str):
                     fmt = fmt_arg.value
                     format_is_percent_s = fmt in ['"%s"', "'%s'"]
+                    format_is_percent_d = fmt in ['"%d"', "'%d'"]
 
                 # First argument is format string (ignored), second is buffer
                 # Evaluate second argument to get buffer address
                 self._generate_expression(call.args.exprs[1])
-                self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Buffer address")
-                
-                # Set file descriptor to stdout (1)
-                self.output.append(f"    MOV {self.reg_rdi}, 1  ; stdout file descriptor")
-                
-                # Compute length: try to get it from global variable if it's a string literal/array
-                # Check if second argument is a global variable with known string
-                buf_arg = call.args.exprs[1]
-                string_length = None
-                if isinstance(buf_arg, c_ast.ID):
-                    # Check if it's a global variable with string initializer
-                    var_name = buf_arg.name
-                    glob_vars = getattr(self, '_current_parser', None).get_global_variables() if hasattr(self, '_current_parser') else []
-                    for gv in glob_vars:
-                        if gv.name == var_name and gv.init and isinstance(gv.init, c_ast.Constant):
-                            value = gv.init.value
-                            if isinstance(value, str) and ((value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'"))):
-                                # Extract string content
-                                if value.startswith('"'):
-                                    string_value = value[1:-1].replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\\\', '\\')
-                                else:
-                                    string_value = value[1:-1]
-                                # Length is string length (excluding null terminator for syscall)
-                                string_length = len(string_value)
-                                break
-                
-                if format_is_percent_s:
+
+                if format_is_percent_d:
+                    # Convert integer in RAX to decimal ASCII into shared buffer, then write it.
+                    self.needs_print_int_buffer = True
+                    self.label_counter = self.label_counter + 1
+                    label_id = self.label_counter
+                    if self.use_32bit:
+                        self.output.append("    LEA ESI, [GLOBAL___print_int_buf + 31]  ; End of int print buffer")
+                        self.output.append("    MOV BYTE [ESI], 0")
+                        self.output.append("    PUSH 0  ; sign flag (0=positive, 1=negative)")
+                        self.output.append("    TEST EAX, EAX")
+                        self.output.append(f"    JGE PRINT_INT_ABS_{label_id}")
+                        self.output.append("    NEG EAX")
+                        self.output.append("    MOV DWORD [ESP], 1")
+                        self.output.append(f"PRINT_INT_ABS_{label_id}:")
+                        self.output.append("    MOV ECX, 10")
+                        self.output.append(f"PRINT_INT_LOOP_{label_id}:")
+                        self.output.append("    XOR EDX, EDX")
+                        self.output.append("    DIV ECX")
+                        self.output.append("    ADD DL, '0'")
+                        self.output.append("    DEC ESI")
+                        self.output.append("    MOV BYTE [ESI], DL")
+                        self.output.append("    TEST EAX, EAX")
+                        self.output.append(f"    JNZ PRINT_INT_LOOP_{label_id}")
+                        self.output.append("    CMP DWORD [ESP], 0")
+                        self.output.append(f"    JE PRINT_INT_NOSIGN_{label_id}")
+                        self.output.append("    DEC ESI")
+                        self.output.append("    MOV BYTE [ESI], '-'")
+                        self.output.append(f"PRINT_INT_NOSIGN_{label_id}:")
+                        self.output.append("    ADD ESP, 4  ; Pop sign flag")
+                        self.output.append("    LEA EDX, [GLOBAL___print_int_buf + 31]")
+                        self.output.append("    SUB EDX, ESI  ; Decimal string length")
+                        self.output.append("    MOV EDI, 1  ; stdout file descriptor")
+                    else:
+                        self.output.append("    MOVSXD RAX, EAX  ; Treat %d argument as signed 32-bit int")
+                        self.output.append("    LEA RSI, [rel GLOBAL___print_int_buf + 31]  ; End of int print buffer")
+                        self.output.append("    MOV BYTE [RSI], 0")
+                        self.output.append("    PUSH 0  ; sign flag (0=positive, 1=negative)")
+                        self.output.append("    TEST RAX, RAX")
+                        self.output.append(f"    JGE PRINT_INT_ABS_{label_id}")
+                        self.output.append("    NEG RAX")
+                        self.output.append("    MOV QWORD [RSP], 1")
+                        self.output.append(f"PRINT_INT_ABS_{label_id}:")
+                        self.output.append("    MOV RCX, 10")
+                        self.output.append(f"PRINT_INT_LOOP_{label_id}:")
+                        self.output.append("    XOR RDX, RDX")
+                        self.output.append("    DIV RCX")
+                        self.output.append("    ADD DL, '0'")
+                        self.output.append("    DEC RSI")
+                        self.output.append("    MOV BYTE [RSI], DL")
+                        self.output.append("    TEST RAX, RAX")
+                        self.output.append(f"    JNZ PRINT_INT_LOOP_{label_id}")
+                        self.output.append("    CMP QWORD [RSP], 0")
+                        self.output.append(f"    JE PRINT_INT_NOSIGN_{label_id}")
+                        self.output.append("    DEC RSI")
+                        self.output.append("    MOV BYTE [RSI], '-'")
+                        self.output.append(f"PRINT_INT_NOSIGN_{label_id}:")
+                        self.output.append("    ADD RSP, 8  ; Pop sign flag")
+                        self.output.append("    LEA RDX, [rel GLOBAL___print_int_buf + 31]")
+                        self.output.append("    SUB RDX, RSI  ; Decimal string length")
+                        self.output.append("    MOV RDI, 1  ; stdout file descriptor")
+                elif format_is_percent_s:
+                    self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Buffer address")
+                    
+                    # Set file descriptor to stdout (1)
+                    self.output.append(f"    MOV {self.reg_rdi}, 1  ; stdout file descriptor")
+                    
+                    # Compute length: try to get it from global variable if it's a string literal/array
+                    # Check if second argument is a global variable with known string
+                    buf_arg = call.args.exprs[1]
+                    string_length = None
+                    if isinstance(buf_arg, c_ast.ID):
+                        # Check if it's a global variable with string initializer
+                        var_name = buf_arg.name
+                        glob_vars = getattr(self, '_current_parser', None).get_global_variables() if hasattr(self, '_current_parser') else []
+                        for gv in glob_vars:
+                            if gv.name == var_name and gv.init and isinstance(gv.init, c_ast.Constant):
+                                value = gv.init.value
+                                if isinstance(value, str) and ((value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'"))):
+                                    # Extract string content
+                                    if value.startswith('"'):
+                                        string_value = value[1:-1].replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\\\', '\\')
+                                    else:
+                                        string_value = value[1:-1]
+                                    # Length is string length (excluding null terminator for syscall)
+                                    string_length = len(string_value)
+                                    break
+                    
                     if string_length is not None:
                         # Use compile-time length
                         self.output.append(f"    MOV {self.reg_rdx}, {string_length}  ; String length (compile-time)")
@@ -1500,10 +1571,10 @@ class CodeGenerator:
                         self.output.append(f"    JMP {length_label}")
                         self.output.append(f"{length_label}_done:")
                 else:
-                    # This compiler's print shim currently only supports "%s".
-                    # Avoid treating integer values as pointers (which can segfault).
-                    self.output.append(f"    MOV {self.reg_rsi}, 0  ; Unsupported print format, skip write buffer")
-                    self.output.append(f"    MOV {self.reg_rdx}, 0  ; Unsupported print format, write zero bytes")
+                    # Unknown format specifier: keep syscall harmless.
+                    self.output.append(f"    MOV {self.reg_rdi}, 1  ; stdout")
+                    self.output.append(f"    MOV {self.reg_rsi}, 0  ; Unsupported format buffer")
+                    self.output.append(f"    MOV {self.reg_rdx}, 0  ; Unsupported format length")
             else:
                 # Fallback: set default values
                 self.output.append(f"    MOV {self.reg_rdi}, 1  ; stdout")
@@ -1864,6 +1935,10 @@ class CodeGenerator:
                 pass  # Fall through to general case
         
         # General case: evaluate both operands
+        # 64-bit * keeps left in RCX: callees often use MOV R10,... for multiply temps;
+        # that must not clobber a live value a caller left in R10 (nested square calls).
+        left_temp = 'RCX' if (op.op == '*' and not self.use_32bit) else self.reg_binary_op_temp
+        
         # Optimize: if left operand is a variable in a register, use it directly
         left_in_reg = None
         if isinstance(op.left, c_ast.ID):
@@ -1881,26 +1956,26 @@ class CodeGenerator:
             temp_in_use = False
             temp_var = None
             for var_name, reg in self.variable_registers.items():
-                if reg == self.reg_binary_op_temp:
+                if reg == left_temp:
                     temp_in_use = True
                     temp_var = var_name
                     break
             
-            if temp_in_use and left_in_reg != self.reg_binary_op_temp:
+            if temp_in_use and left_in_reg != left_temp:
                 # Temp is in use, save it first
-                self.output.append(f"    PUSH {self.reg_binary_op_temp}  ; Save {temp_var}")
+                self.output.append(f"    PUSH {left_temp}  ; Save {temp_var}")
                 if self.use_32bit:
                     reg_32 = left_in_reg.replace('R', 'E') if left_in_reg.startswith('R') else left_in_reg
-                    self.output.append(f"    MOV {self.reg_binary_op_temp}, {reg_32}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                    self.output.append(f"    MOV {left_temp}, {reg_32}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
                 else:
-                    self.output.append(f"    MOV {self.reg_binary_op_temp}, {left_in_reg}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                    self.output.append(f"    MOV {left_temp}, {left_in_reg}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
                 self._binary_op_temp_saved = True
             else:
                 if self.use_32bit:
                     reg_32 = left_in_reg.replace('R', 'E') if left_in_reg.startswith('R') else left_in_reg
-                    self.output.append(f"    MOV {self.reg_binary_op_temp}, {reg_32}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                    self.output.append(f"    MOV {left_temp}, {reg_32}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
                 else:
-                    self.output.append(f"    MOV {self.reg_binary_op_temp}, {left_in_reg}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
+                    self.output.append(f"    MOV {left_temp}, {left_in_reg}  ; Use {op.left.name if isinstance(op.left, c_ast.ID) else 'left'} from register")
                 self._binary_op_temp_saved = False
         else:
             # Evaluate left operand normally
@@ -1909,75 +1984,79 @@ class CodeGenerator:
             temp_in_use = False
             temp_var = None
             for var_name, reg in self.variable_registers.items():
-                if reg == self.reg_binary_op_temp:
+                if reg == left_temp:
                     temp_in_use = True
                     temp_var = var_name
                     break
             
             if temp_in_use:
-                self.output.append(f"    PUSH {self.reg_binary_op_temp}  ; Save {temp_var}")
-                self.output.append(f"    MOV {self.reg_binary_op_temp}, {self.reg_rax}  ; Save left operand")
+                self.output.append(f"    PUSH {left_temp}  ; Save {temp_var}")
+                self.output.append(f"    MOV {left_temp}, {self.reg_rax}  ; Save left operand")
                 self._binary_op_temp_saved = True
             else:
-                self.output.append(f"    MOV {self.reg_binary_op_temp}, {self.reg_rax}  ; Save left operand")
+                self.output.append(f"    MOV {left_temp}, {self.reg_rax}  ; Save left operand")
                 self._binary_op_temp_saved = False
         
-        # Evaluate right operand
+        # Evaluate right operand (may use RCX; save * left on stack in 64-bit)
+        if op.op == '*' and not self.use_32bit:
+            self.output.append("    PUSH RCX")
         self._generate_expression(op.right)
+        if op.op == '*' and not self.use_32bit:
+            self.output.append("    POP RCX")
         
         if op.op == '+':
-            self.output.append(f"    ADD {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    ADD {self.reg_rax}, {left_temp}")
         elif op.op == '-':
-            self.output.append(f"    SUB {self.reg_binary_op_temp}, {self.reg_rax}")
-            self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    SUB {left_temp}, {self.reg_rax}")
+            self.output.append(f"    MOV {self.reg_rax}, {left_temp}")
         elif op.op == '*':
-            self.output.append(f"    MUL {self.reg_binary_op_temp}")
+            self.output.append(f"    IMUL {self.reg_rax}, {left_temp}")
         elif op.op == '/':
             # Division: left / RAX (operands need swapping)
             # DIV divides RDX:RAX by operand, result in RAX, remainder in RDX
             self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save divisor")
-            self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}  ; Dividend to RAX")
+            self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Dividend to RAX")
             self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear RDX for unsigned division")
             self.output.append(f"    DIV {self.reg_rcx}  ; RAX = RAX / RCX")
         elif op.op == '==':
-            self.output.append(f"    CMP {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    CMP {self.reg_rax}, {left_temp}")
             self.output.append("    SETE AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '<':
-            self.output.append(f"    CMP {self.reg_binary_op_temp}, {self.reg_rax}")
+            self.output.append(f"    CMP {left_temp}, {self.reg_rax}")
             self.output.append("    SETL AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '>':
-            self.output.append(f"    CMP {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    CMP {self.reg_rax}, {left_temp}")
             self.output.append("    SETG AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '<=':
-            self.output.append(f"    CMP {self.reg_binary_op_temp}, {self.reg_rax}")
+            self.output.append(f"    CMP {left_temp}, {self.reg_rax}")
             self.output.append("    SETLE AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '>=':
-            self.output.append(f"    CMP {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    CMP {self.reg_rax}, {left_temp}")
             self.output.append("    SETGE AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '!=':
-            self.output.append(f"    CMP {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    CMP {self.reg_rax}, {left_temp}")
             self.output.append("    SETNE AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '%':
             # Modulo: left % right
-            self.output.append(f"    ; Modulo operation: {self.reg_binary_op_temp} % {self.reg_rax}")
+            self.output.append(f"    ; Modulo operation: {left_temp} % {self.reg_rax}")
             self.output.append(f"    PUSH {self.reg_rax}  ; Save right operand (divisor)")
-            self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}  ; Move left operand (dividend) to {self.reg_rax}")
-            self.output.append(f"    POP {self.reg_binary_op_temp}  ; Get divisor")
+            self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Move left operand (dividend) to {self.reg_rax}")
+            self.output.append(f"    POP {left_temp}  ; Get divisor")
             self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear {self.reg_rdx} for division")
-            self.output.append(f"    DIV {self.reg_binary_op_temp}  ; {self.reg_rax} = dividend / divisor, {self.reg_rdx} = remainder")
+            self.output.append(f"    DIV {left_temp}  ; {self.reg_rax} = dividend / divisor, {self.reg_rdx} = remainder")
             self.output.append(f"    MOV {self.reg_rax}, {self.reg_rdx}  ; Remainder is the modulo result")
         elif op.op == '&&':
             # Logical AND: both operands must be non-zero
             self.label_counter = self.label_counter + 1
             label_id = self.label_counter
-            self.output.append(f"    ; Logical AND: {self.reg_binary_op_temp} && {self.reg_rax}")
-            self.output.append(f"    TEST {self.reg_binary_op_temp}, {self.reg_binary_op_temp}  ; Check if left is non-zero")
+            self.output.append(f"    ; Logical AND: {left_temp} && {self.reg_rax}")
+            self.output.append(f"    TEST {left_temp}, {left_temp}  ; Check if left is non-zero")
             self.output.append(f"    JZ AND_FALSE_{label_id}")
             self.output.append(f"    TEST {self.reg_rax}, {self.reg_rax}  ; Check if right is non-zero")
             self.output.append(f"    JZ AND_FALSE_{label_id}")
@@ -1990,8 +2069,8 @@ class CodeGenerator:
             # Logical OR: at least one operand must be non-zero
             self.label_counter = self.label_counter + 1
             label_id = self.label_counter
-            self.output.append(f"    ; Logical OR: {self.reg_binary_op_temp} || {self.reg_rax}")
-            self.output.append(f"    TEST {self.reg_binary_op_temp}, {self.reg_binary_op_temp}  ; Check if left is non-zero")
+            self.output.append(f"    ; Logical OR: {left_temp} || {self.reg_rax}")
+            self.output.append(f"    TEST {left_temp}, {left_temp}  ; Check if left is non-zero")
             self.output.append(f"    JNZ OR_TRUE_{label_id}")
             self.output.append(f"    TEST {self.reg_rax}, {self.reg_rax}  ; Check if right is non-zero")
             self.output.append(f"    JNZ OR_TRUE_{label_id}")
@@ -2001,28 +2080,28 @@ class CodeGenerator:
             self.output.append(f"    MOV {self.reg_rax}, 1  ; At least one non-zero, result is 1")
             self.output.append(f"OR_END_{label_id}:")
         elif op.op == '<<':
-            self.output.append(f"    ; Left shift: {self.reg_binary_op_temp} << {self.reg_rax}")
+            self.output.append(f"    ; Left shift: {left_temp} << {self.reg_rax}")
             self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Shift amount in {self.reg_rcx}")
-            self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}  ; Value to shift")
+            self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Value to shift")
             self.output.append(f"    SHL {self.reg_rax}, CL  ; Left shift by CL (low 8 bits of {self.reg_rcx})")
         elif op.op == '>>':
-            self.output.append(f"    ; Right shift: {self.reg_binary_op_temp} >> {self.reg_rax}")
+            self.output.append(f"    ; Right shift: {left_temp} >> {self.reg_rax}")
             self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Shift amount in {self.reg_rcx}")
-            self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}  ; Value to shift")
+            self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Value to shift")
             self.output.append(f"    SHR {self.reg_rax}, CL  ; Right shift by CL (low 8 bits of {self.reg_rcx})")
         elif op.op == '&':
-            self.output.append(f"    ; Bitwise AND: {self.reg_binary_op_temp} & {self.reg_rax}")
-            self.output.append(f"    AND {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    ; Bitwise AND: {left_temp} & {self.reg_rax}")
+            self.output.append(f"    AND {self.reg_rax}, {left_temp}")
         elif op.op == '|':
-            self.output.append(f"    ; Bitwise OR: {self.reg_binary_op_temp} | {self.reg_rax}")
-            self.output.append(f"    OR {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    ; Bitwise OR: {left_temp} | {self.reg_rax}")
+            self.output.append(f"    OR {self.reg_rax}, {left_temp}")
         elif op.op == '^':
-            self.output.append(f"    ; Bitwise XOR: {self.reg_binary_op_temp} ^ {self.reg_rax}")
-            self.output.append(f"    XOR {self.reg_rax}, {self.reg_binary_op_temp}")
+            self.output.append(f"    ; Bitwise XOR: {left_temp} ^ {self.reg_rax}")
+            self.output.append(f"    XOR {self.reg_rax}, {left_temp}")
         
         # Restore binary-op temp if it was saved (variable was in that register)
         if hasattr(self, '_binary_op_temp_saved') and self._binary_op_temp_saved:
-            self.output.append(f"    POP {self.reg_binary_op_temp}  ; Restore temp")
+            self.output.append(f"    POP {left_temp}  ; Restore temp")
             self._binary_op_temp_saved = False
     
     def _generate_unary_op(self, op):
@@ -2632,43 +2711,44 @@ class CodeGenerator:
             
             # Generate right-hand side
             self._generate_expression(assign.rvalue)
-            # Use binary-op temp (R10) not RBX so we don't clobber caller's loop var in callee
-            self.output.append(f"    POP {self.reg_binary_op_temp}  ; Get current value")
+            # Use R10/EBX for most ops; 64-bit * uses RCX so nested callees can use R10 freely
+            pop_reg = 'RCX' if (assign.op == '*=' and not self.use_32bit) else self.reg_binary_op_temp
+            self.output.append(f"    POP {pop_reg}  ; Get current value")
             
             # Perform operation based on operator
             base_op = assign.op[:-1]  # Remove '=' from '+=', etc.
             if base_op == '+':
-                self.output.append(f"    ADD {self.reg_rax}, {self.reg_binary_op_temp}")
+                self.output.append(f"    ADD {self.reg_rax}, {pop_reg}")
             elif base_op == '-':
-                self.output.append(f"    SUB {self.reg_binary_op_temp}, {self.reg_rax}")
-                self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}")
+                self.output.append(f"    SUB {pop_reg}, {self.reg_rax}")
+                self.output.append(f"    MOV {self.reg_rax}, {pop_reg}")
             elif base_op == '*':
-                self.output.append(f"    MUL {self.reg_binary_op_temp}")
+                self.output.append(f"    IMUL {self.reg_rax}, {pop_reg}")
             elif base_op == '/':
                 self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save divisor")
-                self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}  ; Dividend")
+                self.output.append(f"    MOV {self.reg_rax}, {pop_reg}  ; Dividend")
                 self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}")
                 self.output.append(f"    DIV {self.reg_rcx}")
             elif base_op == '%':
                 self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save divisor")
-                self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}  ; Dividend")
+                self.output.append(f"    MOV {self.reg_rax}, {pop_reg}  ; Dividend")
                 self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}")
                 self.output.append(f"    DIV {self.reg_rcx}")
                 self.output.append(f"    MOV {self.reg_rax}, {self.reg_rdx}  ; Remainder")
             elif base_op == '<<':
                 self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Shift amount")
-                self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}  ; Value to shift")
+                self.output.append(f"    MOV {self.reg_rax}, {pop_reg}  ; Value to shift")
                 self.output.append(f"    SHL {self.reg_rax}, CL")
             elif base_op == '>>':
                 self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Shift amount")
-                self.output.append(f"    MOV {self.reg_rax}, {self.reg_binary_op_temp}  ; Value to shift")
+                self.output.append(f"    MOV {self.reg_rax}, {pop_reg}  ; Value to shift")
                 self.output.append(f"    SHR {self.reg_rax}, CL")
             elif base_op == '&':
-                self.output.append(f"    AND {self.reg_rax}, {self.reg_binary_op_temp}")
+                self.output.append(f"    AND {self.reg_rax}, {pop_reg}")
             elif base_op == '|':
-                self.output.append(f"    OR {self.reg_rax}, {self.reg_binary_op_temp}")
+                self.output.append(f"    OR {self.reg_rax}, {pop_reg}")
             elif base_op == '^':
-                self.output.append(f"    XOR {self.reg_rax}, {self.reg_binary_op_temp}")
+                self.output.append(f"    XOR {self.reg_rax}, {pop_reg}")
             
             # Now assign the result
             # For struct members, we already pushed the address - pop it and store

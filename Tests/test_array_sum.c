@@ -7,8 +7,8 @@ void print(char *fmt, char *msg) {
 }
 #endif
 
-char ok_msg[] = "array sum ok\n";
-char fail_msg[] = "array sum failed\n";
+char successMessage[] = "Success\n";
+char failMessage[] = "Fail\n";
 
 int test_sum (int *a, int length)
 {
@@ -31,11 +31,11 @@ int main ()
 		last_sum = test_sum(arr, 64);
 
 	if (last_sum == 2016)
-		print("%s", ok_msg);
+		print("%s", successMessage);
 	else
 	{
+		print("%s", failMessage);
 		print("%d", last_sum);
-		print("%s", fail_msg);
 	}
 	
 	return 0;
