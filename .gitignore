@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Compiler build artifacts
+*.o
+*.asm
+output
+
+# Benchmark outputs
+gcc_output/
+custom_output/
+benchmark_results.png
+
+# Test build artifacts
+Tests/**/*.o
+Tests/**/*.asm
+Tests/**/*.exe
+Tests/test_*
+!Tests/test_*.c
+Tests/comprehensive_test/comprehensive_test
+Tests/include_test/include_test
+Tests/bare_metal_os_test/kernel
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

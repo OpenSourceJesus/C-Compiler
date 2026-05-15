@@ -1,7 +1,10 @@
 """C code parser using pycparser."""
 
 from pycparser import c_parser, c_ast, parse_file
-from pycparser.plyparser import ParseError
+try:
+    from pycparser.c_parser import ParseError
+except ImportError:
+    from pycparser.plyparser import ParseError
 import sys
 import os
 import re
