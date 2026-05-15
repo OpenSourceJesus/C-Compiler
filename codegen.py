@@ -69,6 +69,7 @@ class CodeGenerator:
             self.reg_binary_op_temp = 'EBX'  # Same as RBX in 32-bit (no R10)
             self.stack_base_register = 'EBX'  # Base address register for stack (32-bit)
             self.stack_index_register = 'ECX'  # Index register (32-bit)
+            self.small_func_dispatch_reg = 'EAX'  # Temp register for small-function JMP dispatch
         else:
             self.reg_rax = 'RAX'
             self.reg_rbx = 'RBX'
@@ -84,6 +85,7 @@ class CodeGenerator:
             self.reg_binary_op_temp = 'R10'
             self.stack_base_register = 'R12'  # Base address register for stack
             self.stack_index_register = 'R13'  # Index register (stores slot index, fits in 32 bits)
+            self.small_func_dispatch_reg = 'R11'  # Temp register for small-function JMP dispatch
         
         # Indexed stack pointer system (16-byte intervals)
         self.stack_slot_size = 16  # 16-byte intervals
@@ -1444,6 +1446,12 @@ class CodeGenerator:
             # print function: print("%s", msg) -> sys_write(1, msg, len)
             # Set up syscall arguments: RDI=1 (stdout), RSI=buffer, RDX=length
             if call.args and len(call.args.exprs) >= 2:
+                format_is_percent_s = False
+                fmt_arg = call.args.exprs[0]
+                if isinstance(fmt_arg, c_ast.Constant) and isinstance(fmt_arg.value, str):
+                    fmt = fmt_arg.value
+                    format_is_percent_s = fmt in ['"%s"', "'%s'"]
+
                 # First argument is format string (ignored), second is buffer
                 # Evaluate second argument to get buffer address
                 self._generate_expression(call.args.exprs[1])
@@ -1473,23 +1481,29 @@ class CodeGenerator:
                                 string_length = len(string_value)
                                 break
                 
-                if string_length is not None:
-                    # Use compile-time length
-                    self.output.append(f"    MOV {self.reg_rdx}, {string_length}  ; String length (compile-time)")
+                if format_is_percent_s:
+                    if string_length is not None:
+                        # Use compile-time length
+                        self.output.append(f"    MOV {self.reg_rdx}, {string_length}  ; String length (compile-time)")
+                    else:
+                        # Compute length at runtime by finding null terminator
+                        # Use RCX as pointer, RDX as length counter
+                        self.output.append(f"    MOV RCX, {self.reg_rsi}  ; Copy buffer address to RCX")
+                        self.output.append(f"    MOV {self.reg_rdx}, 0  ; Initialize length counter")
+                        length_label = f"_strlen_{self.return_site_index}"
+                        self.output.append(f"{length_label}:")
+                        self.output.append(f"    MOV AL, BYTE [RCX]  ; Load byte")
+                        self.output.append(f"    CMP AL, 0  ; Check for null terminator")
+                        self.output.append(f"    JE {length_label}_done")
+                        self.output.append(f"    INC RCX  ; Move to next byte")
+                        self.output.append(f"    INC {self.reg_rdx}  ; Increment length")
+                        self.output.append(f"    JMP {length_label}")
+                        self.output.append(f"{length_label}_done:")
                 else:
-                    # Compute length at runtime by finding null terminator
-                    # Use RCX as pointer, RDX as length counter
-                    self.output.append(f"    MOV RCX, {self.reg_rsi}  ; Copy buffer address to RCX")
-                    self.output.append(f"    MOV {self.reg_rdx}, 0  ; Initialize length counter")
-                    length_label = f"_strlen_{self.return_site_index}"
-                    self.output.append(f"{length_label}:")
-                    self.output.append(f"    MOV AL, BYTE [RCX]  ; Load byte")
-                    self.output.append(f"    CMP AL, 0  ; Check for null terminator")
-                    self.output.append(f"    JE {length_label}_done")
-                    self.output.append(f"    INC RCX  ; Move to next byte")
-                    self.output.append(f"    INC {self.reg_rdx}  ; Increment length")
-                    self.output.append(f"    JMP {length_label}")
-                    self.output.append(f"{length_label}_done:")
+                    # This compiler's print shim currently only supports "%s".
+                    # Avoid treating integer values as pointers (which can segfault).
+                    self.output.append(f"    MOV {self.reg_rsi}, 0  ; Unsupported print format, skip write buffer")
+                    self.output.append(f"    MOV {self.reg_rdx}, 0  ; Unsupported print format, write zero bytes")
             else:
                 # Fallback: set default values
                 self.output.append(f"    MOV {self.reg_rdi}, 1  ; stdout")
@@ -1575,17 +1589,16 @@ class CodeGenerator:
                         offset = func_idx * 1024
                         self.output.append(f"    ; Single jump to {func_name} (SMALL_FUNC_BASE + {offset})")
                         if self.use_32bit:
-                            # Use EBX as temp so EDI (first arg) is preserved; one JMP
-                            self.output.append(f"    MOV EAX, SMALL_FUNC_BASE")
-                            self.output.append(f"    MOV EBX, {offset}  ; offset for {func_name}")
-                            self.output.append(f"    ADD EAX, EBX")
-                            self.output.append(f"    JMP EAX  ; One jump only")
+                            # Use EAX as dispatch temp (avoid clobbering allocated loop vars in EBX).
+                            self.output.append(f"    MOV {self.small_func_dispatch_reg}, SMALL_FUNC_BASE")
+                            self.output.append(f"    ADD {self.small_func_dispatch_reg}, {offset}")
+                            self.output.append(f"    JMP {self.small_func_dispatch_reg}  ; One jump only")
                         else:
-                            # Use MOV for offset (no SHL), then JMP; use 64-bit RAX so ADD RBX, RAX is valid
-                            self.output.append(f"    MOV {self.reg_rbx}, SMALL_FUNC_BASE")
+                            # Use caller-saved temp register to avoid clobbering allocated variables in RBX.
+                            self.output.append(f"    MOV {self.small_func_dispatch_reg}, SMALL_FUNC_BASE")
                             self.output.append(f"    MOV {self.reg_rax}, {offset}  ; offset for {func_name}")
-                            self.output.append(f"    ADD {self.reg_rbx}, {self.reg_rax}")
-                            self.output.append(f"    JMP {self.reg_rbx}  ; One jump only")
+                            self.output.append(f"    ADD {self.small_func_dispatch_reg}, {self.reg_rax}")
+                            self.output.append(f"    JMP {self.small_func_dispatch_reg}  ; One jump only")
                     else:
                         # Fallback to direct call if not in jump table
                         self.output.append(f"    CALL FUNC_{func_name}")
@@ -3004,8 +3017,10 @@ class CodeGenerator:
         end_label = f"END_WHILE_{len(self.output)}"
         
         small_funcs = self._collect_small_func_calls_in_stmt(while_stmt.stmt)
-        hoist_regs_64 = [self.reg_rbx, 'R12']
-        hoist_regs_32 = [self.reg_rbx, self.reg_rsi]
+        # Disable loop-hoisted small-function addresses for now.
+        # Hoisting into general registers can alias register-allocated locals and corrupt loop state.
+        hoist_regs_64 = []
+        hoist_regs_32 = []
         hoist_regs = hoist_regs_32 if self.use_32bit else hoist_regs_64
         prev_hoisted = self._loop_hoisted_small_funcs
         if small_funcs:
@@ -3043,8 +3058,10 @@ class CodeGenerator:
             small_funcs |= self._collect_small_func_calls_in_stmt(for_stmt.next)
         if for_stmt.cond:
             self._collect_small_func_calls_in_expr(for_stmt.cond, small_funcs)
-        hoist_regs_64 = [self.reg_rbx, 'R12']
-        hoist_regs_32 = [self.reg_rbx, self.reg_rsi]
+        # Disable loop-hoisted small-function addresses for now.
+        # Hoisting into general registers can alias register-allocated locals and corrupt loop state.
+        hoist_regs_64 = []
+        hoist_regs_32 = []
         hoist_regs = hoist_regs_32 if self.use_32bit else hoist_regs_64
         
         if for_stmt.init:
