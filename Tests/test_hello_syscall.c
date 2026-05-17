@@ -13,14 +13,14 @@ void print(char *fmt, char *msg) {
 }
 #endif
 
-void a ()
-{
-    b ();
-}
-
 void b ()
 {
     print("%s", msg);
+}
+
+void a ()
+{
+    b ();
 }
 
 int main() {

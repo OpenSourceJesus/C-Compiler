@@ -271,13 +271,14 @@ class GlobalVariableExtractor(c_ast.NodeVisitor):
     
     def visit_Decl(self, node):
         """Collect global variable declarations (not in functions)."""
-        if not self.in_function and node.name:
-            # Check if it's a variable (not a function)
-            if not isinstance(node.type, c_ast.FuncDecl):
-                # Store _Alignas information if present in the node
-                # This will be checked later in the analyzer
-                self.globals.append(node)
-        self.generic_visit(node)
+        if self.in_function or not node.name:
+            return
+        # Only collect true file-scope variable declarations.
+        # Do not descend into declaration children; doing so pulls in
+        # function-parameter and struct-member Decl nodes as "globals".
+        if isinstance(node.type, c_ast.FuncDecl):
+            return
+        self.globals.append(node)
 
 
 class MultiFileParser:

@@ -329,6 +329,7 @@ def main():
 	parser.add_argument('--qemu-kernel', help='Path to kernel file for QEMU system mode (-kernel option)')
 	parser.add_argument('--qemu-bios', help='Path to BIOS file for QEMU system mode (-bios option)')
 	parser.add_argument('--32-bit', dest='use_32bit', action='store_true', help='Generate 32-bit code (elf32 format)')
+	parser.add_argument('-O0', action='store_true', help='Disable all optimizations (indexed function calls, metamorphic return sites, SIMD bit-packing, register allocation)')
 	parser.add_argument('--metamorphic-return-sites', dest='enable_metamorphic_return_sites', action='store_true', default=True, help='Enable metamorphic return sites optimization (default: enabled)')
 	parser.add_argument('--no-metamorphic-return-sites', dest='enable_metamorphic_return_sites', action='store_false', help='Disable metamorphic return sites optimization')
 	parser.add_argument('--indexed-function-calls', dest='enable_indexed_function_calls', action='store_true', default=True, help='Use indexed jump table for small function calls (default: enabled)')
@@ -338,10 +339,22 @@ def main():
 	
 	args = parser.parse_args()
 	
+	if args.O0:
+		args.enable_metamorphic_return_sites = False
+		args.enable_indexed_function_calls = False
+		if args.verbose:
+			print("Optimization level -O0: all optimizations disabled", file=sys.stderr)
+	
 	input_path = Path(args.input_path)
 	
 	# Determine if input is a file or directory
 	if input_path.is_file():
+		if input_path.suffix.lower() != '.c':
+			error_msg = f"Error: {args.input_path} is a file, but not a C source (.c)"
+			if os.access(input_path, os.X_OK):
+				error_msg += ". It looks like an executable; pass a .c file or a directory of .c files instead."
+			print(error_msg, file=sys.stderr)
+			sys.exit(1)
 		# Single file mode
 		c_files = [str(input_path)]
 		c_parser = CParser(include_paths=args.include_paths)
@@ -398,17 +411,20 @@ def main():
 		sys.exit(1)
 	
 	# Analyze global variables for SIMD bit-packing
-	try:
-		global_var_data = analyze_global_variables(c_parser)
-		if args.verbose:
-			packed_count = len(global_var_data['packed_vars'])
-			if packed_count > 0:
-				print(f"SIMD Bit-Packing: {packed_count} global variables packed into {global_var_data['total_bits_used']} bits", file=sys.stderr)
-				for var_info in global_var_data['packed_vars']:
-					print(f"  {var_info['name']}: {var_info['bits']} bits at position {var_info['start_bit']}", file=sys.stderr)
-	except Exception as e:
-		print(f"Error analyzing global variables: {e}", file=sys.stderr)
+	if args.O0:
 		global_var_data = {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
+	else:
+		try:
+			global_var_data = analyze_global_variables(c_parser)
+			if args.verbose:
+				packed_count = len(global_var_data['packed_vars'])
+				if packed_count > 0:
+					print(f"SIMD Bit-Packing: {packed_count} global variables packed into {global_var_data['total_bits_used']} bits", file=sys.stderr)
+					for var_info in global_var_data['packed_vars']:
+						print(f"  {var_info['name']}: {var_info['bits']} bits at position {var_info['start_bit']}", file=sys.stderr)
+		except Exception as e:
+			print(f"Error analyzing global variables: {e}", file=sys.stderr)
+			global_var_data = {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
 	
 	# Parse assembly files if they exist
 	asm_parser = None
@@ -461,17 +477,30 @@ def main():
 	
 	# Analyze functions for register allocation
 	register_allocator = None
-	try:
-		register_allocator = analyze_all_functions_for_registers(c_parser, args.use_32bit)
-		if args.verbose:
-			print("Register allocation analysis completed", file=sys.stderr)
-	except Exception as e:
-		print(f"Warning: Register allocation analysis failed: {e}", file=sys.stderr)
-		register_allocator = None
+	if not args.O0:
+		try:
+			register_allocator = analyze_all_functions_for_registers(c_parser, args.use_32bit)
+			if args.verbose:
+				print("Register allocation analysis completed", file=sys.stderr)
+		except Exception as e:
+			print(f"Warning: Register allocation analysis failed: {e}", file=sys.stderr)
+			register_allocator = None
 	
 	# Generate code
 	try:
-		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, args.enable_metamorphic_return_sites, register_allocator, args.enable_indexed_function_calls)
+		# Metamorphic return sites patch instruction bytes in .text at runtime.
+		# For normal Linux linking (no custom linker script), .text is read-only,
+		# so this optimization must be disabled to avoid runtime segfaults.
+		linker_script = None
+		effective_metamorphic_return_sites = args.enable_metamorphic_return_sites
+		if not args.no_assemble:
+			linker_script = find_linker_script(input_path)
+			if effective_metamorphic_return_sites and not linker_script:
+				effective_metamorphic_return_sites = False
+				if args.verbose:
+					print("Disabling metamorphic return sites: no linker script found (.text is read-only with default linker settings)", file=sys.stderr)
+		
+		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, effective_metamorphic_return_sites, register_allocator, args.enable_indexed_function_calls)
 		output_code = codegen.generate(c_parser)
 		
 		# Write output
@@ -502,8 +531,9 @@ def main():
 				else:
 					executable_name = os.path.join(args.input_path, Path(args.input_path).name)
 			
-			# Find linker script
-			linker_script = find_linker_script(input_path)
+			# Find linker script (already computed above when assembling)
+			if linker_script is None:
+				linker_script = find_linker_script(input_path)
 			if linker_script and args.verbose:
 				print(f"Found linker script: {linker_script}", file=sys.stderr)
 			

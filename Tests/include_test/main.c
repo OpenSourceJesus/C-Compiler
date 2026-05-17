@@ -11,8 +11,8 @@ void print(char *fmt, char *msg) {
 
 #include "math_utils.h"
 
-char successMessage[] = "Success\n";
-char failMessage[] = "Fail\n";
+char successMsg[] = "Success\n";
+char failMsg[] = "Fail\n";
 
 int main() {
 	volatile int iterations = 1000000;  /* 1 million iterations */
@@ -37,10 +37,10 @@ int main() {
 	
 
 	if (result % 256 == 128)
-		print("%s", successMessage);
+		print("%s", successMsg);
 	else
 	{
-		print("%s", failMessage);
+		print("%s", failMsg);
 		print("%d", result);
 	}
 	/* Return result modulo to keep in valid range */

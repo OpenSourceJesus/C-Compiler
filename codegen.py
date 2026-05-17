@@ -52,6 +52,8 @@ class CodeGenerator:
         self.variable_registers = {}  # Track which variables are currently in registers: {var_name: register}
         self._loop_hoisted_small_funcs = None  # When in a loop: {func_name: reg} for precomputed jump addresses
         self.needs_print_int_buffer = False  # Emit shared decimal buffer only when print("%d", ...) is used
+        self.string_literals = {}  # Interned C string literals: {raw_literal: (label, decoded_value)}
+        self.string_literal_counter = 0
         
         # Register names based on bit mode
         if use_32bit:
@@ -262,6 +264,8 @@ class CodeGenerator:
         """Generate optimized code for all functions."""
         self.output = []
         self.needs_print_int_buffer = False
+        self.string_literals = {}
+        self.string_literal_counter = 0
         self._current_parser = parser  # Store parser reference for variable lookup
         self._collect_struct_sizes(parser)  # Auto-detect struct sizes from AST
         
@@ -474,6 +478,23 @@ class CodeGenerator:
             self.output.append("GLOBAL___print_int_buf:")
             self.output.append("    TIMES 32 DB 0")
             self.output.append("")
+
+        # Interned string literals used directly by expressions/calls
+        for _, (label, string_value) in sorted(self.string_literals.items(), key=lambda item: item[1][0]):
+            self.output.append(f"{label}:")
+            for char in string_value:
+                if char == '\n':
+                    self.output.append("    DB 10  ; newline")
+                elif char == '\t':
+                    self.output.append("    DB 9   ; tab")
+                elif char == '\r':
+                    self.output.append("    DB 13  ; carriage return")
+                elif ord(char) < 32 or ord(char) > 126 or char in ["'", '"']:
+                    self.output.append(f"    DB {ord(char)}")
+                else:
+                    self.output.append(f"    DB '{char}'")
+            self.output.append("    DB 0  ; null terminator")
+            self.output.append("")
         
         globals = parser.get_global_variables()
         
@@ -641,6 +662,72 @@ class CodeGenerator:
         # The return addresses are written directly into instruction bytes
         
         self.output.append("")
+
+    def _decode_c_string_literal(self, literal):
+        """Decode a quoted C string literal to Python text (basic escapes)."""
+        if not isinstance(literal, str) or len(literal) < 2:
+            return ""
+        if literal[0] == literal[-1] and literal[0] in ["'", '"']:
+            literal = literal[1:-1]
+        return literal.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\\\', '\\')
+
+    def _intern_string_literal(self, literal):
+        """Return stable data label for a C string literal."""
+        if literal not in self.string_literals:
+            label = f"STR_LIT_{self.string_literal_counter}"
+            self.string_literal_counter += 1
+            self.string_literals[literal] = (label, self._decode_c_string_literal(literal))
+        return self.string_literals[literal]
+
+    def _intern_runtime_string(self, text):
+        """Return stable data label for generated runtime text (already decoded)."""
+        key = f"__runtime__{text}"
+        if key not in self.string_literals:
+            label = f"STR_LIT_{self.string_literal_counter}"
+            self.string_literal_counter += 1
+            self.string_literals[key] = (label, text)
+        return self.string_literals[key]
+
+    def _emit_write_syscall_literal(self, text, preserve_rax=False):
+        """Emit direct write(1, literal, len) syscall for a Python string."""
+        if not text:
+            return
+        label, value = self._intern_runtime_string(text)
+        if preserve_rax:
+            self.output.append(f"    PUSH {self.reg_rax}  ; Preserve value across literal write")
+        if self.use_32bit:
+            self.output.append("    MOV EAX, 4  ; sys_write (32-bit)")
+            self.output.append("    MOV EBX, 1  ; stdout")
+            self.output.append(f"    LEA ECX, [{label}]")
+            self.output.append(f"    MOV EDX, {len(value)}")
+            self.output.append("    INT 0x80")
+        else:
+            self.output.append("    MOV RAX, 1  ; sys_write")
+            self.output.append("    MOV RDI, 1  ; stdout")
+            self.output.append(f"    LEA RSI, [rel {label}]")
+            self.output.append(f"    MOV RDX, {len(value)}")
+            self.output.append("    SYSCALL")
+        if preserve_rax:
+            self.output.append(f"    POP {self.reg_rax}  ; Restore preserved value")
+
+    def _emit_write_syscall_from_regs(self, buffer_reg, length_reg):
+        """Emit direct write(1, buffer_reg, length_reg) syscall."""
+        if self.use_32bit:
+            self.output.append("    MOV EAX, 4  ; sys_write (32-bit)")
+            self.output.append("    MOV EBX, 1  ; stdout")
+            if buffer_reg != 'ECX':
+                self.output.append(f"    MOV ECX, {buffer_reg}")
+            if length_reg != 'EDX':
+                self.output.append(f"    MOV EDX, {length_reg}")
+            self.output.append("    INT 0x80")
+        else:
+            self.output.append("    MOV RAX, 1  ; sys_write")
+            self.output.append("    MOV RDI, 1  ; stdout")
+            if buffer_reg != 'RSI':
+                self.output.append(f"    MOV RSI, {buffer_reg}")
+            if length_reg != 'RDX':
+                self.output.append(f"    MOV RDX, {length_reg}")
+            self.output.append("    SYSCALL")
     
     def _generate_asm_symbols(self, parser):
         """Generate assembly code for referenced external symbols from .S files."""
@@ -1051,6 +1138,7 @@ class CodeGenerator:
             reg_map = self.register_allocator.function_register_map.get(func_name, {})
             if self.reg_rbx in reg_map.values():
                 self.function_uses_rbx = True
+        self.function_saved_rbx = False
         
         # Reset stack tracking for this function
         self.current_function_stack = {}
@@ -1110,6 +1198,9 @@ class CodeGenerator:
             # Mark that this function needs stack frame
             if not self.function_needs_indexed_stack:
                 self.function_needs_indexed_stack = True
+                if getattr(self, 'function_uses_rbx', False) and not getattr(self, 'function_saved_rbx', False):
+                    self.output.append(f"    PUSH {self.reg_rbx}  ; Callee-saved: preserve RBX")
+                    self.function_saved_rbx = True
                 # Generate indexed stack prologue (with R12/R13 for indexed stack system)
                 # Note: After CALL, stack is 8-byte aligned. We push 3 registers (24 bytes),
                 # so we need to adjust RSP by 8 bytes to maintain 16-byte alignment
@@ -1185,13 +1276,13 @@ class CodeGenerator:
                                     self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
                                     self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
                                 self.output.append(f"    POP {self.reg_rbp}")
-                                if getattr(self, 'function_uses_rbx', False):
+                                if getattr(self, 'function_saved_rbx', False):
                                     self.output.append(f"    POP {self.reg_rbx}  ; Restore callee-saved RBX")
                             else:
                                 if self.current_stack_slots > 0:
                                     self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
                                     self.output.append(f"    POP {self.reg_rbp}")
-                                if getattr(self, 'function_uses_rbx', False):
+                                if getattr(self, 'function_saved_rbx', False):
                                     self.output.append(f"    POP {self.reg_rbx}  ; Restore callee-saved RBX")
                             
                             # Metamorphic return: load return address from instruction bytes and jump
@@ -1216,7 +1307,7 @@ class CodeGenerator:
                         elif self.current_stack_slots > 0:
                             self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}  ; Restore stack pointer")
                             self.output.append(f"    POP {self.reg_rbp}  ; Restore frame pointer")
-                        if getattr(self, 'function_uses_rbx', False):
+                        if getattr(self, 'function_saved_rbx', False):
                             self.output.append(f"    POP {self.reg_rbx}  ; Restore callee-saved RBX")
                     self.output.append("    RET")
     
@@ -1275,13 +1366,13 @@ class CodeGenerator:
                     self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
                     self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
                 self.output.append(f"    POP {self.reg_rbp}")
-                if getattr(self, 'function_uses_rbx', False):
+                if getattr(self, 'function_saved_rbx', False):
                     self.output.append(f"    POP {self.reg_rbx}  ; Restore callee-saved RBX")
             else:
                 if self.current_stack_slots > 0:
                     self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
                     self.output.append(f"    POP {self.reg_rbp}")
-                if getattr(self, 'function_uses_rbx', False):
+                if getattr(self, 'function_saved_rbx', False):
                     self.output.append(f"    POP {self.reg_rbx}  ; Restore callee-saved RBX")
             
             # Metamorphic return: load return address from instruction bytes and jump
@@ -1309,14 +1400,14 @@ class CodeGenerator:
                 self.output.append(f"    POP {self.stack_index_register}  ; Restore stack index register")
                 self.output.append(f"    POP {self.stack_base_register}  ; Restore stack base register")
                 self.output.append(f"    POP {self.reg_rbp}")
-                if getattr(self, 'function_uses_rbx', False):
+                if getattr(self, 'function_saved_rbx', False):
                     self.output.append(f"    POP {self.reg_rbx}  ; Restore callee-saved RBX")
             else:
                 # Only pop RBP if we pushed it (had stack frame / locals)
                 if self.current_stack_slots > 0:
                     self.output.append(f"    MOV {self.reg_rsp}, {self.reg_rbp}")
                     self.output.append(f"    POP {self.reg_rbp}")
-                if getattr(self, 'function_uses_rbx', False):
+                if getattr(self, 'function_saved_rbx', False):
                     self.output.append(f"    POP {self.reg_rbx}  ; Restore callee-saved RBX")
             self.output.append("    RET")
     
@@ -1451,6 +1542,128 @@ class CodeGenerator:
         
         # Special handling for print function (syscall)
         if func_name == "print":
+            # Inline print lowering with one placeholder (%d or %s), including literal prefix/suffix.
+            if call.args and len(call.args.exprs) >= 1:
+                fmt_arg = call.args.exprs[0]
+                if isinstance(fmt_arg, c_ast.Constant) and isinstance(fmt_arg.value, str):
+                    fmt_content = self._decode_c_string_literal(fmt_arg.value)
+                    format_is_percent_d = '%d' in fmt_content
+                    format_is_percent_s = '%s' in fmt_content
+                    if not format_is_percent_d and not format_is_percent_s:
+                        self._emit_write_syscall_literal(fmt_content)
+                        return
+                    if len(call.args.exprs) >= 2:
+                        value_arg = call.args.exprs[1]
+                        value_is_string_literal = isinstance(value_arg, c_ast.Constant) and isinstance(value_arg.value, str) and len(value_arg.value) >= 2 and value_arg.value[0] == '"' and value_arg.value[-1] == '"'
+                        if format_is_percent_d:
+                            prefix, suffix = fmt_content.split('%d', 1)
+                            self._generate_expression(value_arg)
+                            if prefix:
+                                self._emit_write_syscall_literal(prefix, preserve_rax=True)
+                            self.needs_print_int_buffer = True
+                            self.label_counter = self.label_counter + 1
+                            label_id = self.label_counter
+                            if self.use_32bit:
+                                self.output.append("    LEA ESI, [GLOBAL___print_int_buf + 31]  ; End of int print buffer")
+                                self.output.append("    MOV BYTE [ESI], 0")
+                                self.output.append("    PUSH 0  ; sign flag (0=positive, 1=negative)")
+                                self.output.append("    TEST EAX, EAX")
+                                self.output.append(f"    JGE PRINT_INT_ABS_{label_id}")
+                                self.output.append("    NEG EAX")
+                                self.output.append("    MOV DWORD [ESP], 1")
+                                self.output.append(f"PRINT_INT_ABS_{label_id}:")
+                                self.output.append("    MOV ECX, 10")
+                                self.output.append(f"PRINT_INT_LOOP_{label_id}:")
+                                self.output.append("    XOR EDX, EDX")
+                                self.output.append("    DIV ECX")
+                                self.output.append("    ADD DL, '0'")
+                                self.output.append("    DEC ESI")
+                                self.output.append("    MOV BYTE [ESI], DL")
+                                self.output.append("    TEST EAX, EAX")
+                                self.output.append(f"    JNZ PRINT_INT_LOOP_{label_id}")
+                                self.output.append("    CMP DWORD [ESP], 0")
+                                self.output.append(f"    JE PRINT_INT_NOSIGN_{label_id}")
+                                self.output.append("    DEC ESI")
+                                self.output.append("    MOV BYTE [ESI], '-'")
+                                self.output.append(f"PRINT_INT_NOSIGN_{label_id}:")
+                                self.output.append("    ADD ESP, 4  ; Pop sign flag")
+                                self.output.append("    LEA EDX, [GLOBAL___print_int_buf + 31]")
+                                self.output.append("    SUB EDX, ESI  ; Decimal string length")
+                                self._emit_write_syscall_from_regs("ESI", "EDX")
+                            else:
+                                self.output.append("    MOVSXD RAX, EAX  ; Treat %d argument as signed 32-bit int")
+                                self.output.append("    LEA RSI, [rel GLOBAL___print_int_buf + 31]  ; End of int print buffer")
+                                self.output.append("    MOV BYTE [RSI], 0")
+                                self.output.append("    PUSH 0  ; sign flag (0=positive, 1=negative)")
+                                self.output.append("    TEST RAX, RAX")
+                                self.output.append(f"    JGE PRINT_INT_ABS_{label_id}")
+                                self.output.append("    NEG RAX")
+                                self.output.append("    MOV QWORD [RSP], 1")
+                                self.output.append(f"PRINT_INT_ABS_{label_id}:")
+                                self.output.append("    MOV RCX, 10")
+                                self.output.append(f"PRINT_INT_LOOP_{label_id}:")
+                                self.output.append("    XOR RDX, RDX")
+                                self.output.append("    DIV RCX")
+                                self.output.append("    ADD DL, '0'")
+                                self.output.append("    DEC RSI")
+                                self.output.append("    MOV BYTE [RSI], DL")
+                                self.output.append("    TEST RAX, RAX")
+                                self.output.append(f"    JNZ PRINT_INT_LOOP_{label_id}")
+                                self.output.append("    CMP QWORD [RSP], 0")
+                                self.output.append(f"    JE PRINT_INT_NOSIGN_{label_id}")
+                                self.output.append("    DEC RSI")
+                                self.output.append("    MOV BYTE [RSI], '-'")
+                                self.output.append(f"PRINT_INT_NOSIGN_{label_id}:")
+                                self.output.append("    ADD RSP, 8  ; Pop sign flag")
+                                self.output.append("    LEA RDX, [rel GLOBAL___print_int_buf + 31]")
+                                self.output.append("    SUB RDX, RSI  ; Decimal string length")
+                                self._emit_write_syscall_from_regs("RSI", "RDX")
+                            if suffix:
+                                self._emit_write_syscall_literal(suffix)
+                            return
+                        if format_is_percent_s:
+                            prefix, suffix = fmt_content.split('%s', 1)
+                            if value_is_string_literal:
+                                lit_label, lit_value = self._intern_string_literal(value_arg.value)
+                                if self.use_32bit:
+                                    self.output.append(f"    LEA {self.reg_rax}, [{lit_label}]  ; Address of string literal")
+                                else:
+                                    self.output.append(f"    LEA {self.reg_rax}, [rel {lit_label}]  ; Address of string literal")
+                            else:
+                                self._generate_expression(value_arg)
+                            if prefix:
+                                self._emit_write_syscall_literal(prefix, preserve_rax=True)
+                            self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Buffer address")
+                            string_length = None
+                            if value_is_string_literal:
+                                string_length = len(lit_value)
+                            elif isinstance(value_arg, c_ast.ID):
+                                var_name = value_arg.name
+                                glob_vars = getattr(self, '_current_parser', None).get_global_variables() if hasattr(self, '_current_parser') else []
+                                for gv in glob_vars:
+                                    if gv.name == var_name and gv.init and isinstance(gv.init, c_ast.Constant):
+                                        value = gv.init.value
+                                        if isinstance(value, str) and ((value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'"))):
+                                            string_length = len(self._decode_c_string_literal(value))
+                                            break
+                            if string_length is not None:
+                                self.output.append(f"    MOV {self.reg_rdx}, {string_length}  ; String length (compile-time)")
+                            else:
+                                self.output.append(f"    MOV RCX, {self.reg_rsi}  ; Copy buffer address to RCX")
+                                self.output.append(f"    MOV {self.reg_rdx}, 0  ; Initialize length counter")
+                                length_label = f"_strlen_{self.return_site_index}"
+                                self.output.append(f"{length_label}:")
+                                self.output.append("    MOV AL, BYTE [RCX]  ; Load byte")
+                                self.output.append("    CMP AL, 0  ; Check for null terminator")
+                                self.output.append(f"    JE {length_label}_done")
+                                self.output.append("    INC RCX  ; Move to next byte")
+                                self.output.append(f"    INC {self.reg_rdx}  ; Increment length")
+                                self.output.append(f"    JMP {length_label}")
+                                self.output.append(f"{length_label}_done:")
+                            self._emit_write_syscall_from_regs(self.reg_rsi, self.reg_rdx)
+                            if suffix:
+                                self._emit_write_syscall_literal(suffix)
+                            return
             # print function: print("%s", msg) -> sys_write(1, msg, len)
             # Set up syscall arguments: RDI=1 (stdout), RSI=buffer, RDX=length
             if call.args and len(call.args.exprs) >= 2:
@@ -1459,12 +1672,27 @@ class CodeGenerator:
                 fmt_arg = call.args.exprs[0]
                 if isinstance(fmt_arg, c_ast.Constant) and isinstance(fmt_arg.value, str):
                     fmt = fmt_arg.value
-                    format_is_percent_s = fmt in ['"%s"', "'%s'"]
-                    format_is_percent_d = fmt in ['"%d"', "'%d'"]
+                    fmt_content = fmt
+                    if len(fmt_content) >= 2 and fmt_content[0] == fmt_content[-1] and fmt_content[0] in ["'", '"']:
+                        fmt_content = fmt_content[1:-1]
+                    # Basic escape normalization for common C escapes in string literals
+                    fmt_content = fmt_content.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\\\', '\\')
+                    # Accept common variants like "%s\n" or "label=%d\n", not only exact "%s"/"%d"
+                    format_is_percent_s = '%s' in fmt_content
+                    format_is_percent_d = '%d' in fmt_content
 
-                # First argument is format string (ignored), second is buffer
-                # Evaluate second argument to get buffer address
-                self._generate_expression(call.args.exprs[1])
+                # First argument is format string (ignored), second is payload argument
+                buf_arg = call.args.exprs[1]
+                buf_is_string_literal = isinstance(buf_arg, c_ast.Constant) and isinstance(buf_arg.value, str) and len(buf_arg.value) >= 2 and buf_arg.value[0] == '"' and buf_arg.value[-1] == '"'
+                if buf_is_string_literal:
+                    lit_label, lit_value = self._intern_string_literal(buf_arg.value)
+                    if self.use_32bit:
+                        self.output.append(f"    LEA {self.reg_rax}, [{lit_label}]  ; Address of string literal")
+                    else:
+                        self.output.append(f"    LEA {self.reg_rax}, [rel {lit_label}]  ; Address of string literal")
+                else:
+                    # Evaluate second argument to get pointer/value into RAX
+                    self._generate_expression(buf_arg)
 
                 if format_is_percent_d:
                     # Convert integer in RAX to decimal ASCII into shared buffer, then write it.
@@ -1534,9 +1762,10 @@ class CodeGenerator:
                     
                     # Compute length: try to get it from global variable if it's a string literal/array
                     # Check if second argument is a global variable with known string
-                    buf_arg = call.args.exprs[1]
                     string_length = None
-                    if isinstance(buf_arg, c_ast.ID):
+                    if buf_is_string_literal:
+                        string_length = len(lit_value)
+                    elif isinstance(buf_arg, c_ast.ID):
                         # Check if it's a global variable with string initializer
                         var_name = buf_arg.name
                         glob_vars = getattr(self, '_current_parser', None).get_global_variables() if hasattr(self, '_current_parser') else []
@@ -1583,10 +1812,14 @@ class CodeGenerator:
         else:
             # Prepare arguments (simplified - assume up to 6 args in registers)
             if call.args:
-                for i, arg in enumerate(call.args.exprs[:6]):
-                    reg = ([self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx] if self.use_32bit else [self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx, self.reg_r8, self.reg_r9])[i]
+                arg_regs = ([self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx] if self.use_32bit else [self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx, self.reg_r8, self.reg_r9])
+                args = call.args.exprs[:len(arg_regs)]
+                for arg in args:
                     self._generate_expression(arg)
-                    self.output.append(f"    MOV {reg}, {self.reg_rax}")
+                    self.output.append(f"    PUSH {self.reg_rax}  ; Save argument value")
+                for i in range(len(args) - 1, -1, -1):
+                    reg = arg_regs[i]
+                    self.output.append(f"    POP {reg}  ; Argument {i+1}")
         
         # Handle return site for single-return functions (quantized call-back)
         return_site_label = None
@@ -1622,10 +1855,14 @@ class CodeGenerator:
                     self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{func_name}]  ; Load function pointer")
                     # Prepare arguments first
                     if call.args:
-                        for i, arg in enumerate(call.args.exprs[:6]):
-                            reg = ([self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx] if self.use_32bit else [self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx, self.reg_r8, self.reg_r9])[i]
+                        arg_regs = ([self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx] if self.use_32bit else [self.reg_rdi, self.reg_rsi, self.reg_rdx, self.reg_rcx, self.reg_r8, self.reg_r9])
+                        args = call.args.exprs[:len(arg_regs)]
+                        for arg in args:
                             self._generate_expression(arg)
-                            self.output.append(f"    MOV {reg}, {self.reg_rax}  ; Argument {i+1}")
+                            self.output.append(f"    PUSH {self.reg_rax}  ; Save argument value")
+                        for i in range(len(args) - 1, -1, -1):
+                            reg = arg_regs[i]
+                            self.output.append(f"    POP {reg}  ; Argument {i+1}")
                         # Reload function pointer (arguments might have overwritten RAX)
                         self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{func_name}]  ; Reload function pointer")
                     # Use JMP for function pointer calls (like GCC -O3)
@@ -1636,7 +1873,7 @@ class CodeGenerator:
                     self.output.append(f"    CALL FUNC_{func_name}  ; Assumed to be defined externally")
         else:
             # Generate call based on function type
-            if callee_info.get('is_small', False):
+            if callee_info.get('is_small', False) and self.enable_indexed_function_calls:
                 # Small functions use JMP (not CALL), so we must push return address for callee's RET.
                 if return_site_label is None:
                     return_site_label = f"RET_SITE_{caller_func_name}_{self.return_site_index}"
@@ -1818,6 +2055,7 @@ class CodeGenerator:
                 if name in globals:
                     # Check if this is an array - arrays should give address, not value
                     is_array = False
+                    is_pointer = False
                     glob_vars = getattr(self, '_current_parser', None).get_global_variables() if hasattr(self, '_current_parser') else []
                     for gv in glob_vars:
                         if gv.name == name:
@@ -1825,6 +2063,9 @@ class CodeGenerator:
                             while hasattr(type_node, 'type'):
                                 if isinstance(type_node, c_ast.ArrayDecl):
                                     is_array = True
+                                    break
+                                if isinstance(type_node, c_ast.PtrDecl):
+                                    is_pointer = True
                                     break
                                 type_node = type_node.type
                             break
@@ -1836,8 +2077,10 @@ class CodeGenerator:
                         else:
                             # Use RIP-relative addressing for position-independent code
                             self.output.append(f"    LEA {self.reg_rax}, [rel GLOBAL_{name}]  ; Load array address (PIC)")
+                    elif is_pointer:
+                        self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load global pointer variable")
                     else:
-                        self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load global variable")
+                        self.output.append(f"    MOV EAX, DWORD [GLOBAL_{name}]  ; Load global int variable")
                 elif self.asm_parser and self.asm_parser.has_symbol(name):
                     # Global variable defined in assembly
                     self.output.append(f"    MOV {self.reg_rax}, [GLOBAL_{name}]  ; Load assembly-defined global")
@@ -1868,6 +2111,17 @@ class CodeGenerator:
             expr_type = safe_str(expr)
             self.output.append(f"    ; Warning: Unhandled expression type: {expr_type}")
             self.output.append(f"    MOV {self.reg_rax}, 0  ; Default value for unhandled expression")
+
+    def _expr_contains_func_call(self, expr):
+        """Return True if expression tree contains a function call."""
+        if expr is None:
+            return False
+        if isinstance(expr, c_ast.FuncCall):
+            return True
+        for _, child in expr.children():
+            if self._expr_contains_func_call(child):
+                return True
+        return False
     
     def _generate_binary_op(self, op):
         """Generate code for binary operation."""
@@ -1997,12 +2251,19 @@ class CodeGenerator:
                 self.output.append(f"    MOV {left_temp}, {self.reg_rax}  ; Save left operand")
                 self._binary_op_temp_saved = False
         
-        # Evaluate right operand (may use RCX; save * left on stack in 64-bit)
-        if op.op == '*' and not self.use_32bit:
-            self.output.append("    PUSH RCX")
-        self._generate_expression(op.right)
-        if op.op == '*' and not self.use_32bit:
-            self.output.append("    POP RCX")
+        # Evaluate right operand.
+        # Nested binary expressions reuse left_temp, so preserve it.
+        # If RHS contains function calls, do not use stack preservation because
+        # call lowering may emit extra return-site pushes in this backend.
+        rhs_has_call = self._expr_contains_func_call(op.right)
+        if rhs_has_call and not self.use_32bit:
+            self.output.append(f"    MOV R15, {left_temp}  ; Preserve left operand across calls")
+            self._generate_expression(op.right)
+            self.output.append(f"    MOV {left_temp}, R15  ; Restore left operand")
+        else:
+            self.output.append(f"    PUSH {left_temp}  ; Preserve left operand")
+            self._generate_expression(op.right)
+            self.output.append(f"    POP {left_temp}  ; Restore left operand")
         
         if op.op == '+':
             self.output.append(f"    ADD {self.reg_rax}, {left_temp}")
@@ -2027,7 +2288,7 @@ class CodeGenerator:
             self.output.append("    SETL AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '>':
-            self.output.append(f"    CMP {self.reg_rax}, {left_temp}")
+            self.output.append(f"    CMP {left_temp}, {self.reg_rax}")
             self.output.append("    SETG AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '<=':
@@ -2035,7 +2296,7 @@ class CodeGenerator:
             self.output.append("    SETLE AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '>=':
-            self.output.append(f"    CMP {self.reg_rax}, {left_temp}")
+            self.output.append(f"    CMP {left_temp}, {self.reg_rax}")
             self.output.append("    SETGE AL")
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '!=':
@@ -2138,7 +2399,9 @@ class CodeGenerator:
         if op.op == '-':
             self.output.append(f"    NEG {self.reg_rax}")
         elif op.op == '!':
-            self.output.append(f"    NOT {self.reg_rax}")
+            self.output.append(f"    TEST {self.reg_rax}, {self.reg_rax}")
+            self.output.append("    SETZ AL")
+            self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '*':
             # Pointer dereference: *ptr
             self.output.append("    ; Pointer dereference: *ptr")
@@ -2607,10 +2870,10 @@ class CodeGenerator:
             if member_offset > 0:
                 self.output.append(f"    ADD RAX, {member_offset}  ; Add member offset")
             if not is_nested_struct:
-                self.output.append("    MOV RAX, [RAX]  ; Load member value")
+                self.output.append("    MOV EAX, DWORD [RAX]  ; Load 32-bit member value")
         else:
             self.output.append("    ; Struct member access (member name not found)")
-            self.output.append("    MOV RAX, [RAX]  ; Load value at address")
+            self.output.append("    MOV EAX, DWORD [RAX]  ; Load 32-bit value at address")
     
     def _generate_assignment(self, assign):
         """Generate code for assignment."""
@@ -2697,11 +2960,12 @@ class CodeGenerator:
                     if member_offset > 0:
                         self.output.append(f"    ADD {self.reg_rax}, {member_offset}")
                 
-                # Save member address (use RSI, not RBX which might be allocated to a variable)
-                self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Save member address in RSI")
+                # Save member address in a temp register that is not an argument register.
+                # Using RSI here clobbers the second function parameter on x86-64.
+                self.output.append(f"    MOV {self.reg_binary_op_temp}, {self.reg_rax}  ; Save member address")
                 # Load current value from member
-                self.output.append(f"    MOV EAX, DWORD [{self.reg_rsi}]  ; Load current value from member")
-                self.output.append(f"    PUSH {self.reg_rsi}  ; Save member address for later store")
+                self.output.append(f"    MOV EAX, DWORD [{self.reg_binary_op_temp}]  ; Load current value from member")
+                self.output.append(f"    PUSH {self.reg_binary_op_temp}  ; Save member address for later store")
             else:
                 # Complex lvalue - generate expression
                 self._generate_expression(assign.lvalue)
@@ -2784,6 +3048,7 @@ class CodeGenerator:
             # Check if we have a struct member assignment
             if isinstance(assign.lvalue, c_ast.StructRef):
                 # Struct member assignment: first get the address, then evaluate rvalue
+                struct_addr_reg = 'EDI' if self.use_32bit else 'R11'
                 # Get the struct pointer base
                 struct_type = assign.lvalue.type if isinstance(assign.lvalue.type, str) else '.'
                 member_name = assign.lvalue.field.name if hasattr(assign.lvalue.field, 'name') else None
@@ -2794,58 +3059,58 @@ class CodeGenerator:
                 
                 if struct_type == '->':
                     # Pointer access: p->x = value
-                    # First, get the pointer value (use RSI, not RBX which might be allocated to a variable)
+                    # First, get the pointer value in a dedicated non-argument temp register.
                     if isinstance(assign.lvalue.name, c_ast.ID):
                         ptr_name = assign.lvalue.name.name
                         if ptr_name in self.function_parameters:
                             # Parameter - it's in a register
                             param_reg = self.function_parameters[ptr_name]
-                            self.output.append(f"    MOV {self.reg_rsi}, {param_reg}  ; Get struct pointer {ptr_name}")
+                            self.output.append(f"    MOV {struct_addr_reg}, {param_reg}  ; Get struct pointer {ptr_name}")
                         else:
                             # Local variable
                             self._generate_local_var_load(ptr_name)
-                            self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Get struct pointer")
+                            self.output.append(f"    MOV {struct_addr_reg}, {self.reg_rax}  ; Get struct pointer")
                     else:
                         self._generate_expression(assign.lvalue.name)
-                        self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}  ; Get struct pointer")
+                        self.output.append(f"    MOV {struct_addr_reg}, {self.reg_rax}  ; Get struct pointer")
                     
                     # Add member offset
                     if member_offset > 0:
-                        self.output.append(f"    ADD {self.reg_rsi}, {member_offset}  ; Add member offset for {member_name}")
+                        self.output.append(f"    ADD {struct_addr_reg}, {member_offset}  ; Add member offset for {member_name}")
                     
                     # Now generate the rvalue
                     self._generate_expression(assign.rvalue)
                     
                     # Store the value
-                    self.output.append(f"    MOV DWORD [{self.reg_rsi}], EAX  ; Store to struct member {member_name}")
+                    self.output.append(f"    MOV DWORD [{struct_addr_reg}], EAX  ; Store to struct member {member_name}")
                 else:
                     # Direct access: s.x = value
-                    # Generate address of struct (use RSI, not RBX which might be allocated to a variable)
+                    # Generate address of struct in a dedicated non-argument temp register.
                     if isinstance(assign.lvalue.name, c_ast.ID):
                         struct_name = assign.lvalue.name.name
                         globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
                         if struct_name in globals:
-                            self.output.append(f"    LEA {self.reg_rsi}, [GLOBAL_{struct_name}]  ; Get struct address")
+                            self.output.append(f"    LEA {struct_addr_reg}, [GLOBAL_{struct_name}]  ; Get struct address")
                         elif struct_name in self.current_function_stack:
                             slot_index, offset = self.current_function_stack[struct_name]
                             stack_offset = (slot_index + 1) * 8 + offset
-                            self.output.append(f"    LEA {self.reg_rsi}, [{self.reg_rbp} - {stack_offset}]  ; Get local struct address")
+                            self.output.append(f"    LEA {struct_addr_reg}, [{self.reg_rbp} - {stack_offset}]  ; Get local struct address")
                         else:
                             self._generate_expression(assign.lvalue.name)
-                            self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}")
+                            self.output.append(f"    MOV {struct_addr_reg}, {self.reg_rax}")
                     else:
                         self._generate_expression(assign.lvalue.name)
-                        self.output.append(f"    MOV {self.reg_rsi}, {self.reg_rax}")
+                        self.output.append(f"    MOV {struct_addr_reg}, {self.reg_rax}")
                     
                     # Add member offset
                     if member_offset > 0:
-                        self.output.append(f"    ADD {self.reg_rsi}, {member_offset}  ; Add member offset for {member_name}")
+                        self.output.append(f"    ADD {struct_addr_reg}, {member_offset}  ; Add member offset for {member_name}")
                     
                     # Now generate the rvalue
                     self._generate_expression(assign.rvalue)
                     
                     # Store the value
-                    self.output.append(f"    MOV DWORD [{self.reg_rsi}], EAX  ; Store to struct member {member_name}")
+                    self.output.append(f"    MOV DWORD [{struct_addr_reg}], EAX  ; Store to struct member {member_name}")
             elif isinstance(assign.lvalue, c_ast.ID):
                 # Generate the rvalue expression first
                 self._generate_expression(assign.rvalue)
@@ -3434,8 +3699,9 @@ class CodeGenerator:
         if not self.function_needs_indexed_stack:
             self.function_needs_indexed_stack = True
             # If function uses RBX (callee-saved), preserve it so we don't clobber caller's value
-            if getattr(self, 'function_uses_rbx', False):
+            if getattr(self, 'function_uses_rbx', False) and not getattr(self, 'function_saved_rbx', False):
                 self.output.append(f"    PUSH {self.reg_rbx}  ; Callee-saved: preserve RBX")
+                self.function_saved_rbx = True
             # Generate indexed stack prologue (with R12/R13 for indexed stack system)
             # Note: After CALL, stack is 8-byte aligned. We push 3 registers (24 bytes),
             # so we need to adjust RSP by 8 bytes to maintain 16-byte alignment
