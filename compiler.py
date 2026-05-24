@@ -15,6 +15,60 @@ from symbol_collector import collect_symbols
 from register_allocator import analyze_all_functions_for_registers
 
 
+GCC_IGNORED_FLAGS = frozenset({
+	'-fPIC',
+	'-fdiagnostics-color=always',
+	'-Wall',
+	'-Winvalid-pch',
+	'-D_FILE_OFFSET_BITS=64',
+})
+
+
+def preprocess_gcc_compat_args(argv):
+	"""Strip GCC-compatible flags and detect shared-library builds.
+
+	When both -shared and -fPIC are present, enable shared-library output.
+	"""
+	filtered = []
+	has_shared = False
+	has_fpic = False
+
+	for arg in argv:
+		if arg == '-shared':
+			has_shared = True
+			continue
+		if arg == '-fPIC':
+			has_fpic = True
+			continue
+		if arg in GCC_IGNORED_FLAGS:
+			continue
+		filtered.append(arg)
+
+	return filtered, has_shared and has_fpic
+
+
+def resolve_output_paths(output_arg, input_path, build_shared):
+	"""Return (asm_path, final_binary_path) for codegen and linking."""
+	if output_arg:
+		if build_shared or output_arg.endswith('.so'):
+			if output_arg.endswith('.so'):
+				asm_path = output_arg[:-3] + '.asm'
+			else:
+				asm_path = output_arg + '.asm'
+			return asm_path, output_arg
+		if output_arg.endswith('.asm'):
+			return output_arg, output_arg[:-4]
+		return output_arg, output_arg
+
+	if input_path.is_file():
+		base = str(input_path).replace('.c', '')
+	else:
+		base = os.path.join(str(input_path), Path(input_path).name)
+	if build_shared:
+		return base + '.asm', base + '.so'
+	return base + '.asm', base
+
+
 def find_assembler(use_32bit=False):
 	"""Find available assembler (nasm or yasm).
 	
@@ -108,7 +162,7 @@ def find_linker_script(input_path):
 	return None
 
 
-def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_script=None, use_32bit=False):
+def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_script=None, use_32bit=False, build_shared=False):
 	"""Assemble and link the generated assembly file.
 	
 	Args:
@@ -117,6 +171,7 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 		verbose: Enable verbose output
 		linker_script: Path to linker script
 		use_32bit: If True, use 32-bit mode (elf32, -m elf_i386)
+		build_shared: If True, link as a shared library (.so)
 	"""
 	# Find assembler
 	assembler_info = find_assembler(use_32bit)
@@ -164,6 +219,12 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 		# segmentation faults when running normal Linux executables. Use -N only when
 		# a linker script is provided (bare-metal / custom layout).
 		link_cmd = ['ld', obj_file, '-o', output_executable]
+		
+		if build_shared:
+			link_cmd.insert(1, '-shared')
+			# Shared libraries loaded by hardened runtimes may fail if PT_GNU_STACK
+			# requests an executable stack. Force a non-executable stack.
+			link_cmd.extend(['-z', 'noexecstack'])
 		
 		# Add 32-bit emulation if needed
 		if use_32bit:
@@ -219,8 +280,8 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 					print(f"Warning: Could not modify linker script for writable text: {e}", file=sys.stderr)
 				pass
 		
-		# Add linker script if provided
-		if actual_linker_script:
+		# Add linker script if provided (not for shared libraries)
+		if actual_linker_script and not build_shared:
 			link_cmd.extend(['-T', actual_linker_script])
 			# -N (omagic) for bare-metal: writable text/data, no page alignment (needed for custom layout)
 			link_cmd.append('-N')
@@ -241,7 +302,8 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 		return False
 	
 	if verbose:
-		print(f"Success! Executable created: {output_executable}", file=sys.stderr)
+		kind = "Shared library" if build_shared else "Executable"
+		print(f"Success! {kind} created: {output_executable}", file=sys.stderr)
 	
 	return True
 
@@ -319,6 +381,8 @@ def run_qemu(executable, verbose=False, qemu_mode='user', kernel=None, bios=None
 
 def main():
 	"""Main compiler entry point."""
+	argv, build_shared = preprocess_gcc_compat_args(sys.argv[1:])
+
 	parser = argparse.ArgumentParser(description='Custom C Compiler with Function Call Optimizations')
 	parser.add_argument('input_path', help='Input C source file or directory containing C files')
 	parser.add_argument('-o', '--output', help='Output assembly file (or executable if --assemble is used)', default=None)
@@ -337,7 +401,8 @@ def main():
 	parser.add_argument('-I', action='append', dest='include_paths', default=[], metavar='DIR',
 	                    help='Add directory to include search path (can be specified multiple times)')
 	
-	args = parser.parse_args()
+	args = parser.parse_args(argv)
+	args.build_shared = build_shared
 	
 	if args.O0:
 		args.enable_metamorphic_return_sites = False
@@ -495,7 +560,12 @@ def main():
 		effective_metamorphic_return_sites = args.enable_metamorphic_return_sites
 		if not args.no_assemble:
 			linker_script = find_linker_script(input_path)
-			if effective_metamorphic_return_sites and not linker_script:
+			if args.build_shared:
+				linker_script = None
+				effective_metamorphic_return_sites = False
+				if args.verbose:
+					print("Shared library build: disabling linker script and metamorphic return sites", file=sys.stderr)
+			elif effective_metamorphic_return_sites and not linker_script:
 				effective_metamorphic_return_sites = False
 				if args.verbose:
 					print("Disabling metamorphic return sites: no linker script found (.text is read-only with default linker settings)", file=sys.stderr)
@@ -503,14 +573,7 @@ def main():
 		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, effective_metamorphic_return_sites, register_allocator, args.enable_indexed_function_calls)
 		output_code = codegen.generate(c_parser)
 		
-		# Write output
-		if args.output:
-			output_file = args.output
-		elif input_path.is_file():
-			output_file = str(input_path).replace('.c', '.asm')
-		else:
-			# For directories, use directory name with .asm extension
-			output_file = os.path.join(args.input_path, Path(args.input_path).name + '.asm')
+		output_file, executable_name = resolve_output_paths(args.output, input_path, args.build_shared)
 		
 		with open(output_file, 'w') as f:
 			f.write(output_code)
@@ -520,16 +583,6 @@ def main():
 		
 		# Assemble and link if not disabled
 		if not args.no_assemble:
-			# Determine executable output name
-			if args.output:
-				# If user specified output, use it for both asm and executable
-				executable_name = args.output.replace('.asm', '')
-			else:
-				# Default executable name based on input
-				if input_path.is_file():
-					executable_name = str(input_path).replace('.c', '')
-				else:
-					executable_name = os.path.join(args.input_path, Path(args.input_path).name)
 			
 			# Find linker script (already computed above when assembling)
 			if linker_script is None:
@@ -537,7 +590,7 @@ def main():
 			if linker_script and args.verbose:
 				print(f"Found linker script: {linker_script}", file=sys.stderr)
 			
-			success = assemble_and_link(output_file, executable_name, args.verbose, linker_script, args.use_32bit)
+			success = assemble_and_link(output_file, executable_name, args.verbose, linker_script, args.use_32bit, args.build_shared)
 			if not success:
 				sys.exit(1)
 			

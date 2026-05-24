@@ -54,6 +54,7 @@ class CodeGenerator:
         self.needs_print_int_buffer = False  # Emit shared decimal buffer only when print("%d", ...) is used
         self.string_literals = {}  # Interned C string literals: {raw_literal: (label, decoded_value)}
         self.string_literal_counter = 0
+        self.external_functions = set()  # Unresolved function symbols that must be declared EXTERN
         
         # Register names based on bit mode
         if use_32bit:
@@ -266,6 +267,7 @@ class CodeGenerator:
         self.needs_print_int_buffer = False
         self.string_literals = {}
         self.string_literal_counter = 0
+        self.external_functions = set()
         self._current_parser = parser  # Store parser reference for variable lookup
         self._collect_struct_sizes(parser)  # Auto-detect struct sizes from AST
         
@@ -302,6 +304,7 @@ class CodeGenerator:
             self.output.append("BITS 32")
         else:
             self.output.append("BITS 64")
+            self.output.append("DEFAULT REL")
         self.output.append("SECTION .text")
         self.output.append("")
         
@@ -318,8 +321,11 @@ class CodeGenerator:
             if func_name and func_name != "unknown":
                 all_function_names.add(func_name)
         for func_name in sorted(all_function_names):
+            # Export plain C symbol names for FFI/dlsym users (ctypes, etc.).
+            self.output.append(f"GLOBAL {func_name}")
             self.output.append(f"GLOBAL FUNC_{func_name}")
         self.output.append("")
+        extern_insert_index = len(self.output)
         
         # Only generate _start if not already defined in assembly files
         if not has_external_start:
@@ -415,6 +421,14 @@ class CodeGenerator:
         # Generate assembly code for referenced external symbols
         if self.asm_parser:
             self._generate_asm_symbols(parser)
+        
+        # Emit EXTERN declarations for unresolved direct calls (e.g. libc symbols).
+        if self.external_functions:
+            extern_lines = ["; External function declarations"]
+            for name in sorted(self.external_functions):
+                extern_lines.append(f"EXTERN {name}")
+            extern_lines.append("")
+            self.output[extern_insert_index:extern_insert_index] = extern_lines
         
         # Final sanitization pass to remove any AST node attributes that might have leaked
         sanitized_output = []
@@ -1181,6 +1195,8 @@ class CodeGenerator:
         # Align function start to 16 bytes for quantized call-backs (skip when co-located in 1024-byte slot)
         if not in_small_func_block:
             self.output.append(f"ALIGN {self.alignment}")
+        # Plain symbol alias at the same address for C ABI/FFI lookups.
+        self.output.append(f"{func_name}:")
         self.output.append(f"FUNC_{func_name}:")
         
         if is_interrupt:
@@ -1539,6 +1555,36 @@ class CodeGenerator:
             return
         
         callee_info = self.function_data.get(func_name, {})
+        preserved_param_func_ptr_reg = None
+        if func_name in self.function_parameters and not self.use_32bit:
+            # Function-pointer parameters can share argument registers that get overwritten
+            # while evaluating call arguments. Preserve a copy in a caller-saved temp.
+            preserved_param_func_ptr_reg = self.small_func_dispatch_reg
+            self.output.append(
+                f"    MOV {preserved_param_func_ptr_reg}, {self.function_parameters[func_name]}  ; Preserve potential function-pointer parameter"
+            )
+
+        # Special handling for assert(expr): lower to runtime check and abort on failure.
+        # This avoids unresolved plain "assert" symbols when sources use assert-like calls.
+        if func_name == "assert":
+            self.label_counter = self.label_counter + 1
+            label_id = self.label_counter
+            assert_ok_label = f"ASSERT_OK_{label_id}"
+            if call.args and len(call.args.exprs) >= 1:
+                self._generate_expression(call.args.exprs[0])
+            else:
+                # Missing argument: treat as failure to keep behavior conservative.
+                self.output.append(f"    MOV {self.reg_rax}, 0")
+            self.output.append(f"    TEST {self.reg_rax}, {self.reg_rax}")
+            self.output.append(f"    JNZ {assert_ok_label}")
+            if self.use_32bit:
+                self.output.append("    CALL abort")
+            else:
+                self.output.append("    CALL abort WRT ..plt")
+            self.external_functions.add("abort")
+            self.output.append(f"{assert_ok_label}:")
+            self.output.append(f"    MOV {self.reg_rax}, 0")
+            return
         
         # Special handling for print function (syscall)
         if func_name == "print":
@@ -1848,7 +1894,14 @@ class CodeGenerator:
             else:
                 # Check if it's a global variable (might be a function pointer)
                 globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
-                if func_name in globals:
+                if func_name in self.function_parameters:
+                    # Function pointer passed as parameter; call through preserved register.
+                    self.output.append(f"    ; Function pointer parameter call: {func_name}")
+                    if preserved_param_func_ptr_reg and not self.use_32bit:
+                        self.output.append(f"    CALL {preserved_param_func_ptr_reg}")
+                    else:
+                        self.output.append(f"    CALL {self.function_parameters[func_name]}")
+                elif func_name in globals:
                     # This is a function pointer variable, not a function name
                     # Load the function pointer and call it
                     self.output.append(f"    ; Function pointer call: {func_name}")
@@ -1870,7 +1923,12 @@ class CodeGenerator:
                 else:
                     # Assume it's an external function
                     self.output.append(f"    ; External function call: {func_name}")
-                    self.output.append(f"    CALL FUNC_{func_name}  ; Assumed to be defined externally")
+                    if self.use_32bit:
+                        self.output.append(f"    CALL {func_name}  ; Assumed to be provided by external linker inputs")
+                    else:
+                        # Use PLT relocation in shared/PIC builds to avoid non-PIC PC32 relocations.
+                        self.output.append(f"    CALL {func_name} WRT ..plt  ; External call via PLT")
+                    self.external_functions.add(func_name)
         else:
             # Generate call based on function type
             if callee_info.get('is_small', False) and self.enable_indexed_function_calls:
@@ -2578,7 +2636,10 @@ class CodeGenerator:
                     if self.use_32bit:
                         self.output.append(f"    LEA EAX, [GLOBAL_{name} + ECX*4]  ; Base + index*4 (int is 4 bytes)")
                     else:
-                        self.output.append(f"    LEA RAX, [rel GLOBAL_{name} + RCX*4]  ; Base + index*4 (int is 4 bytes, PIC)")
+                        # NASM does not support RIP-relative addressing with scaled index directly.
+                        # Load the base with RIP-relative LEA, then apply the scaled index in a second LEA.
+                        self.output.append(f"    LEA RAX, [rel GLOBAL_{name}]  ; Base address (PIC)")
+                        self.output.append("    LEA RAX, [RAX + RCX*4]  ; Base + index*4")
                 else:
                     # Local array - get base address; use per-array element size (e.g. 16 for struct Inner[])
                     if name in self.current_function_stack:
