@@ -1,5 +1,15 @@
+#ifdef GCC
+#include <stdio.h>
+#define print printf
+#else
+void print(char *fmt, char *msg) {
+	/* Empty body - compiler will generate syscall code */
+}
+#endif
+
 void test ()
 {
+	print("Called function\n");
 }
 
 int main ()
@@ -11,5 +21,6 @@ int main ()
 		test ();
 	}
 	
+	print("Reached end\n");
 	return 0;
 }

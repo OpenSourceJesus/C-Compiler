@@ -983,12 +983,8 @@ class CodeGenerator:
             # Check if it's a function parameter
             if var_name in self.function_parameters:
                 param_reg = self.function_parameters[var_name]
-                # Use 32-bit move for integer parameters if in 64-bit mode
-                if not self.use_32bit and self.current_function_stack.get(var_name, (0, 0)) == (0, 0):
-                    reg_name = param_reg.replace('R', 'E') if param_reg.startswith('R') else param_reg
-                    self.output.append(f"    MOVSX {self.reg_rax}, {reg_name}  ; Load parameter {var_name} (sign-extend)")
-                else:
-                    self.output.append(f"    MOV {self.reg_rax}, {param_reg}  ; Load parameter {var_name}")
+                # Keep full register width so pointer/size_t parameters are not truncated.
+                self.output.append(f"    MOV {self.reg_rax}, {param_reg}  ; Load parameter {var_name}")
                 return
             # Variable not found - might be an error
             self.output.append(f"    ; Warning: {var_name} not found in stack or parameters")
@@ -1048,11 +1044,7 @@ class CodeGenerator:
                 reg_32 = param_reg.replace('R', 'E') if param_reg.startswith('R') else param_reg
                 self.output.append(f"    MOV {reg_32}, {self.reg_rax}  ; Store to parameter {var_name}")
             else:
-                if param_reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
-                    reg_32 = param_reg + 'D'
-                else:
-                    reg_32 = param_reg.replace('R', 'E') if param_reg.startswith('R') else param_reg
-                self.output.append(f"    MOV {reg_32}, EAX  ; Store to parameter {var_name} (32-bit)")
+                self.output.append(f"    MOV {param_reg}, {self.reg_rax}  ; Store to parameter {var_name}")
             return
         
         # Variable should be on stack
@@ -1180,6 +1172,7 @@ class CodeGenerator:
             param_registers = ['EDI', 'ESI', 'EDX', 'ECX']
         else:
             param_registers = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9']
+        self.function_parameter_elem_size = {}
         if func_def.decl and func_def.decl.type and hasattr(func_def.decl.type, 'args'):
             if func_def.decl.type.args and func_def.decl.type.args.params:
                 for i, param in enumerate(func_def.decl.type.args.params):
@@ -1191,6 +1184,47 @@ class CodeGenerator:
                             else:
                                 param_name = str(param.name)
                             self.function_parameters[param_name] = param_registers[i]
+                            # Best-effort pointee element size for pointer/array parameters.
+                            elem_size = 4
+                            type_node = getattr(param, 'type', None)
+                            while type_node is not None:
+                                if isinstance(type_node, c_ast.PtrDecl):
+                                    pointee = type_node.type
+                                    while isinstance(pointee, c_ast.TypeDecl):
+                                        pointee = pointee.type
+                                    if isinstance(pointee, c_ast.IdentifierType):
+                                        names = [str(n).lower() for n in (pointee.names or [])]
+                                        if 'char' in names:
+                                            elem_size = 1
+                                        elif 'short' in names:
+                                            elem_size = 2
+                                        elif 'long' in names:
+                                            elem_size = 8
+                                        else:
+                                            elem_size = 4
+                                    elif isinstance(pointee, c_ast.PtrDecl):
+                                        elem_size = 8 if not self.use_32bit else 4
+                                    break
+                                if isinstance(type_node, c_ast.ArrayDecl):
+                                    inner = type_node.type
+                                    while isinstance(inner, c_ast.TypeDecl):
+                                        inner = inner.type
+                                    if isinstance(inner, c_ast.IdentifierType):
+                                        names = [str(n).lower() for n in (inner.names or [])]
+                                        if 'char' in names:
+                                            elem_size = 1
+                                        elif 'short' in names:
+                                            elem_size = 2
+                                        elif 'long' in names:
+                                            elem_size = 8
+                                        else:
+                                            elem_size = 4
+                                    break
+                                if hasattr(type_node, 'type'):
+                                    type_node = type_node.type
+                                else:
+                                    break
+                            self.function_parameter_elem_size[param_name] = elem_size
         
         # Align function start to 16 bytes for quantized call-backs (skip when co-located in 1024-byte slot)
         if not in_small_func_block:
@@ -1234,6 +1268,25 @@ class CodeGenerator:
             self.current_stack_slots = 1
             self.output.append(f"    SUB {self.reg_rsp}, 8  ; Allocate stack space for SIMD register")
             # Note: xmm15 is typically preserved across calls, but we ensure it's accessible
+        elif self.function_total_stack_size > 0:
+            # Emit stack frame/prologue at function entry when locals exist anywhere in this
+            # function body (including nested blocks/conditionals). Delaying prologue emission
+            # until a Decl executes causes runtime imbalance when that path is skipped.
+            self.function_needs_indexed_stack = True
+            if getattr(self, 'function_uses_rbx', False) and not getattr(self, 'function_saved_rbx', False):
+                self.output.append(f"    PUSH {self.reg_rbx}  ; Callee-saved: preserve RBX")
+                self.function_saved_rbx = True
+            self.output.append(f"    PUSH {self.reg_rbp}  ; Save old frame pointer")
+            if not self.use_32bit:
+                self.output.append(f"    PUSH {self.stack_base_register}  ; Preserve stack base register")
+                self.output.append(f"    PUSH {self.stack_index_register}  ; Preserve stack index register")
+                self.output.append(f"    SUB {self.reg_rsp}, 8  ; Adjust for 16-byte stack alignment")
+            self.output.append(f"    MOV {self.reg_rbp}, {self.reg_rsp}  ; Set new frame pointer")
+            if not self.use_32bit:
+                self.output.append(f"    MOV {self.stack_base_register}, 0x7FFF0000  ; Load stack base (immediate)")
+                self.output.append(f"    XOR {self.stack_index_register}, {self.stack_index_register}  ; Initialize slot index to 0")
+            self.output.append(f"    SUB {self.reg_rsp}, {self.function_total_stack_size}  ; Allocate stack for all locals")
+            self.function_stack_allocated = True
         
         # Check if this is a syscall function (functions starting with "print" that have empty bodies)
         is_syscall = func_name.startswith("print")
@@ -1356,7 +1409,7 @@ class CodeGenerator:
             self._generate_decl(stmt)
         elif isinstance(stmt, c_ast.Compound):
             self._generate_block(stmt, func_name, info)
-        elif isinstance(stmt, (c_ast.UnaryOp, c_ast.BinaryOp, c_ast.ID, c_ast.ArrayRef, c_ast.StructRef)):
+        elif isinstance(stmt, (c_ast.UnaryOp, c_ast.BinaryOp, c_ast.ID, c_ast.ArrayRef, c_ast.StructRef, c_ast.Cast, c_ast.ExprList)):
             # Expression statements (e.g., i++, function calls in expressions, etc.)
             # Generate the expression and discard the result
             self._generate_expression(stmt)
@@ -2069,12 +2122,16 @@ class CodeGenerator:
                 else:
                     # Try to parse as numeric value
                     try:
-                        if value.startswith('0x') or value.startswith('0X'):
-                            num_value = int(value, 16)
-                        elif value.startswith('0') and len(value) > 1:
-                            num_value = int(value, 8)
+                        # Strip common C integer suffixes (U/L/UL/etc.).
+                        import re
+                        match = re.match(r'^(0[xX][0-9a-fA-F]+|0[0-7]*|[0-9]+)([uUlL]*)$', value)
+                        literal_value = match.group(1) if match else value
+                        if literal_value.startswith('0x') or literal_value.startswith('0X'):
+                            num_value = int(literal_value, 16)
+                        elif literal_value.startswith('0') and len(literal_value) > 1:
+                            num_value = int(literal_value, 8)
                         else:
-                            num_value = int(value)
+                            num_value = int(literal_value)
                         self.output.append(f"    MOV {self.reg_rax}, {num_value}")
                     except (ValueError, TypeError):
                         # If conversion fails, use 0
@@ -2156,6 +2213,22 @@ class CodeGenerator:
             self._generate_struct_ref(expr)
         elif isinstance(expr, c_ast.TernaryOp):
             self._generate_ternary_op(expr)
+        elif isinstance(expr, c_ast.Assignment):
+            # Assignment can appear as an expression (e.g. comma operator lists).
+            self._generate_assignment(expr)
+        elif isinstance(expr, c_ast.Cast):
+            # Basic C cast support: evaluate the inner expression.
+            # Most integer/pointer casts in this backend are representational and
+            # can be handled by downstream MOV width at use sites.
+            self._generate_expression(expr.expr)
+        elif isinstance(expr, c_ast.ExprList):
+            # Comma operator: evaluate all expressions left-to-right, result is last.
+            exprs = getattr(expr, 'exprs', None) or []
+            if not exprs:
+                self.output.append(f"    MOV {self.reg_rax}, 0")
+            else:
+                for sub_expr in exprs:
+                    self._generate_expression(sub_expr)
         elif isinstance(expr, c_ast.FuncCall):
             # Function call in expression - generate call, return value will be in RAX
             # We need to get the current function name for the caller context
@@ -2333,10 +2406,15 @@ class CodeGenerator:
         elif op.op == '/':
             # Division: left / RAX (operands need swapping)
             # DIV divides RDX:RAX by operand, result in RAX, remainder in RDX
+            preserve_param_rdx = (not self.use_32bit and hasattr(self, 'function_parameters') and any(reg == self.reg_rdx for reg in self.function_parameters.values()))
+            if preserve_param_rdx:
+                self.output.append(f"    PUSH {self.reg_rdx}  ; Preserve parameter register {self.reg_rdx} across division")
             self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save divisor")
             self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Dividend to RAX")
             self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear RDX for unsigned division")
             self.output.append(f"    DIV {self.reg_rcx}  ; RAX = RAX / RCX")
+            if preserve_param_rdx:
+                self.output.append(f"    POP {self.reg_rdx}  ; Restore preserved parameter register")
         elif op.op == '==':
             self.output.append(f"    CMP {self.reg_rax}, {left_temp}")
             self.output.append("    SETE AL")
@@ -2363,6 +2441,9 @@ class CodeGenerator:
             self.output.append(f"    MOVZX {self.reg_rax}, AL")
         elif op.op == '%':
             # Modulo: left % right
+            preserve_param_rdx = (not self.use_32bit and hasattr(self, 'function_parameters') and any(reg == self.reg_rdx for reg in self.function_parameters.values()))
+            if preserve_param_rdx:
+                self.output.append(f"    PUSH {self.reg_rdx}  ; Preserve parameter register {self.reg_rdx} across modulo")
             self.output.append(f"    ; Modulo operation: {left_temp} % {self.reg_rax}")
             self.output.append(f"    PUSH {self.reg_rax}  ; Save right operand (divisor)")
             self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Move left operand (dividend) to {self.reg_rax}")
@@ -2370,6 +2451,8 @@ class CodeGenerator:
             self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear {self.reg_rdx} for division")
             self.output.append(f"    DIV {left_temp}  ; {self.reg_rax} = dividend / divisor, {self.reg_rdx} = remainder")
             self.output.append(f"    MOV {self.reg_rax}, {self.reg_rdx}  ; Remainder is the modulo result")
+            if preserve_param_rdx:
+                self.output.append(f"    POP {self.reg_rdx}  ; Restore preserved parameter register")
         elif op.op == '&&':
             # Logical AND: both operands must be non-zero
             self.label_counter = self.label_counter + 1
@@ -2463,7 +2546,21 @@ class CodeGenerator:
         elif op.op == '*':
             # Pointer dereference: *ptr
             self.output.append("    ; Pointer dereference: *ptr")
-            self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rax}]  ; Load value at address in {self.reg_rax}")
+            deref_size = 4
+            if isinstance(op.expr, c_ast.ID):
+                pname = op.expr.name
+                deref_size = getattr(self, 'function_parameter_elem_size', {}).get(pname, deref_size)
+            elif isinstance(op.expr, c_ast.UnaryOp) and isinstance(op.expr.expr, c_ast.ID):
+                pname = op.expr.expr.name
+                deref_size = getattr(self, 'function_parameter_elem_size', {}).get(pname, deref_size)
+            if deref_size == 1:
+                self.output.append("    MOVZX EAX, BYTE [RAX]  ; Load 8-bit pointee")
+            elif deref_size == 2:
+                self.output.append("    MOVZX EAX, WORD [RAX]  ; Load 16-bit pointee")
+            elif deref_size == 8:
+                self.output.append("    MOV RAX, QWORD [RAX]  ; Load 64-bit pointee")
+            else:
+                self.output.append("    MOV EAX, DWORD [RAX]  ; Load 32-bit pointee")
         elif op.op == '~':
             # Bitwise NOT: ~expr
             self.output.append("    ; Bitwise NOT: ~expr")
@@ -2492,26 +2589,8 @@ class CodeGenerator:
                     if name in globals:
                         self.output.append(f"    MOV [GLOBAL_{name}], {self.reg_rax}")
                     else:
-                        # Store to local - use RBP-based addressing
-                        if name in self.current_function_stack:
-                            slot_index, offset = self.current_function_stack[name]
-                            stack_offset = (slot_index + 1) * 8 + offset
-                            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
-                            # Update register if variable is in a register
-                            if name in self.variable_registers:
-                                reg = self.variable_registers[name]
-                                if self.use_32bit:
-                                    reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
-                                    self.output.append(f"    MOV {reg_32}, EAX  ; Update {name} in register {reg}")
-                                else:
-                                    if reg.startswith('R'):
-                                        if reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
-                                            reg_32 = reg + 'D'
-                                        else:
-                                            reg_32 = reg.replace('R', 'E')
-                                        self.output.append(f"    MOV {reg_32}, EAX  ; Update {name} in register {reg} (32-bit)")
-                                    else:
-                                        self.output.append(f"    MOV {reg}, EAX  ; Update {name} in register {reg}")
+                        # Store back to local/parameter through normal lvalue store path.
+                        self._generate_local_var_store(name)
                 self.output.append(f"    POP {self.reg_rax}  ; Return original value")
         elif op.op == 'p--':
             # Post-decrement: var--
@@ -2537,26 +2616,8 @@ class CodeGenerator:
                     if name in globals:
                         self.output.append(f"    MOV [GLOBAL_{name}], {self.reg_rax}")
                     else:
-                        # Store to local - use RBP-based addressing
-                        if name in self.current_function_stack:
-                            slot_index, offset = self.current_function_stack[name]
-                            stack_offset = (slot_index + 1) * 8 + offset
-                            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
-                            # Update register if variable is in a register
-                            if name in self.variable_registers:
-                                reg = self.variable_registers[name]
-                                if self.use_32bit:
-                                    reg_32 = reg.replace('R', 'E') if reg.startswith('R') else reg
-                                    self.output.append(f"    MOV {reg_32}, EAX  ; Update {name} in register {reg}")
-                                else:
-                                    if reg.startswith('R'):
-                                        if reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
-                                            reg_32 = reg + 'D'
-                                        else:
-                                            reg_32 = reg.replace('R', 'E')
-                                        self.output.append(f"    MOV {reg_32}, EAX  ; Update {name} in register {reg} (32-bit)")
-                                    else:
-                                        self.output.append(f"    MOV {reg}, EAX  ; Update {name} in register {reg}")
+                        # Store back to local/parameter through normal lvalue store path.
+                        self._generate_local_var_store(name)
                 self.output.append(f"    POP {self.reg_rax}  ; Return original value")
         elif op.op == '++':
             # Pre-increment: ++var
@@ -2576,11 +2637,7 @@ class CodeGenerator:
                     else:
                         self._generate_local_var_load(name)
                         self.output.append(f"    INC {self.reg_rax}")
-                        # Store to local - use RBP-based addressing
-                        if name in self.current_function_stack:
-                            slot_index, offset = self.current_function_stack[name]
-                            stack_offset = (slot_index + 1) * 8 + offset
-                            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
+                        self._generate_local_var_store(name)
         elif op.op == '--':
             # Pre-decrement: --var
             if isinstance(op.expr, c_ast.ID):
@@ -2599,14 +2656,14 @@ class CodeGenerator:
                     else:
                         self._generate_local_var_load(name)
                         self.output.append(f"    DEC {self.reg_rax}")
-                        # Store to local - use RBP-based addressing
-                        if name in self.current_function_stack:
-                            slot_index, offset = self.current_function_stack[name]
-                            stack_offset = (slot_index + 1) * 8 + offset
-                            self.output.append(f"    MOV DWORD [{self.reg_rbp} - {stack_offset}], EAX  ; Store {name}")
+                        self._generate_local_var_store(name)
     
-    def _generate_array_ref(self, arr_ref):
-        """Generate code for array indexing: arr[index] using efficient LEA addressing."""
+    def _generate_array_ref(self, arr_ref, load_value=True):
+        """Generate code for array indexing: arr[index] using efficient LEA addressing.
+
+        When load_value is False, leaves element address in RAX/EAX.
+        """
+        load_elem_size = 4
         # Generate index first (we'll need it)
         self._generate_expression(arr_ref.subscript)
         # Save index to a register (prefer RCX for index)
@@ -2623,11 +2680,23 @@ class CodeGenerator:
             # Parameter (pointer): base is in argument register - use it, not GLOBAL_
             if name in self.function_parameters:
                 param_reg = self.function_parameters[name]
+                elem_size = getattr(self, 'function_parameter_elem_size', {}).get(name, 4)
+                load_elem_size = elem_size
                 self.output.append(f"    MOV {self.reg_rax}, {param_reg}  ; Base from parameter {name}")
-                if self.use_32bit:
-                    self.output.append(f"    LEA EAX, [EAX + ECX*4]  ; Base + index*4")
+                if elem_size in [1, 2, 4, 8]:
+                    if self.use_32bit:
+                        self.output.append(f"    LEA EAX, [EAX + ECX*{elem_size}]  ; Base + index*{elem_size}")
+                    else:
+                        self.output.append(f"    LEA RAX, [RAX + RCX*{elem_size}]  ; Base + index*{elem_size}")
                 else:
-                    self.output.append(f"    LEA RAX, [RAX + RCX*4]  ; Base + index*4")
+                    if self.use_32bit:
+                        self.output.append("    MOV EAX, ECX  ; index")
+                        self.output.append(f"    IMUL EAX, {elem_size}  ; index * elem_size")
+                        self.output.append(f"    ADD EAX, {param_reg}  ; base + offset")
+                    else:
+                        self.output.append("    MOV RAX, RCX  ; index")
+                        self.output.append(f"    IMUL RAX, {elem_size}  ; index * elem_size")
+                        self.output.append(f"    ADD RAX, {param_reg}  ; base + offset")
             else:
                 # Check if it's a global variable
                 globals = [g.name for g in getattr(self, '_current_parser', None).get_global_variables() if g.name] if hasattr(self, '_current_parser') else []
@@ -2646,6 +2715,7 @@ class CodeGenerator:
                         slot_index, offset = self.current_function_stack[name]
                         stack_offset = (slot_index + 1) * 8 + offset
                         elem_size = getattr(self, 'local_array_element_size', {}).get(name, 4)
+                        load_elem_size = elem_size
                         if self.use_32bit:
                             if elem_size == 1:
                                 self.output.append(f"    LEA EAX, [{self.reg_rbp} - {stack_offset} + ECX*1]  ; Base + index*1")
@@ -2693,11 +2763,26 @@ class CodeGenerator:
             else:
                 self.output.append(f"    LEA RAX, [RAX + RCX*4]  ; Base + index*4")
         
-        # Load value from memory
-        if self.use_32bit:
-            self.output.append(f"    MOV EAX, DWORD [EAX]  ; Load array element")
-        else:
-            self.output.append(f"    MOV EAX, DWORD [RAX]  ; Load array element (32-bit)")
+        if load_value:
+            # Load value from memory
+            if self.use_32bit:
+                if load_elem_size == 1:
+                    self.output.append("    MOVZX EAX, BYTE [EAX]  ; Load array element (8-bit)")
+                elif load_elem_size == 2:
+                    self.output.append("    MOVZX EAX, WORD [EAX]  ; Load array element (16-bit)")
+                elif load_elem_size == 8:
+                    self.output.append("    MOV EAX, DWORD [EAX]  ; Load array element (truncated 32-bit)")
+                else:
+                    self.output.append("    MOV EAX, DWORD [EAX]  ; Load array element")
+            else:
+                if load_elem_size == 1:
+                    self.output.append("    MOVZX EAX, BYTE [RAX]  ; Load array element (8-bit)")
+                elif load_elem_size == 2:
+                    self.output.append("    MOVZX EAX, WORD [RAX]  ; Load array element (16-bit)")
+                elif load_elem_size == 8:
+                    self.output.append("    MOV RAX, QWORD [RAX]  ; Load array element (64-bit)")
+                else:
+                    self.output.append("    MOV EAX, DWORD [RAX]  ; Load array element (32-bit)")
     
     def _compute_nested_struct_offset(self, struct_ref):
         """Compute cumulative offset for nested struct access like container.outer.inner.callback.
@@ -2880,6 +2965,9 @@ class CodeGenerator:
                         slot_index, offset = self.current_function_stack[name]
                         stack_offset = (slot_index + 1) * 8 + offset  # Match _generate_local_var_load
                         self.output.append(f"    LEA RAX, [{self.reg_rbp} - {stack_offset}]  ; Base address of local struct {name}")
+            elif isinstance(struct_ref.name, c_ast.ArrayRef):
+                # For struct arrays, use element address as base (do not load element value).
+                self._generate_array_ref(struct_ref.name, load_value=False)
             else:
                 self._generate_expression(struct_ref.name)
         elif struct_type == '->':
@@ -3004,6 +3092,9 @@ class CodeGenerator:
                         # Handle nested struct references
                         if isinstance(assign.lvalue.name, c_ast.StructRef):
                             self._generate_struct_ref(assign.lvalue.name)
+                        elif isinstance(assign.lvalue.name, c_ast.ArrayRef):
+                            # For struct arrays, use element address as assignment base.
+                            self._generate_array_ref(assign.lvalue.name, load_value=False)
                         else:
                             self._generate_expression(assign.lvalue.name)
                 elif struct_type == '->':
@@ -3050,16 +3141,26 @@ class CodeGenerator:
             elif base_op == '*':
                 self.output.append(f"    IMUL {self.reg_rax}, {pop_reg}")
             elif base_op == '/':
+                preserve_param_rdx = (not self.use_32bit and hasattr(self, 'function_parameters') and any(reg == self.reg_rdx for reg in self.function_parameters.values()))
+                if preserve_param_rdx:
+                    self.output.append(f"    PUSH {self.reg_rdx}  ; Preserve parameter register {self.reg_rdx} across division")
                 self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save divisor")
                 self.output.append(f"    MOV {self.reg_rax}, {pop_reg}  ; Dividend")
                 self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}")
                 self.output.append(f"    DIV {self.reg_rcx}")
+                if preserve_param_rdx:
+                    self.output.append(f"    POP {self.reg_rdx}  ; Restore preserved parameter register")
             elif base_op == '%':
+                preserve_param_rdx = (not self.use_32bit and hasattr(self, 'function_parameters') and any(reg == self.reg_rdx for reg in self.function_parameters.values()))
+                if preserve_param_rdx:
+                    self.output.append(f"    PUSH {self.reg_rdx}  ; Preserve parameter register {self.reg_rdx} across modulo")
                 self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save divisor")
                 self.output.append(f"    MOV {self.reg_rax}, {pop_reg}  ; Dividend")
                 self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}")
                 self.output.append(f"    DIV {self.reg_rcx}")
                 self.output.append(f"    MOV {self.reg_rax}, {self.reg_rdx}  ; Remainder")
+                if preserve_param_rdx:
+                    self.output.append(f"    POP {self.reg_rdx}  ; Restore preserved parameter register")
             elif base_op == '<<':
                 self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Shift amount")
                 self.output.append(f"    MOV {self.reg_rax}, {pop_reg}  ; Value to shift")
@@ -3836,5 +3937,12 @@ class CodeGenerator:
                 self.variable_registers[name] = allocated_reg
             else:
                 # Initialize on stack
-                self.output.append(f"    XOR {self.reg_rax}, {self.reg_rax}  ; Initialize {name} to 0")
-                self._generate_local_var_store(name)
+                stack_offset = (slot_index + 1) * 8
+                if var_size > 8:
+                    # Zero full aggregate storage (arrays/structs), not just first word.
+                    self.output.append(f"    ; Zero-initialize aggregate {name} ({var_size} bytes)")
+                    for chunk in range(0, var_size, 8):
+                        self.output.append(f"    MOV QWORD [{self.reg_rbp} - {stack_offset - chunk}], 0")
+                else:
+                    self.output.append(f"    XOR {self.reg_rax}, {self.reg_rax}  ; Initialize {name} to 0")
+                    self._generate_local_var_store(name)

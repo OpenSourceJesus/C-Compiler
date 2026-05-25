@@ -1,5 +1,14 @@
 /* Test file for nested structs and complex function pointer calls */
 
+#ifdef GCC
+#include <stdio.h>
+#define print printf
+#else
+void print(char *fmt, char *msg) {
+	/* Empty body - compiler will generate syscall code */
+}
+#endif
+
 struct Inner {
     int x;
     int y;
@@ -105,15 +114,23 @@ int main(void) {
     volatile int iterations = 1000000;  /* 1 million iterations */
     
     /* Loop to test actual execution time, not just startup */
-    for (int i = 0; i < iterations; i++) {
+    for (int i = 0; i < iterations; i ++) {
         test_func1(1);
+        print("Reached test_func2 call\n");
         test_func2();
+        print("Reached test_func3 call\n");
         test_func3();
+        print("Reached test_func4 call\n");
         test_func4();
+        print("Reached test_func5 call\n");
         test_func5();
+        print("Reached test_func6 call\n");
         test_func6();
+        print("Reached test_func7 call\n");
         test_func7();
+        print("Reached iteration end\n");
     }
     
+    print("Reached end\n");
     return 0;
 }
