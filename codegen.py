@@ -546,6 +546,22 @@ class CodeGenerator:
                     "type": None,
                     "aggregate": False,
                 }
+        # Linux x86_64 glibc fallback for forward-declared struct stat.
+        if struct_name == "stat":
+            stat_fields = {
+                "st_size": (48, 8),
+                "st_atime": (72, 8),
+                "st_mtime": (88, 8),
+                "st_ctime": (104, 8),
+            }
+            if member_name in stat_fields:
+                off, sz = stat_fields[member_name]
+                return {
+                    "offset": off,
+                    "size": sz,
+                    "type": None,
+                    "aggregate": False,
+                }
         return None
 
     def _extract_struct_name_from_type(self, type_node):
@@ -1719,7 +1735,23 @@ class CodeGenerator:
                 if self.use_32bit:
                     self.output.append(f"    MOV {self.reg_rax}, DWORD [{self.reg_rbp} - {spill_offset}]  ; Load spilled parameter {var_name}")
                 else:
-                    self.output.append(f"    MOV {self.reg_rax}, QWORD [{self.reg_rbp} - {spill_offset}]  ; Load spilled parameter {var_name}")
+                    var_size = self._get_var_storage_size(var_name)
+                    var_type = self.current_var_types.get(var_name)
+                    is_unsigned = self._is_unsigned_integer_type(var_type)
+                    if var_size == 1:
+                        if is_unsigned:
+                            self.output.append(f"    MOVZX EAX, BYTE [{self.reg_rbp} - {spill_offset}]  ; Load spilled parameter {var_name} (u8)")
+                        else:
+                            self.output.append(f"    MOVSX EAX, BYTE [{self.reg_rbp} - {spill_offset}]  ; Load spilled parameter {var_name} (s8)")
+                    elif var_size == 2:
+                        if is_unsigned:
+                            self.output.append(f"    MOVZX EAX, WORD [{self.reg_rbp} - {spill_offset}]  ; Load spilled parameter {var_name} (u16)")
+                        else:
+                            self.output.append(f"    MOVSX EAX, WORD [{self.reg_rbp} - {spill_offset}]  ; Load spilled parameter {var_name} (s16)")
+                    elif var_size >= 8:
+                        self.output.append(f"    MOV {self.reg_rax}, QWORD [{self.reg_rbp} - {spill_offset}]  ; Load spilled parameter {var_name} (64-bit)")
+                    else:
+                        self.output.append(f"    MOV EAX, DWORD [{self.reg_rbp} - {spill_offset}]  ; Load spilled parameter {var_name} (32-bit)")
                 return
             # Check if it's a function parameter
             if var_name in self.function_parameters:
@@ -1746,10 +1778,18 @@ class CodeGenerator:
             self.output.append(f"    MOV {self.reg_rax}, [{self.reg_rbp} - {stack_offset}]  ; Load {var_name}")
         else:
             var_size = self._get_var_storage_size(var_name)
+            var_type = self.current_var_types.get(var_name)
+            is_unsigned = self._is_unsigned_integer_type(var_type)
             if var_size == 1:
-                self.output.append(f"    MOVZX EAX, BYTE [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (8-bit)")
+                if is_unsigned:
+                    self.output.append(f"    MOVZX EAX, BYTE [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (u8)")
+                else:
+                    self.output.append(f"    MOVSX EAX, BYTE [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (s8)")
             elif var_size == 2:
-                self.output.append(f"    MOVZX EAX, WORD [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (16-bit)")
+                if is_unsigned:
+                    self.output.append(f"    MOVZX EAX, WORD [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (u16)")
+                else:
+                    self.output.append(f"    MOVSX EAX, WORD [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (s16)")
             elif var_size >= 8:
                 self.output.append(f"    MOV RAX, QWORD [{self.reg_rbp} - {stack_offset}]  ; Load {var_name} (64-bit)")
             else:
@@ -1791,7 +1831,15 @@ class CodeGenerator:
                 if self.use_32bit:
                     self.output.append(f"    MOV DWORD [{self.reg_rbp} - {spill_offset}], {self.reg_rax}  ; Store to spilled parameter {var_name}")
                 else:
-                    self.output.append(f"    MOV QWORD [{self.reg_rbp} - {spill_offset}], {self.reg_rax}  ; Store to spilled parameter {var_name}")
+                    var_size = self._get_var_storage_size(var_name)
+                    if var_size == 1:
+                        self.output.append(f"    MOV BYTE [{self.reg_rbp} - {spill_offset}], AL  ; Store spilled parameter {var_name} (8-bit)")
+                    elif var_size == 2:
+                        self.output.append(f"    MOV WORD [{self.reg_rbp} - {spill_offset}], AX  ; Store spilled parameter {var_name} (16-bit)")
+                    elif var_size >= 8:
+                        self.output.append(f"    MOV QWORD [{self.reg_rbp} - {spill_offset}], RAX  ; Store spilled parameter {var_name} (64-bit)")
+                    else:
+                        self.output.append(f"    MOV DWORD [{self.reg_rbp} - {spill_offset}], EAX  ; Store spilled parameter {var_name} (32-bit)")
                 return
             param_reg = self.function_parameters[var_name]
             if self.use_32bit:
@@ -3009,6 +3057,22 @@ class CodeGenerator:
             # Most integer/pointer casts in this backend are representational and
             # can be handled by downstream MOV width at use sites.
             self._generate_expression(expr.expr)
+            # Targeted narrowing fix: enforce explicit 16-bit unsigned casts used
+            # by miniz's match-distance math (e.g. (mz_uint16)(a - b)).
+            try:
+                target = self._resolve_typedefs(getattr(expr, "to_type", None))
+                t = target
+                if isinstance(t, c_ast.Typename):
+                    t = getattr(t, "type", t)
+                if isinstance(t, c_ast.TypeDecl):
+                    ident = getattr(t, "type", None)
+                    if isinstance(ident, c_ast.IdentifierType):
+                        names = [str(n).lower() for n in (ident.names or [])]
+                        joined = " ".join(names)
+                        if ("uint16_t" in joined) or ("mz_uint16" in joined) or ("unsigned short" in joined):
+                            self.output.append("    AND EAX, 65535  ; Cast to 16-bit unsigned")
+            except Exception:
+                pass
         elif isinstance(expr, c_ast.ExprList):
             # Comma operator: evaluate all expressions left-to-right, result is last.
             exprs = getattr(expr, 'exprs', None) or []
@@ -3220,14 +3284,19 @@ class CodeGenerator:
             self.output.append(f"    IMUL {self.reg_rax}, {left_temp}")
         elif op.op == '/':
             # Division: left / RAX (operands need swapping)
-            # DIV divides RDX:RAX by operand, result in RAX, remainder in RDX
+            # DIV/IDIV divides RDX:RAX by operand, result in RAX, remainder in RDX
             preserve_param_rdx = (not self.use_32bit and hasattr(self, 'function_parameters') and any(reg == self.reg_rdx for reg in self.function_parameters.values()))
+            use_unsigned_div = self._expr_is_unsigned(op.left) or self._expr_is_unsigned(op.right)
             if preserve_param_rdx:
                 self.output.append(f"    PUSH {self.reg_rdx}  ; Preserve parameter register {self.reg_rdx} across division")
             self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Save divisor")
             self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Dividend to RAX")
-            self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear RDX for unsigned division")
-            self.output.append(f"    DIV {self.reg_rcx}  ; RAX = RAX / RCX")
+            if use_unsigned_div:
+                self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear RDX for unsigned division")
+                self.output.append(f"    DIV {self.reg_rcx}  ; RAX = RAX / RCX (unsigned)")
+            else:
+                self.output.append("    CQO  ; Sign-extend RAX into RDX:RAX for signed division")
+                self.output.append(f"    IDIV {self.reg_rcx}  ; RAX = RAX / RCX (signed)")
             if preserve_param_rdx:
                 self.output.append(f"    POP {self.reg_rdx}  ; Restore preserved parameter register")
         elif op.op == '==':
@@ -3293,14 +3362,19 @@ class CodeGenerator:
         elif op.op == '%':
             # Modulo: left % right
             preserve_param_rdx = (not self.use_32bit and hasattr(self, 'function_parameters') and any(reg == self.reg_rdx for reg in self.function_parameters.values()))
+            use_unsigned_mod = self._expr_is_unsigned(op.left) or self._expr_is_unsigned(op.right)
             if preserve_param_rdx:
                 self.output.append(f"    PUSH {self.reg_rdx}  ; Preserve parameter register {self.reg_rdx} across modulo")
             self.output.append(f"    ; Modulo operation: {left_temp} % {self.reg_rax}")
             self.output.append(f"    PUSH {self.reg_rax}  ; Save right operand (divisor)")
             self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Move left operand (dividend) to {self.reg_rax}")
             self.output.append(f"    POP {left_temp}  ; Get divisor")
-            self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear {self.reg_rdx} for division")
-            self.output.append(f"    DIV {left_temp}  ; {self.reg_rax} = dividend / divisor, {self.reg_rdx} = remainder")
+            if use_unsigned_mod:
+                self.output.append(f"    XOR {self.reg_rdx}, {self.reg_rdx}  ; Clear {self.reg_rdx} for unsigned division")
+                self.output.append(f"    DIV {left_temp}  ; {self.reg_rax} = dividend / divisor, {self.reg_rdx} = remainder")
+            else:
+                self.output.append("    CQO  ; Sign-extend RAX into RDX:RAX for signed division")
+                self.output.append(f"    IDIV {left_temp}  ; {self.reg_rax} = dividend / divisor, {self.reg_rdx} = remainder")
             self.output.append(f"    MOV {self.reg_rax}, {self.reg_rdx}  ; Remainder is the modulo result")
             if preserve_param_rdx:
                 self.output.append(f"    POP {self.reg_rdx}  ; Restore preserved parameter register")
@@ -3341,7 +3415,10 @@ class CodeGenerator:
             self.output.append(f"    ; Right shift: {left_temp} >> {self.reg_rax}")
             self.output.append(f"    MOV {self.reg_rcx}, {self.reg_rax}  ; Shift amount in {self.reg_rcx}")
             self.output.append(f"    MOV {self.reg_rax}, {left_temp}  ; Value to shift")
-            self.output.append(f"    SHR {self.reg_rax}, CL  ; Right shift by CL (low 8 bits of {self.reg_rcx})")
+            if self._expr_is_unsigned(op.left):
+                self.output.append(f"    SHR {self.reg_rax}, CL  ; Logical right shift by CL")
+            else:
+                self.output.append(f"    SAR {self.reg_rax}, CL  ; Arithmetic right shift by CL")
         elif op.op == '&':
             self.output.append(f"    ; Bitwise AND: {left_temp} & {self.reg_rax}")
             self.output.append(f"    AND {self.reg_rax}, {left_temp}")
@@ -3351,6 +3428,18 @@ class CodeGenerator:
         elif op.op == '^':
             self.output.append(f"    ; Bitwise XOR: {left_temp} ^ {self.reg_rax}")
             self.output.append(f"    XOR {self.reg_rax}, {left_temp}")
+
+        # C integer arithmetic on <=32-bit scalar types wraps at 32 bits.
+        # Our backend frequently computes in 64-bit regs; truncate here for
+        # arithmetic/bitwise/shift ops whose result type is 32-bit-or-smaller.
+        if (not self.use_32bit) and op.op in ['+', '-', '*', '/', '%', '<<', '>>', '&', '|', '^']:
+            result_t = self._resolve_typedefs(self._infer_expr_type(op))
+            if isinstance(result_t, c_ast.TypeDecl):
+                result_t = result_t.type
+            if result_t is not None and not isinstance(result_t, (c_ast.PtrDecl, c_ast.ArrayDecl, c_ast.Struct, c_ast.Union)):
+                result_size, _ = self._get_type_size_align_resolved(result_t, self.struct_sizes)
+                if 0 < result_size <= 4:
+                    self.output.append("    MOV EAX, EAX  ; Truncate result to 32-bit semantics")
         
         # Restore binary-op temp if it was saved (variable was in that register)
         if hasattr(self, '_binary_op_temp_saved') and self._binary_op_temp_saved:
@@ -3449,7 +3538,16 @@ class CodeGenerator:
         elif op.op == '~':
             # Bitwise NOT: ~expr
             self.output.append("    ; Bitwise NOT: ~expr")
-            self.output.append(f"    NOT {self.reg_rax}")
+            not_size = 4
+            expr_t = self._resolve_typedefs(self._infer_expr_type(op.expr))
+            if expr_t is not None:
+                sz, _ = self._get_type_size_align_resolved(expr_t, self.struct_sizes)
+                if sz in (1, 2, 4, 8):
+                    not_size = sz
+            if self.use_32bit or not_size <= 4:
+                self.output.append("    NOT EAX")
+            else:
+                self.output.append(f"    NOT {self.reg_rax}")
         elif op.op == 'p++':
             # Post-increment: var++
             if isinstance(op.expr, c_ast.ID):
@@ -5097,29 +5195,57 @@ class CodeGenerator:
                 should_be_in_register = True
         
         if decl.init:
-            self._generate_expression(decl.init)
-            if should_be_in_register:
-                # Variable should be in a register - move RAX to allocated register
-                if allocated_reg != self.reg_rax:
-                    if self.use_32bit:
-                        reg_32 = allocated_reg.replace('R', 'E') if allocated_reg.startswith('R') else allocated_reg
-                        self.output.append(f"    MOV {reg_32}, {self.reg_rax}  ; Initialize {name} in register {allocated_reg}")
+            if is_array and isinstance(decl.init, c_ast.InitList):
+                # Handle local array initializers (e.g. static const lookup tables in miniz).
+                # Keep behavior simple/correct by materializing each initializer element.
+                stack_offset = self._local_stack_offset(slot_index, 0)
+                for chunk in range(0, var_size, 8):
+                    self.output.append(f"    MOV QWORD [{self.reg_rbp} - {stack_offset - chunk}], 0")
+
+                init_exprs = []
+                for expr in (decl.init.exprs or []):
+                    if isinstance(expr, c_ast.InitList):
+                        init_exprs.extend(expr.exprs or [])
                     else:
-                        # In 64-bit mode, use 32-bit moves for integers
-                        if allocated_reg.startswith('R'):
-                            # R8-R15 use R8D-R15D, not E8-E15
-                            if allocated_reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
-                                reg_32 = allocated_reg + 'D'
-                            else:
-                                reg_32 = allocated_reg.replace('R', 'E')
-                            self.output.append(f"    MOV {reg_32}, EAX  ; Initialize {name} in register {allocated_reg} (32-bit)")
-                        else:
-                            self.output.append(f"    MOV {allocated_reg}, {self.reg_rax}  ; Initialize {name} in register {allocated_reg}")
-                # Track that this variable is in a register
-                self.variable_registers[name] = allocated_reg
+                        init_exprs.append(expr)
+
+                max_elems = var_size // max(elem_size, 1)
+                for idx, expr in enumerate(init_exprs[:max_elems]):
+                    self._generate_expression(expr)
+                    disp = idx * elem_size
+                    if disp:
+                        self.output.append(
+                            f"    LEA {self.reg_binary_op_temp}, [{self.reg_rbp} - {stack_offset} + {disp}]  ; {name}[{idx}] address"
+                        )
+                    else:
+                        self.output.append(
+                            f"    LEA {self.reg_binary_op_temp}, [{self.reg_rbp} - {stack_offset}]  ; {name}[0] address"
+                        )
+                    self._emit_store_to_address(self.reg_binary_op_temp, elem_size if elem_size in (1, 2, 4, 8) else 4)
             else:
-                # Store value using stack addressing
-                self._generate_local_var_store(name)
+                self._generate_expression(decl.init)
+                if should_be_in_register:
+                    # Variable should be in a register - move RAX to allocated register
+                    if allocated_reg != self.reg_rax:
+                        if self.use_32bit:
+                            reg_32 = allocated_reg.replace('R', 'E') if allocated_reg.startswith('R') else allocated_reg
+                            self.output.append(f"    MOV {reg_32}, {self.reg_rax}  ; Initialize {name} in register {allocated_reg}")
+                        else:
+                            # In 64-bit mode, use 32-bit moves for integers
+                            if allocated_reg.startswith('R'):
+                                # R8-R15 use R8D-R15D, not E8-E15
+                                if allocated_reg in ['R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']:
+                                    reg_32 = allocated_reg + 'D'
+                                else:
+                                    reg_32 = allocated_reg.replace('R', 'E')
+                                self.output.append(f"    MOV {reg_32}, EAX  ; Initialize {name} in register {allocated_reg} (32-bit)")
+                            else:
+                                self.output.append(f"    MOV {allocated_reg}, {self.reg_rax}  ; Initialize {name} in register {allocated_reg}")
+                    # Track that this variable is in a register
+                    self.variable_registers[name] = allocated_reg
+                else:
+                    # Store value using stack addressing
+                    self._generate_local_var_store(name)
         else:
             # Initialize to 0
             if should_be_in_register:
