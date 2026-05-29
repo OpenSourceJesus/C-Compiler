@@ -315,7 +315,7 @@ def find_linker_scripts(directory):
     
     return linker_scripts
 
-def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O0', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=None):
+def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O0', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=None, debug_symbols=False):
     """Compile a single file or folder and run benchmarks.
     
     Args:
@@ -445,6 +445,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     try:
         # Build GCC command with all C files and assembly files
         gcc_cmd = ['gcc', opt_level, '-DGCC']
+        if debug_symbols:
+            gcc_cmd.append('-g')
         if use_32bit:
             gcc_cmd.append('-m32')
         # Use -nostdlib if custom startup is detected to avoid _start conflict
@@ -566,6 +568,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             try:
                 # Build GCC command again with -m32 flag
                 gcc_cmd = ['gcc', opt_level, '-DGCC', '-m32']
+                if debug_symbols:
+                    gcc_cmd.append('-g')
                 # Use -nostdlib if custom startup is detected to avoid _start conflict
                 if has_custom_startup:
                     gcc_cmd.append('-nostdlib')
@@ -691,7 +695,10 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     custom_obj_file = custom_output_dir / f'{custom_output_name}.o'
     
-    assembler_cmd = [assembler, '-f', format_type, str(asm_file), '-o', str(custom_obj_file)]
+    assembler_cmd = [assembler, '-f', format_type]
+    if debug_symbols:
+        assembler_cmd.append('-g')
+    assembler_cmd.extend([str(asm_file), '-o', str(custom_obj_file)])
     
     try:
         result = subprocess.run(
@@ -726,7 +733,13 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             if obj_file.exists():
                 obj_file.unlink()
             # Recursively retry with 32-bit mode
-            return compile_and_benchmark(test_path, output_base_name, exclude_patterns, True, opt_level, iterations)
+            return compile_and_benchmark(
+                test_path, output_base_name, exclude_patterns, True, opt_level, iterations,
+                enable_metamorphic_return_sites=enable_metamorphic_return_sites,
+                enable_indexed_function_calls=enable_indexed_function_calls,
+                include_paths=include_paths,
+                debug_symbols=debug_symbols,
+            )
         
         print("Error: Assembly failed")
         if e.stderr:
@@ -751,6 +764,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 # Use the same 32-bit mode that was determined during GCC compilation
                 # Don't define GCC for custom compiler - it needs FUNC_ prefixes
                 gcc_asm_cmd = ['gcc', '-c', asm_file, '-o', str(asm_obj)]
+                if debug_symbols:
+                    gcc_asm_cmd.insert(1, '-g')
                 if use_32bit:
                     gcc_asm_cmd.insert(1, '-m32')
                 result = subprocess.run(
@@ -769,6 +784,8 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     # Build linker command with all object files
     link_cmd = ['ld', str(obj_file)] + asm_obj_files + ['-o', str(custom_output)]
+    if debug_symbols:
+        link_cmd.insert(1, '-g')
     
     # Add 32-bit emulation if needed
     if use_32bit:
@@ -809,7 +826,13 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             if obj_file.exists():
                 obj_file.unlink()
             # Recursively retry with 32-bit mode
-            return compile_and_benchmark(test_path, output_base_name, exclude_patterns, True, opt_level, iterations)
+            return compile_and_benchmark(
+                test_path, output_base_name, exclude_patterns, True, opt_level, iterations,
+                enable_metamorphic_return_sites=enable_metamorphic_return_sites,
+                enable_indexed_function_calls=enable_indexed_function_calls,
+                include_paths=include_paths,
+                debug_symbols=debug_symbols,
+            )
         
         # Check for undefined symbol errors that might indicate we need to retry
         error_text = e.stderr if e.stderr else ""
@@ -887,7 +910,13 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                         if path.exists():
                             path.unlink()
                 # Recursively retry with the correct bitness
-                return compile_and_benchmark(test_path, output_base_name, exclude_patterns, expected_32bit, opt_level, iterations, enable_metamorphic_return_sites, include_paths)
+                return compile_and_benchmark(
+                    test_path, output_base_name, exclude_patterns, expected_32bit, opt_level, iterations,
+                    enable_metamorphic_return_sites=enable_metamorphic_return_sites,
+                    enable_indexed_function_calls=enable_indexed_function_calls,
+                    include_paths=include_paths,
+                    debug_symbols=debug_symbols,
+                )
     except (subprocess.CalledProcessError, FileNotFoundError):
         # If 'file' command is not available, skip the check
         pass
@@ -980,6 +1009,7 @@ def main():
     # Parse command-line arguments
     exclude_patterns = []
     use_32bit = False
+    debug_symbols = False
     opt_level = '-O0'  # Default optimization level
     iterations = DEFAULT_ITERATIONS
     include_paths = []
@@ -992,7 +1022,7 @@ def main():
             test_path = default_test
             output_base = "benchmark"
         else:
-            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N] [--include-path DIR | --include-paths LIST] [-I DIR]...")
+            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [-g] [--opt-level LEVEL] [--runs N] [--include-path DIR | --include-paths LIST] [-I DIR]...")
             print()
             print("Examples:")
             print("  benchmark.py test.c")
@@ -1032,6 +1062,9 @@ def main():
                 i += 2
             elif args[i] == '--32bit':
                 use_32bit = True
+                i += 1
+            elif args[i] == '-g':
+                debug_symbols = True
                 i += 1
             elif args[i] == '--opt-level' and i + 1 < len(args):
                 opt_level_arg = args[i + 1]
@@ -1083,7 +1116,7 @@ def main():
         
         if test_path is None:
             print("Error: No test path specified")
-            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [--opt-level LEVEL] [--runs N] [--include-path DIR | --include-paths LIST] [-I DIR]...")
+            print("Usage: benchmark.py <path_to_file_or_folder> [output_base_name] [--exclude PATTERN] [--32bit] [-g] [--opt-level LEVEL] [--runs N] [--include-path DIR | --include-paths LIST] [-I DIR]...")
             sys.exit(1)
     
     # Print configuration info (but keep it minimal)
@@ -1091,6 +1124,8 @@ def main():
         print(f"Excluding files matching: {', '.join(exclude_patterns)}")
     if use_32bit:
         print("Compilation mode: 32-bit")
+    if debug_symbols:
+        print("Debug symbols: enabled (-g)")
     if include_paths:
         print(f"Include paths: {', '.join(include_paths)}")
     print()
@@ -1099,7 +1134,7 @@ def main():
     print("=" * 70)
     print("Running benchmark WITH metamorphic return sites")
     print("=" * 70)
-    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths)
+    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols)
     
     if not result_with or not isinstance(result_with, dict) or not result_with.get('success', False):
         print("Error: Benchmark with metamorphic return sites failed")
@@ -1109,7 +1144,7 @@ def main():
     print("=" * 70)
     print("Running benchmark WITHOUT metamorphic return sites")
     print("=" * 70)
-    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False, enable_indexed_function_calls=True, include_paths=include_paths)
+    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols)
     
     if not result_without or not isinstance(result_without, dict) or not result_without.get('success', False):
         print("Error: Benchmark without metamorphic return sites failed")
@@ -1164,7 +1199,7 @@ def main():
     print("=" * 70)
     print("Running benchmark WITH indexed function calls")
     print("=" * 70)
-    result_indexed = compile_and_benchmark(test_path, output_base + "_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths)
+    result_indexed = compile_and_benchmark(test_path, output_base + "_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols)
     
     if not result_indexed or not isinstance(result_indexed, dict) or not result_indexed.get('success', False):
         print("Error: Benchmark with indexed function calls failed")
@@ -1173,7 +1208,7 @@ def main():
         print("=" * 70)
         print("Running benchmark WITHOUT indexed function calls")
         print("=" * 70)
-        result_no_indexed = compile_and_benchmark(test_path, output_base + "_no_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=False, include_paths=include_paths)
+        result_no_indexed = compile_and_benchmark(test_path, output_base + "_no_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=False, include_paths=include_paths, debug_symbols=debug_symbols)
         
         if not result_no_indexed or not isinstance(result_no_indexed, dict) or not result_no_indexed.get('success', False):
             print("Error: Benchmark without indexed function calls failed")
