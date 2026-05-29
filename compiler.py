@@ -162,7 +162,7 @@ def find_linker_script(input_path):
 	return None
 
 
-def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_script=None, use_32bit=False, build_shared=False):
+def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_script=None, use_32bit=False, build_shared=False, debug_symbols=False):
 	"""Assemble and link the generated assembly file.
 	
 	Args:
@@ -172,6 +172,7 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 		linker_script: Path to linker script
 		use_32bit: If True, use 32-bit mode (elf32, -m elf_i386)
 		build_shared: If True, link as a shared library (.so)
+		debug_symbols: If True, pass -g to the assembler (DWARF) and linker (GCC-compatible)
 	"""
 	# Find assembler
 	assembler_info = find_assembler(use_32bit)
@@ -195,8 +196,12 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 		print(f"Assembling {asm_file}...", file=sys.stderr)
 	
 	try:
+		asm_cmd = [assembler, '-f', format_type]
+		if debug_symbols:
+			asm_cmd.append('-g')
+		asm_cmd.extend([asm_file, '-o', obj_file])
 		result = subprocess.run(
-			[assembler, '-f', format_type, asm_file, '-o', obj_file],
+			asm_cmd,
 			check=True,
 			capture_output=True,
 			text=True
@@ -219,6 +224,8 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 		# segmentation faults when running normal Linux executables. Use -N only when
 		# a linker script is provided (bare-metal / custom layout).
 		link_cmd = ['ld', obj_file, '-o', output_executable]
+		if debug_symbols:
+			link_cmd.insert(1, '-g')
 		
 		if build_shared:
 			link_cmd.insert(1, '-shared')
@@ -400,6 +407,8 @@ def main():
 	parser.add_argument('--no-indexed-function-calls', dest='enable_indexed_function_calls', action='store_false', help='Disable indexed function calls; use normal CALL for all functions')
 	parser.add_argument('-I', action='append', dest='include_paths', default=[], metavar='DIR',
 	                    help='Add directory to include search path (can be specified multiple times)')
+	parser.add_argument('-g', dest='debug_symbols', action='store_true',
+	                    help='Generate debug symbols when assembling and linking')
 	
 	args = parser.parse_args(argv)
 	args.build_shared = build_shared
@@ -590,7 +599,10 @@ def main():
 			if linker_script and args.verbose:
 				print(f"Found linker script: {linker_script}", file=sys.stderr)
 			
-			success = assemble_and_link(output_file, executable_name, args.verbose, linker_script, args.use_32bit, args.build_shared)
+			success = assemble_and_link(
+				output_file, executable_name, args.verbose, linker_script,
+				args.use_32bit, args.build_shared, args.debug_symbols,
+			)
 			if not success:
 				sys.exit(1)
 			
