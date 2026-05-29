@@ -13,6 +13,7 @@ from codegen import CodeGenerator
 from asm_parser import parse_asm_files, find_asm_files
 from symbol_collector import collect_symbols
 from register_allocator import analyze_all_functions_for_registers
+from debug_gdb import parse_debug_metadata_from_asm, run_gdb
 
 
 GCC_IGNORED_FLAGS = frozenset({
@@ -409,6 +410,8 @@ def main():
 	                    help='Add directory to include search path (can be specified multiple times)')
 	parser.add_argument('-g', dest='debug_symbols', action='store_true',
 	                    help='Generate debug symbols when assembling and linking')
+	parser.add_argument('-d', dest='debug_gdb', action='store_true', default=False,
+	                    help='Run under gdb; honor // REG=value and // MEMDUMP debug comments')
 	
 	args = parser.parse_args(argv)
 	args.build_shared = build_shared
@@ -432,6 +435,7 @@ def main():
 		# Single file mode
 		c_files = [str(input_path)]
 		c_parser = CParser(include_paths=args.include_paths)
+		c_parser.extract_debug_comments = args.debug_gdb
 		try:
 			ast = c_parser.parse_file(args.input_path)
 			# for node in ast:
@@ -456,6 +460,7 @@ def main():
 			
 			# Parse all files
 			c_parser = MultiFileParser(include_paths=args.include_paths)
+			c_parser.extract_debug_comments = args.debug_gdb
 			try:
 				c_parser.parse_files(c_files)
 				if args.verbose:
@@ -567,6 +572,11 @@ def main():
 		# so this optimization must be disabled to avoid runtime segfaults.
 		linker_script = None
 		effective_metamorphic_return_sites = args.enable_metamorphic_return_sites
+		effective_indexed_function_calls = args.enable_indexed_function_calls
+		if args.debug_gdb and effective_indexed_function_calls:
+			effective_indexed_function_calls = False
+			if args.verbose:
+				print("GDB debug mode (-d): disabling indexed function calls for debug checkpoints", file=sys.stderr)
 		if not args.no_assemble:
 			linker_script = find_linker_script(input_path)
 			if args.build_shared:
@@ -579,7 +589,7 @@ def main():
 				if args.verbose:
 					print("Disabling metamorphic return sites: no linker script found (.text is read-only with default linker settings)", file=sys.stderr)
 		
-		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, effective_metamorphic_return_sites, register_allocator, args.enable_indexed_function_calls)
+		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, effective_metamorphic_return_sites, register_allocator, effective_indexed_function_calls, args.debug_gdb)
 		output_code = codegen.generate(c_parser)
 		
 		output_file, executable_name = resolve_output_paths(args.output, input_path, args.build_shared)
@@ -605,6 +615,15 @@ def main():
 			)
 			if not success:
 				sys.exit(1)
+			
+			if args.debug_gdb:
+				assertions = codegen.debug_assertions_meta
+				memdumps = codegen.debug_memdumps_meta
+				if not assertions and not memdumps:
+					assertions, memdumps = parse_debug_metadata_from_asm(output_file)
+				gdb_executable = os.path.abspath(executable_name)
+				if not run_gdb(gdb_executable, assertions, memdumps, args.verbose, args.use_32bit):
+					sys.exit(1)
 			
 			# Run in QEMU if requested
 			if args.qemu or args.qemu_system:

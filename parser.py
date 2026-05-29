@@ -10,6 +10,11 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from debug_gdb import (
+    prepare_source_and_debug_comments,
+    map_stripped_lines_to_preprocessed,
+    remap_debug_line_numbers,
+)
 
 
 class CParser:
@@ -19,6 +24,11 @@ class CParser:
         self.parser = c_parser.CParser()
         self.ast = None
         self._alignas_info = {}  # Store _Alignas information extracted during preprocessing
+        self._register_assertions = []
+        self._memdumps = []
+        self.source_file = None
+        self.extract_debug_comments = False
+        self._function_source_files = {}
         self.include_paths = include_paths or []  # Additional include directories
     
     @staticmethod
@@ -103,6 +113,18 @@ class CParser:
         """Parse a C file into an AST."""
         # Convert filename to absolute path early to avoid issues with path resolution
         abs_filename = os.path.abspath(filename)
+        self.source_file = abs_filename
+        try:
+            with open(abs_filename, 'r') as src_file:
+                original_content = src_file.read()
+            source_content, self._register_assertions, self._memdumps = prepare_source_and_debug_comments(
+                original_content, abs_filename, self.extract_debug_comments,
+            )
+        except OSError:
+            original_content = ''
+            source_content = ''
+            self._register_assertions = []
+            self._memdumps = []
         try:
             # Try to use cpp, but fall back to direct parsing if not available
             try:
@@ -152,20 +174,32 @@ class CParser:
                     pass  # fake libc not available, use system headers
                 
                 # Call cpp manually to get preprocessed output
-                # Use absolute filename to avoid path resolution issues with cwd
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as src_tmp:
+                    src_tmp.write(source_content)
+                    cpp_input_path = src_tmp.name
+
                 import subprocess
-                result = subprocess.run(
-                    ['cpp'] + cpp_args + [abs_filename],
-                    capture_output=True,
-                    text=True,
-                    cwd=source_dir
-                )
+                try:
+                    result = subprocess.run(
+                        ['cpp'] + cpp_args + [cpp_input_path],
+                        capture_output=True,
+                        text=True,
+                        cwd=source_dir
+                    )
+                finally:
+                    try:
+                        os.unlink(cpp_input_path)
+                    except OSError:
+                        pass
                 
                 if result.returncode != 0:
                     raise RuntimeError(f"cpp preprocessing failed: {result.stderr}")
                 
                 # Process the preprocessed output to remove inline assembly
                 preprocessed_content = result.stdout
+                line_mapping = map_stripped_lines_to_preprocessed(source_content, preprocessed_content)
+                self._register_assertions = remap_debug_line_numbers(self._register_assertions, line_mapping)
+                self._memdumps = remap_debug_line_numbers(self._memdumps, line_mapping)
                 
                 # Extract _Alignas information before preprocessing removes it
                 # Store it for later use in the analyzer
@@ -195,9 +229,27 @@ class CParser:
                     with open(abs_filename, 'r') as f:
                         source_content = f.read()
                     self._alignas_info = self._extract_alignas_info(source_content)
-                except:
+                    source_content, self._register_assertions, self._memdumps = prepare_source_and_debug_comments(
+                        source_content, abs_filename, self.extract_debug_comments,
+                    )
+                except OSError:
                     self._alignas_info = {}
-                self.ast = parse_file(abs_filename, use_cpp=False)
+                    self._register_assertions = []
+                    self._memdumps = []
+                    source_content = original_content if original_content else ''
+                if source_content:
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as tmp_file:
+                        tmp_file.write(source_content)
+                        tmp_filename = tmp_file.name
+                    try:
+                        self.ast = parse_file(tmp_filename, use_cpp=False)
+                    finally:
+                        try:
+                            os.unlink(tmp_filename)
+                        except OSError:
+                            pass
+                else:
+                    self.ast = parse_file(abs_filename, use_cpp=False)
             return self.ast
         except ParseError as e:
             print(f"Parse error: {e}", file=sys.stderr)
@@ -223,6 +275,9 @@ class CParser:
         functions = []
         visitor = FunctionExtractor()
         visitor.visit(self.ast)
+        if self.source_file:
+            for func in visitor.functions:
+                self._function_source_files[id(func)] = self.source_file
         return visitor.functions
     
     def get_global_variables(self):
@@ -236,6 +291,18 @@ class CParser:
         # Don't overwrite _alignas_info - it's already set during parse_file
         # The visitor's alignas_info is separate and not used
         return visitor.globals
+    
+    def get_register_assertions(self):
+        """Get register assertions extracted during parsing."""
+        return list(getattr(self, '_register_assertions', []))
+
+    def get_memdumps(self):
+        """Get MEMDUMP debug requests extracted during parsing."""
+        return list(getattr(self, '_memdumps', []))
+
+    def get_function_source_files(self):
+        """Map function AST node ids to their source file paths."""
+        return dict(getattr(self, '_function_source_files', {}))
     
     def get_alignas_info(self):
         """Get _Alignas information extracted during parsing."""
@@ -288,6 +355,7 @@ class MultiFileParser:
         self.parsers = []  # List of CParser instances, one per file
         self.file_paths = []  # List of file paths
         self.include_paths = include_paths or []  # Additional include directories
+        self.extract_debug_comments = False
     
     def parse_files(self, file_paths):
         """Parse multiple C files and aggregate their ASTs."""
@@ -296,6 +364,7 @@ class MultiFileParser:
         
         for file_path in file_paths:
             parser = CParser(include_paths=self.include_paths)
+            parser.extract_debug_comments = self.extract_debug_comments
             try:
                 parser.parse_file(file_path)
                 self.parsers.append(parser)
@@ -308,10 +377,32 @@ class MultiFileParser:
     def get_functions(self):
         """Extract all function definitions from all parsed files."""
         all_functions = []
-        for parser in self.parsers:
+        self._function_source_files = {}
+        for parser, file_path in zip(self.parsers, self.file_paths):
             functions = parser.get_functions()
-            all_functions.extend(functions)
+            source_file = os.path.abspath(file_path)
+            for func in functions:
+                self._function_source_files[id(func)] = source_file
+                all_functions.append(func)
         return all_functions
+
+    def get_function_source_files(self):
+        """Map function AST node ids to their source file paths."""
+        return dict(getattr(self, '_function_source_files', {}))
+    
+    def get_register_assertions(self):
+        """Get register assertions from all parsed files."""
+        assertions = []
+        for parser in self.parsers:
+            assertions.extend(parser.get_register_assertions())
+        return assertions
+
+    def get_memdumps(self):
+        """Get MEMDUMP requests from all parsed files."""
+        memdumps = []
+        for parser in self.parsers:
+            memdumps.extend(parser.get_memdumps())
+        return memdumps
     
     def get_global_variables(self):
         """Extract all global variable declarations from all parsed files."""

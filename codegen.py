@@ -1,6 +1,7 @@
 """Code generator with function call optimizations."""
 
 from pycparser import c_ast
+import os
 import struct
 import sys
 import re
@@ -32,13 +33,14 @@ def safe_str(obj):
 class CodeGenerator:
     """Code generator with indexed-jump, metamorphic return sites, quantized call-backs, and SIMD bit-packing."""
     
-    def __init__(self, function_data, global_var_data=None, asm_parser=None, use_32bit=False, enable_metamorphic_return_sites=False, register_allocator=None, enable_indexed_function_calls=False):
+    def __init__(self, function_data, global_var_data=None, asm_parser=None, use_32bit=False, enable_metamorphic_return_sites=False, register_allocator=None, enable_indexed_function_calls=False, enable_debug_gdb=False):
         self.function_data = function_data
         self.global_var_data = global_var_data or {'packed_vars': [], 'bit_positions': {}, 'total_bits_used': 0}
         self.asm_parser = asm_parser  # Assembly parser for external symbols
         self.use_32bit = use_32bit  # 32-bit mode flag
         self.enable_metamorphic_return_sites = enable_metamorphic_return_sites  # Enable/disable metamorphic return sites
         self.enable_indexed_function_calls = enable_indexed_function_calls  # Use indexed jump for small functions (JMP base+offset vs CALL)
+        self.enable_debug_gdb = enable_debug_gdb
         self.register_allocator = register_allocator  # Register allocator for efficient register usage
         self.output = []
         self.small_functions = []
@@ -919,6 +921,19 @@ class CodeGenerator:
         self.string_literal_counter = 0
         self.external_functions = set()
         self._current_parser = parser  # Store parser reference for variable lookup
+        self._function_source_files = parser.get_function_source_files() if hasattr(parser, 'get_function_source_files') else {}
+        self._program_assertions = [
+            dict(entry, _consumed=False)
+            for entry in (parser.get_register_assertions() if self.enable_debug_gdb and hasattr(parser, 'get_register_assertions') else [])
+        ]
+        self._program_memdumps = [
+            dict(entry, _consumed=False)
+            for entry in (parser.get_memdumps() if self.enable_debug_gdb and hasattr(parser, 'get_memdumps') else [])
+        ]
+        self._debug_assert_counter = 0
+        self._debug_memdump_counter = 0
+        self.debug_assertions_meta = []
+        self.debug_memdumps_meta = []
         self._collect_typedefs(parser)
         self._collect_enum_constants(parser)
         self._collect_struct_sizes(parser)  # Auto-detect struct sizes from AST
@@ -1085,6 +1100,8 @@ class CodeGenerator:
             extern_lines.append("")
             self.output[extern_insert_index:extern_insert_index] = extern_lines
         
+        self._insert_startup_debug_hooks()
+        
         # Final sanitization pass to remove any AST node attributes that might have leaked
         sanitized_output = []
         for line in self.output:
@@ -1116,6 +1133,126 @@ class CodeGenerator:
             self.function_offsets[func_name] = offset
             offset += 1
     
+    def _emit_debug_check(self, assertion, idx=None):
+        if idx is None:
+            idx = self._debug_assert_counter
+            self._debug_assert_counter += 1
+        register = assertion['register']
+        expected = assertion['expected']
+        expected_str = assertion.get('expected_str', hex(expected))
+        self.output.append(f"__dbg_assert_{idx}:")
+        self.output.append(
+            f"    ; DBG_ASSERT {assertion['file']}:{assertion['line']} {register}={expected_str}"
+        )
+        self.output.append("    NOP")
+        self.debug_assertions_meta.append({
+            'file': assertion['file'],
+            'line': assertion['line'],
+            'register': register,
+            'expected': expected,
+            'expected_str': expected_str,
+            'label': f'__dbg_assert_{idx}',
+        })
+
+    def _emit_memdump_check(self, memdump, idx=None):
+        if idx is None:
+            idx = self._debug_memdump_counter
+            self._debug_memdump_counter += 1
+        from debug_gdb import format_memdump_base
+        base_text = format_memdump_base(memdump['base'])
+        size = memdump['size']
+        self.output.append(f"__dbg_memdump_{idx}:")
+        self.output.append(
+            f"    ; DBG_MEMDUMP {memdump['file']}:{memdump['line']} {base_text} {size}"
+        )
+        self.output.append("    NOP")
+        self.debug_memdumps_meta.append({
+            'file': memdump['file'],
+            'line': memdump['line'],
+            'base': memdump['base'],
+            'size': size,
+            'label': f'__dbg_memdump_{idx}',
+        })
+
+    def _debug_entry_matches(self, entry, coord):
+        if entry.get('_consumed'):
+            return False
+        if entry['line'] != coord.line:
+            return False
+        if self._current_source_file:
+            if os.path.basename(entry['file']) != os.path.basename(self._current_source_file):
+                return False
+        return True
+
+    def _matching_debug_hooks(self, coord):
+        hooks = []
+        for assertion in self._program_assertions:
+            if self._debug_entry_matches(assertion, coord):
+                hooks.append(('assert', assertion, assertion.get('sequence', 0)))
+        for memdump in self._program_memdumps:
+            if self._debug_entry_matches(memdump, coord):
+                hooks.append(('memdump', memdump, memdump.get('sequence', 0)))
+        hooks.sort(key=lambda item: item[2])
+        return hooks
+
+    def _emit_stmt_debug_hooks(self, stmt):
+        if not self.enable_debug_gdb:
+            return
+        coord = getattr(stmt, 'coord', None)
+        if not coord:
+            return
+        for kind, entry, _ in self._matching_debug_hooks(coord):
+            if kind == 'assert':
+                self._emit_debug_check(entry)
+            else:
+                self._emit_memdump_check(entry)
+            entry['_consumed'] = True
+
+    def _emit_startup_debug_hooks(self):
+        """Emit file-scope debug hooks before main (globals, comment-only lines)."""
+        if not self.enable_debug_gdb:
+            return
+        pending = []
+        for assertion in self._program_assertions:
+            if not assertion.get('_consumed'):
+                pending.append(('assert', assertion, assertion.get('sequence', 0), assertion.get('line', 0)))
+        for memdump in self._program_memdumps:
+            if not memdump.get('_consumed'):
+                pending.append(('memdump', memdump, memdump.get('sequence', 0), memdump.get('line', 0)))
+        pending.sort(key=lambda item: (item[3], item[2]))
+        for kind, entry, _, _ in pending:
+            if kind == 'assert':
+                self._emit_debug_check(entry)
+            else:
+                self._emit_memdump_check(entry)
+            entry['_consumed'] = True
+
+    def _insert_startup_debug_hooks(self):
+        """Insert unconsumed debug hooks into _start before the main call."""
+        if not self.enable_debug_gdb:
+            return
+        has_unconsumed = any(
+            not entry.get('_consumed')
+            for entry in self._program_assertions + self._program_memdumps
+        )
+        if not has_unconsumed:
+            return
+
+        insert_at = None
+        for i, line in enumerate(self.output):
+            if 'CALL FUNC_main' in line or 'JMP FUNC_main' in line:
+                insert_at = i
+                break
+        if insert_at is None:
+            return
+
+        saved = self.output
+        self.output = []
+        self._emit_startup_debug_hooks()
+        hooks = self.output
+        self.output = saved
+        self.output[insert_at:insert_at] = hooks
+
     def _generate_function_table(self, small_funcs):
         """Generate function pointer table."""
         self.output.append("SECTION .data")
@@ -1943,6 +2080,7 @@ class CodeGenerator:
         
         # Store current function name for use in expression generation
         self._current_function_name = func_name
+        self._current_source_file = self._function_source_files.get(id(func_def))
         
         info = self.function_data.get(func_name, {})
         is_interrupt = self._is_interrupt_callback(func_name)
@@ -2239,6 +2377,7 @@ class CodeGenerator:
             self._generate_return(stmt, func_name, info)
         elif isinstance(stmt, c_ast.Assignment):
             self._generate_assignment(stmt)
+            self._emit_stmt_debug_hooks(stmt)
         elif isinstance(stmt, c_ast.If):
             self._generate_if(stmt, func_name, info)
         elif isinstance(stmt, c_ast.While):
@@ -2249,8 +2388,10 @@ class CodeGenerator:
             self._generate_for(stmt, func_name, info)
         elif isinstance(stmt, c_ast.FuncCall):
             self._generate_call(stmt, func_name)
+            self._emit_stmt_debug_hooks(stmt)
         elif isinstance(stmt, c_ast.Decl):
             self._generate_decl(stmt)
+            self._emit_stmt_debug_hooks(stmt)
         elif isinstance(stmt, c_ast.Compound):
             self._generate_block(stmt, func_name, info)
         elif isinstance(stmt, c_ast.Break):
@@ -2267,6 +2408,7 @@ class CodeGenerator:
             # Expression statements (e.g., i++, function calls in expressions, etc.)
             # Generate the expression and discard the result
             self._generate_expression(stmt)
+            self._emit_stmt_debug_hooks(stmt)
     
     def _generate_return(self, ret_stmt, func_name, info):
         """Generate return statement with metamorphic return site optimization."""
@@ -2313,6 +2455,7 @@ class CodeGenerator:
             if ret_stmt.expr:
                 self._generate_expression(ret_stmt.expr)
                 # Return value is already in RAX from expression evaluation
+            self._emit_stmt_debug_hooks(ret_stmt)
             # Use minimal epilogue if no indexed stack was used
             if self.function_needs_indexed_stack:
                 if self.current_stack_slots > 0:
