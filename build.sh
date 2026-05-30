@@ -38,8 +38,13 @@ fi
 
 echo "Linking ${OUTPUT}.o..."
 
-# Link the object file
-ld "${OUTPUT}.o" -o "$OUTPUT"
+# Link the object file (prefer GNU gold)
+if command -v ld.gold &> /dev/null; then
+    LINKER="ld.gold"
+else
+    LINKER="ld"
+fi
+$LINKER "${OUTPUT}.o" -o "$OUTPUT"
 
 if [ $? -ne 0 ]; then
     echo "Error: Linking failed"

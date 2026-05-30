@@ -1038,7 +1038,7 @@ class CodeGenerator:
                         self.output.append(f"    LEA {self.reg_rdx}, [{return_site_label}]  ; Get return address")
                         self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address")
                     else:
-                        self.output.append(f"    LEA {self.reg_rax}, [rel {metamorphic_label}+1]  ; Address of immediate value")
+                        self.output.append(f"    LEA {self.reg_rax}, [rel {metamorphic_label}+2]  ; Address of immediate value")
                         self.output.append(f"    LEA {self.reg_rdx}, [rel {return_site_label}]  ; Get return address")
                         self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address (32-bit, like example)")
                     self.output.append("    JMP FUNC_main  ; Jump to main function")
@@ -2305,9 +2305,9 @@ class CodeGenerator:
             has_any_return = block_items and any(isinstance(item, c_ast.Return) for item in block_items)
             if not has_any_return:
                 # Generate implicit return (fall-through case)
-                # Small functions use normal RET since they're called via inlined indexed dispatch
-                # Use metamorphic return site if function has single return (implicit) and is not small
-                if self.enable_metamorphic_return_sites and info.get('has_single_return', False) and not info.get('is_small', False):
+                # Prefer metamorphic return sites for single-return functions (including small funcs)
+                # so internal calls can stay JMP-based without extra CALL/RET overhead.
+                if self.enable_metamorphic_return_sites and info.get('has_single_return', False):
                             # Metamorphic return site for implicit return
                             # Generate a label for the metamorphic return site (if not already generated)
                             if func_name not in self.metamorphic_labels:
@@ -2340,7 +2340,8 @@ class CodeGenerator:
                             if self.use_32bit:
                                 self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
                             else:
-                                self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+                                # Force the 64-bit-immediate encoding so caller patch offset stays +2.
+                                self.output.append(f"    MOV RDX, QWORD 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
                             self.output.append(f"    JMP {self.reg_rdx}  ; Jump to return address")
                 else:
                     # Standard implicit return - only pop what we pushed (prologue)
@@ -2412,8 +2413,8 @@ class CodeGenerator:
     
     def _generate_return(self, ret_stmt, func_name, info):
         """Generate return statement with metamorphic return site optimization."""
-        # Small functions use normal RET since they're called via inlined indexed dispatch
-        if self.enable_metamorphic_return_sites and info.get('has_single_return', False) and not info.get('is_small', False):
+        # Prefer metamorphic return sites for all single-return functions (including small funcs).
+        if self.enable_metamorphic_return_sites and info.get('has_single_return', False):
             # Metamorphic return site: return address is embedded in instruction bytes
             # Generate a label for the metamorphic return site
             if func_name not in self.metamorphic_labels:
@@ -2446,9 +2447,8 @@ class CodeGenerator:
             if self.use_32bit:
                 self.output.append(f"    MOV EDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
             else:
-                # Use 32-bit move (will be optimized by NASM, but we write 32 bits to it)
-                # The example uses mov rdx, 0xdeadbeef which NASM optimizes to 32-bit
-                self.output.append(f"    MOV RDX, 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
+                # Force the 64-bit-immediate encoding so caller patch offset stays +2.
+                self.output.append(f"    MOV RDX, QWORD 0xdeadbeef  ; Metamorphic return address (will be overwritten by caller)")
             self.output.append(f"    JMP {self.reg_rdx}  ; Jump to return address")
         else:
             # Standard return
@@ -2960,7 +2960,29 @@ class CodeGenerator:
                     self.external_functions.add(func_name)
         else:
             # Generate call based on function type
-            if callee_info.get('is_small', False) and self.enable_indexed_function_calls:
+            prefer_metamorphic_call = (
+                self.enable_metamorphic_return_sites
+                and callee_info.get('has_single_return', False)
+                and return_site_label is not None
+            )
+            if prefer_metamorphic_call:
+                # Metamorphic return site: write return address directly into instruction bytes.
+                # Callee epilogue has: mov rdx, qword 0xdeadbeef; jmp rdx
+                # For that encoding, immediate starts at +2 from label.
+                metamorphic_label = f"FUNC_{func_name}_METAMORPHIC"
+                self.output.append(f"    ; Metamorphic return site: write return address into instruction bytes")
+                if self.use_32bit:
+                    # 32-bit: mov edx, imm32 is 5 bytes: BA (opcode) + 4-byte immediate.
+                    # Immediate starts at +1.
+                    self.output.append(f"    LEA {self.reg_rax}, [{metamorphic_label}+1]  ; Address of immediate value in mov edx, 0xdeadbeef")
+                    self.output.append(f"    LEA {self.reg_rdx}, [{return_site_label}]  ; Get return address")
+                    self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address to instruction bytes")
+                else:
+                    self.output.append(f"    LEA {self.reg_rax}, [rel {metamorphic_label}+2]  ; Address of immediate value in mov rdx, qword 0xdeadbeef")
+                    self.output.append(f"    LEA {self.reg_rdx}, [rel {return_site_label}]  ; Get return address")
+                    self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address to instruction bytes")
+                self.output.append(f"    JMP FUNC_{func_name}  ; Jump to function")
+            elif callee_info.get('is_small', False) and self.enable_indexed_function_calls:
                 # Small functions use JMP (not CALL), so we must push return address for callee's RET.
                 if return_site_label is None:
                     return_site_label = f"RET_SITE_{caller_func_name}_{self.return_site_index}"
@@ -2998,32 +3020,10 @@ class CodeGenerator:
                         # Fallback to direct call if not in jump table
                         self.output.append(f"    CALL FUNC_{func_name}")
             else:
-                # Standard call or call with metamorphic return
-                if self.enable_metamorphic_return_sites and callee_info.get('has_single_return', False) and return_site_label:
-                    # Metamorphic return site: write return address directly into instruction bytes
-                    # The callee has: mov rdx, 0xdeadbeef; jmp rdx
-                    # We need to write the return address to the immediate value location
-                    # The immediate value starts at offset +2 from the label (after mov opcode and register)
-                    metamorphic_label = f"FUNC_{func_name}_METAMORPHIC"
-                    self.output.append(f"    ; Metamorphic return site: write return address into instruction bytes")
-                    if self.use_32bit:
-                        # 32-bit: mov edx, imm32 is 5 bytes: BA (opcode) + 4 bytes immediate
-                        # Offset is +1 (after opcode BA)
-                        self.output.append(f"    LEA {self.reg_rax}, [{metamorphic_label}+1]  ; Address of immediate value in mov edx, 0xdeadbeef")
-                        self.output.append(f"    LEA {self.reg_rdx}, [{return_site_label}]  ; Get return address")
-                        self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address to instruction bytes")
-                    else:
-                        # NASM optimizes mov rdx, 0xdeadbeef to 32-bit move (5 bytes: BA + 4 bytes immediate)
-                        # Offset is +1 (after opcode BA)
-                        self.output.append(f"    LEA {self.reg_rax}, [rel {metamorphic_label}+1]  ; Address of immediate value in mov rdx, 0xdeadbeef")
-                        self.output.append(f"    LEA {self.reg_rdx}, [rel {return_site_label}]  ; Get return address")
-                        self.output.append(f"    MOV DWORD [{self.reg_rax}], EDX  ; Write return address to instruction bytes (32-bit, like example)")
-                    self.output.append(f"    JMP FUNC_{func_name}  ; Jump to function")
-                else:
-                    # Standard call
-                    self.output.append(f"    CALL FUNC_{func_name}")
-                    if stack_cleanup:
-                        self.output.append(f"    ADD {self.reg_rsp}, {stack_cleanup}  ; Pop stack arguments")
+                # Standard call
+                self.output.append(f"    CALL FUNC_{func_name}")
+                if stack_cleanup:
+                    self.output.append(f"    ADD {self.reg_rsp}, {stack_cleanup}  ; Pop stack arguments")
         
         # Place return site after call (quantized call-back with 16-byte alignment)
         if return_site_label:

@@ -59,7 +59,7 @@ def resolve_output_paths(output_arg, input_path, build_shared):
 			return asm_path, output_arg
 		if output_arg.endswith('.asm'):
 			return output_arg, output_arg[:-4]
-		return output_arg, output_arg
+		return output_arg + '.asm', output_arg
 
 	if input_path.is_file():
 		base = str(input_path).replace('.c', '')
@@ -83,6 +83,22 @@ def find_assembler(use_32bit=False):
 		return ('yasm', format_type)
 	else:
 		return None
+
+
+def find_linker():
+	"""Return the linker executable, preferring GNU gold (ld.gold)."""
+	if shutil.which('ld.gold'):
+		return 'ld.gold'
+	if shutil.which('ld'):
+		return 'ld'
+	return None
+
+
+def gcc_linker_flags():
+	"""Return GCC flags to use the gold linker when available."""
+	if shutil.which('ld.gold'):
+		return ['-fuse-ld=gold']
+	return []
 
 
 def find_linker_script(input_path):
@@ -224,7 +240,11 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 		# Do not use -N (omagic) by default: it disables page alignment and can cause
 		# segmentation faults when running normal Linux executables. Use -N only when
 		# a linker script is provided (bare-metal / custom layout).
-		link_cmd = ['ld', obj_file, '-o', output_executable]
+		linker = find_linker()
+		if not linker:
+			print("Error: No linker found. Please install binutils (ld.gold or ld).", file=sys.stderr)
+			return False
+		link_cmd = [linker, obj_file, '-o', output_executable]
 		if debug_symbols:
 			link_cmd.insert(1, '-g')
 		
@@ -306,7 +326,7 @@ def assemble_and_link(asm_file, output_executable=None, verbose=False, linker_sc
 			print(e.stderr, file=sys.stderr)
 		return False
 	except FileNotFoundError:
-		print("Error: 'ld' linker not found. Please ensure binutils is installed.", file=sys.stderr)
+		print("Error: Linker not found. Please ensure binutils is installed (ld.gold or ld).", file=sys.stderr)
 		return False
 	
 	if verbose:
@@ -577,17 +597,18 @@ def main():
 			effective_indexed_function_calls = False
 			if args.verbose:
 				print("GDB debug mode (-d): disabling indexed function calls for debug checkpoints", file=sys.stderr)
-		if not args.no_assemble:
-			linker_script = find_linker_script(input_path)
-			if args.build_shared:
-				linker_script = None
-				effective_metamorphic_return_sites = False
-				if args.verbose:
-					print("Shared library build: disabling linker script and metamorphic return sites", file=sys.stderr)
-			elif effective_metamorphic_return_sites and not linker_script:
-				effective_metamorphic_return_sites = False
-				if args.verbose:
-					print("Disabling metamorphic return sites: no linker script found (.text is read-only with default linker settings)", file=sys.stderr)
+		# Detect linker script even for --no-assemble mode so metamorphic return
+		# sites can still be safely gated during code generation.
+		linker_script = find_linker_script(input_path)
+		if args.build_shared:
+			linker_script = None
+			effective_metamorphic_return_sites = False
+			if args.verbose:
+				print("Shared library build: disabling linker script and metamorphic return sites", file=sys.stderr)
+		elif effective_metamorphic_return_sites and not linker_script:
+			effective_metamorphic_return_sites = False
+			if args.verbose:
+				print("Disabling metamorphic return sites: no linker script found (.text is read-only with default linker settings)", file=sys.stderr)
 		
 		codegen = CodeGenerator(function_data, global_var_data, asm_parser, args.use_32bit, effective_metamorphic_return_sites, register_allocator, effective_indexed_function_calls, args.debug_gdb)
 		output_code = codegen.generate(c_parser)

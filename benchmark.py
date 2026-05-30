@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 from parser import find_c_files
 from asm_parser import find_asm_files
 from debug_gdb import parse_debug_metadata_from_asm, run_gdb
+from compiler import find_linker, gcc_linker_flags
 
 # Configuration
 DEFAULT_ITERATIONS = 5
@@ -447,7 +448,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
     
     try:
         # Build GCC command with all C files and assembly files
-        gcc_cmd = ['gcc', opt_level, '-DGCC']
+        gcc_cmd = ['gcc', opt_level, '-DGCC'] + gcc_linker_flags()
         if debug_symbols:
             gcc_cmd.append('-g')
         if use_32bit:
@@ -570,7 +571,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             use_32bit = True
             try:
                 # Build GCC command again with -m32 flag
-                gcc_cmd = ['gcc', opt_level, '-DGCC', '-m32']
+                gcc_cmd = ['gcc', opt_level, '-DGCC', '-m32'] + gcc_linker_flags()
                 if debug_symbols:
                     gcc_cmd.append('-g')
                 # Use -nostdlib if custom startup is detected to avoid _start conflict
@@ -790,7 +791,11 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 print(f"Warning: gcc not found, skipping assembly file {asm_file}")
     
     # Build linker command with all object files
-    link_cmd = ['ld', str(obj_file)] + asm_obj_files + ['-o', str(custom_output)]
+    linker = find_linker()
+    if not linker:
+        print("Error: No linker found (ld.gold or ld)")
+        return {'success': False}
+    link_cmd = [linker, str(obj_file)] + asm_obj_files + ['-o', str(custom_output)]
     if debug_symbols:
         link_cmd.insert(1, '-g')
     
@@ -866,7 +871,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
             print(f"   Error output: {e.stderr}")
         return {'success': False}
     except FileNotFoundError:
-        print("Error: ld linker not found")
+        print("Error: linker not found (ld.gold or ld)")
         return {'success': False}
     
     custom_executable = custom_output.resolve()

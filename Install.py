@@ -33,7 +33,7 @@ SYSTEM_TOOLS = [
     },
     {
         "name": "linker",
-        "commands": ("ld",),
+        "commands": ("ld.gold", "ld"),
         "required": True,
         "packages": {
             "apt": ("binutils",),
