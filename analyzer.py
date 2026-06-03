@@ -97,6 +97,23 @@ class FunctionAnalyzer(c_ast.NodeVisitor):
             self.visit(c)
 
 
+def count_function_params(func_def):
+    """Return the number of parameters declared on a function definition."""
+    if not func_def or not func_def.decl or not func_def.decl.type:
+        return 0
+    type_node = func_def.decl.type
+    while type_node is not None:
+        if isinstance(type_node, c_ast.FuncDecl):
+            if type_node.args and type_node.args.params:
+                return len(type_node.args.params)
+            return 0
+        if hasattr(type_node, 'type'):
+            type_node = type_node.type
+        else:
+            break
+    return 0
+
+
 def analyze_all_functions(parser):
     """Analyze all functions from a parser."""
     functions = parser.get_functions()

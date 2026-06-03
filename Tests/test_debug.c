@@ -9,7 +9,7 @@ void print(char *fmt, char *msg) {
 
 int main ()
 {
-	// MEMDUMP RAX = 0x0000000000000000 RSI = 0x0000000000000001
+	// MEMDUMP RAX = 0x0 RSI = 0x1
 	print("Reached end\n");
 	return 0;
 }

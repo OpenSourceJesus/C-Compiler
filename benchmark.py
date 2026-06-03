@@ -10,14 +10,22 @@ import glob
 from pathlib import Path
 from statistics import mean, stdev
 import matplotlib
-# Try to use interactive backend if display is available, otherwise use Agg
-try:
-    if os.environ.get('DISPLAY'):
-        matplotlib.use('TkAgg')  # Interactive backend if display available
-    else:
-        matplotlib.use('Agg')  # Non-interactive backend for headless environments
-except:
-    matplotlib.use('Agg')  # Fallback to non-interactive backend
+
+def _matplotlib_interactive_available():
+    """True when a DISPLAY is set and Tkinter can load (libtk present)."""
+    if not os.environ.get('DISPLAY'):
+        return False
+    try:
+        import tkinter  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+# TkAgg is only selected when Tk actually works; use() alone does not load libtk.
+if _matplotlib_interactive_available():
+    matplotlib.use('TkAgg')
+else:
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from parser import find_c_files
 from asm_parser import find_asm_files
@@ -47,7 +55,7 @@ def get_file_size(filepath):
     except OSError:
         return 0
 
-def run_benchmark(executable_path, name, iterations, verbose=False):
+def run_benchmark(executable_path, name, iterations, verbose=False, extraArgs=[]):
     """Run benchmark and return statistics.
     
     Args:
@@ -55,6 +63,7 @@ def run_benchmark(executable_path, name, iterations, verbose=False):
         name: Name of the compiler/executable being benchmarked
         iterations: Number of iterations to run
         verbose: If True, print individual run times and progress messages
+        extraArgs: Extra arguments to pass to the executable
     """
     times = []
     
@@ -83,7 +92,7 @@ def run_benchmark(executable_path, name, iterations, verbose=False):
         # Run the executable, suppressing output
         try:
             result = subprocess.run(
-                [executable_path],
+                [executable_path] + extraArgs,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
@@ -317,7 +326,7 @@ def find_linker_scripts(directory):
     
     return linker_scripts
 
-def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O0', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=None, debug_symbols=False, debug_gdb=True):
+def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, use_32bit=False, opt_level='-O0', iterations=DEFAULT_ITERATIONS, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=None, debug_symbols=False, debug_gdb=True, program_args=None):
     """Compile a single file or folder and run benchmarks.
     
     Args:
@@ -332,9 +341,13 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
         include_paths: Extra directories passed to the compilers as -I (header search path)
         debug_symbols: If True, pass -g when assembling and linking
         debug_gdb: If True, pass -d to the custom compiler and run gdb after linking
+        program_args: Extra command-line arguments forwarded to compiled test executables
     """
     test_path = Path(test_path).resolve()
     script_dir = Path(__file__).parent.absolute()
+    
+    if program_args is None:
+        program_args = []
     
     if exclude_patterns is None:
         exclude_patterns = []
@@ -747,6 +760,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 include_paths=include_paths,
                 debug_symbols=debug_symbols,
                 debug_gdb=debug_gdb,
+                program_args=program_args,
             )
         
         print("Error: Assembly failed")
@@ -845,6 +859,7 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                 include_paths=include_paths,
                 debug_symbols=debug_symbols,
                 debug_gdb=debug_gdb,
+                program_args=program_args,
             )
         
         # Check for undefined symbol errors that might indicate we need to retry
@@ -935,14 +950,15 @@ def compile_and_benchmark(test_path, output_base_name, exclude_patterns=None, us
                     include_paths=include_paths,
                     debug_symbols=debug_symbols,
                     debug_gdb=debug_gdb,
+                    program_args=program_args,
                 )
     except (subprocess.CalledProcessError, FileNotFoundError):
         # If 'file' command is not available, skip the check
         pass
     
     # Run benchmarks
-    gcc_avg = run_benchmark(str(gcc_executable), f"GCC {opt_level}", iterations, verbose=False)
-    custom_avg = run_benchmark(str(custom_executable), "Custom Compiler", iterations, verbose=False)
+    gcc_avg = run_benchmark(str(gcc_executable), f"GCC {opt_level}", iterations, verbose=False, extraArgs=program_args)
+    custom_avg = run_benchmark(str(custom_executable), "Custom Compiler", iterations, verbose=False, extraArgs=program_args)
     
     # Results summary
     print(f"GCC {opt_level}:")
@@ -1033,6 +1049,7 @@ def main():
     opt_level = '-O0'  # Default optimization level
     iterations = DEFAULT_ITERATIONS
     include_paths = []
+    program_args = []
     
     args = sys.argv[1:]
     if not args:
@@ -1137,7 +1154,7 @@ def main():
                     print(f"Error: -I flag requires a directory path", file=sys.stderr)
                     sys.exit(1)
             else:
-                # Unknown flag, skip it
+                program_args.append(args[i])
                 i += 1
         
         if test_path is None:
@@ -1156,13 +1173,15 @@ def main():
         print("GDB debug run: enabled (-d)")
     if include_paths:
         print(f"Include paths: {', '.join(include_paths)}")
+    if program_args:
+        print(f"Program arguments: {' '.join(program_args)}")
     print()
     
     # Run benchmark with metamorphic return sites enabled
     print("=" * 70)
     print("Running benchmark WITH metamorphic return sites")
     print("=" * 70)
-    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols, debug_gdb=debug_gdb)
+    result_with = compile_and_benchmark(test_path, output_base, exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols, debug_gdb=debug_gdb, program_args=program_args)
     
     if not result_with or not isinstance(result_with, dict) or not result_with.get('success', False):
         print("Error: Benchmark with metamorphic return sites failed")
@@ -1172,7 +1191,7 @@ def main():
     print("=" * 70)
     print("Running benchmark WITHOUT metamorphic return sites")
     print("=" * 70)
-    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols, debug_gdb=debug_gdb)
+    result_without = compile_and_benchmark(test_path, output_base + "_no_metamorphic", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=False, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols, debug_gdb=debug_gdb, program_args=program_args)
     
     if not result_without or not isinstance(result_without, dict) or not result_without.get('success', False):
         print("Error: Benchmark without metamorphic return sites failed")
@@ -1227,7 +1246,7 @@ def main():
     print("=" * 70)
     print("Running benchmark WITH indexed function calls")
     print("=" * 70)
-    result_indexed = compile_and_benchmark(test_path, output_base + "_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols, debug_gdb=debug_gdb)
+    result_indexed = compile_and_benchmark(test_path, output_base + "_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=True, include_paths=include_paths, debug_symbols=debug_symbols, debug_gdb=debug_gdb, program_args=program_args)
     
     if not result_indexed or not isinstance(result_indexed, dict) or not result_indexed.get('success', False):
         print("Error: Benchmark with indexed function calls failed")
@@ -1236,7 +1255,7 @@ def main():
         print("=" * 70)
         print("Running benchmark WITHOUT indexed function calls")
         print("=" * 70)
-        result_no_indexed = compile_and_benchmark(test_path, output_base + "_no_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=False, include_paths=include_paths, debug_symbols=debug_symbols, debug_gdb=debug_gdb)
+        result_no_indexed = compile_and_benchmark(test_path, output_base + "_no_indexed", exclude_patterns, use_32bit, opt_level, iterations, enable_metamorphic_return_sites=True, enable_indexed_function_calls=False, include_paths=include_paths, debug_symbols=debug_symbols, debug_gdb=debug_gdb, program_args=program_args)
         
         if not result_no_indexed or not isinstance(result_no_indexed, dict) or not result_no_indexed.get('success', False):
             print("Error: Benchmark without indexed function calls failed")

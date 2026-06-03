@@ -6,6 +6,7 @@ import struct
 import sys
 import re
 from register_allocator import analyze_all_functions_for_registers
+from analyzer import count_function_params
 
 
 def safe_str(obj):
@@ -1003,6 +1004,10 @@ class CodeGenerator:
             self.output.append("; Program entry point")
             self.output.append("_start:")
             
+            # Linux initial stack layout: [RSP]=argc, [RSP+8]=argv[0], ...
+            # Save it before stack alignment (AND RSP may move past argc on SysV entry).
+            self.output.append(f"    MOV {self.reg_rbx}, {self.reg_rsp}  ; Save initial stack (argc/argv layout)")
+            
             # Ensure stack is 16-byte aligned (required for x86-64 ABI)
             # RSP is already set by the kernel, but we align it to be safe
             self.output.append("    ; Align stack to 16 bytes (x86-64 ABI requirement)")
@@ -1044,6 +1049,13 @@ class CodeGenerator:
                     self.output.append("    JMP FUNC_main  ; Jump to main function")
                     self.output.append(f"{return_site_label}:  ; Return site after main")
                 else:
+                    main_node = main_info.get('node')
+                    main_param_count = count_function_params(main_node) if main_node else 0
+                    if main_param_count >= 1:
+                        self.output.append(f"    MOV {self.reg_rdi}, [{self.reg_rbx}]  ; argc")
+                    if main_param_count >= 2:
+                        argv_offset = 4 if self.use_32bit else 8
+                        self.output.append(f"    LEA {self.reg_rsi}, [{self.reg_rbx}+{argv_offset}]  ; argv")
                     self.output.append("    CALL FUNC_main  ; Call main function")
                 self.output.append(f"    ; Main return value is in {self.reg_rax}, save it for exit")
                 self.output.append(f"    MOV {self.reg_rdi}, {self.reg_rax}  ; Save return value to {self.reg_rdi} (exit code)")
@@ -3927,10 +3939,21 @@ class CodeGenerator:
                 self.output.append(f"    SUB {self.reg_rax}, {step}")
                 self._emit_store_to_address(self.reg_binary_op_temp, elem_size)
     
-    def _generate_array_ref(self, arr_ref, load_value=True):
+    def _array_element_type(self, arr_ref):
+        """Return the element type produced by one subscript on arr_ref's base."""
+        base_type = self._resolve_typedefs(self._infer_expr_type(arr_ref.name))
+        if isinstance(base_type, c_ast.ArrayDecl):
+            return base_type.type
+        if isinstance(base_type, c_ast.PtrDecl):
+            return base_type.type
+        return None
+
+    def _generate_array_ref(self, arr_ref, load_value=True, as_index_base=False):
         """Generate code for array indexing: arr[index] using efficient LEA addressing.
 
         When load_value is False, leaves element address in RAX/EAX.
+        When as_index_base is True, pointer elements (e.g. char **argv) load the stored
+        pointer so nested subscripts like argv[i][j] use the string address, not &argv[i].
         """
         load_elem_size = 4
         default_elem_size = 4
@@ -4073,7 +4096,7 @@ class CodeGenerator:
                         # Parameter or complex - load base first
                         self.output.append(f"    PUSH {index_reg}  ; Preserve outer array index across base evaluation")
                         if isinstance(arr_ref.name, c_ast.ArrayRef):
-                            self._generate_array_ref(arr_ref.name, load_value=False)
+                            self._generate_array_ref(arr_ref.name, load_value=False, as_index_base=True)
                         elif isinstance(arr_ref.name, c_ast.StructRef):
                             self._generate_struct_ref(arr_ref.name, load_value=False)
                         elif isinstance(arr_ref.name, c_ast.UnaryOp) and arr_ref.name.op == '*':
@@ -4099,7 +4122,7 @@ class CodeGenerator:
             # Complex expression for base - evaluate it
             self.output.append(f"    PUSH {index_reg}  ; Preserve outer array index across complex base")
             if isinstance(arr_ref.name, c_ast.ArrayRef):
-                self._generate_array_ref(arr_ref.name, load_value=False)
+                self._generate_array_ref(arr_ref.name, load_value=False, as_index_base=True)
             elif isinstance(arr_ref.name, c_ast.StructRef):
                 self._generate_struct_ref(arr_ref.name, load_value=False)
             elif isinstance(arr_ref.name, c_ast.UnaryOp) and arr_ref.name.op == '*':
@@ -4122,6 +4145,14 @@ class CodeGenerator:
                     self.output.append(f"    IMUL RDX, {default_elem_size}  ; index * elem_size")
                     self.output.append("    ADD RAX, RDX  ; base + offset")
         
+        elem_type = self._array_element_type(arr_ref)
+        if as_index_base and isinstance(elem_type, c_ast.PtrDecl):
+            if self.use_32bit:
+                self.output.append("    MOV EAX, DWORD [EAX]  ; Load pointer element for nested subscript")
+            else:
+                self.output.append("    MOV RAX, QWORD [RAX]  ; Load pointer element for nested subscript")
+            return
+
         if load_value:
             inferred_elem_type = self._resolve_typedefs(self._infer_expr_type(arr_ref))
             if isinstance(inferred_elem_type, c_ast.TypeDecl):

@@ -30,13 +30,12 @@ void overwrite_msg() {
 	msg[13] = '\0';  /* Ensure null terminator */
 }
 
-int main() {
-	volatile int iterations = 1000000;  /* 1 million iterations */
+int main(int argc, char *argv[]) {
+	int iterations = (argc >= 2) ? argv[1][0] * 1000 : 1000000;
 	
 	/* Loop to test actual execution time, not just startup */
-	for (int i = 0; i < iterations; i++) {
-		overwrite_msg();  /* Call function that overwrites msg - tests metamorphic return sites */
-	}
+	for (int i = 0; i < iterations; i ++)
+		overwrite_msg ();  /* Call function that overwrites msg - tests metamorphic return sites */
 	
 	print("%s", msg);
 	return 0;
